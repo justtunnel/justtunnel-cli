@@ -6,10 +6,11 @@ import (
 )
 
 type TunnelAssigned struct {
-	Type      string `json:"type"`
-	TunnelID  string `json:"tunnel_id"`
-	Subdomain string `json:"subdomain"`
-	URL       string `json:"url"`
+	Type           string `json:"type"`
+	TunnelID       string `json:"tunnel_id"`
+	Subdomain      string `json:"subdomain"`
+	URL            string `json:"url"`
+	ReconnectToken string `json:"reconnect_token,omitempty"`
 }
 
 type RequestFrame struct {

@@ -48,7 +48,7 @@ func ProxyRequest(ctx context.Context, frame RequestFrame, target string, logger
 		display.LogRequestDetail("Request", frame.Headers, bodyBytes)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, syscall.ECONNREFUSED) {

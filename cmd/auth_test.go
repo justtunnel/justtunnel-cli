@@ -8,18 +8,19 @@ import (
 )
 
 func TestVerifyKeyValid(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/auth/verify" {
-			w.WriteHeader(http.StatusNotFound)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/me" {
+			writer.WriteHeader(http.StatusNotFound)
 			return
 		}
-		if r.Header.Get("Authorization") != "Bearer justtunnel_validkey" {
-			w.WriteHeader(http.StatusUnauthorized)
+		if request.Header.Get("Authorization") != "Bearer justtunnel_validkey" {
+			writer.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		json.NewEncoder(w).Encode(authVerifyResponse{
-			Email: "user@test.com",
-			Plan:  "pro",
+		json.NewEncoder(writer).Encode(authVerifyResponse{
+			Email:          "user@test.com",
+			GitHubUsername: "testuser",
+			Plan:           "pro",
 		})
 	}))
 	defer server.Close()
@@ -37,8 +38,8 @@ func TestVerifyKeyValid(t *testing.T) {
 }
 
 func TestVerifyKeyInvalidKey(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer server.Close()
 
@@ -52,8 +53,8 @@ func TestVerifyKeyInvalidKey(t *testing.T) {
 }
 
 func TestVerifyKeyForbidden(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
 	}))
 	defer server.Close()
 
@@ -115,5 +116,121 @@ func TestAPIBaseURL(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("apiBaseURL(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestCreateDeviceSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/auth/device" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusCreated)
+		json.NewEncoder(writer).Encode(deviceSessionResponse{
+			DeviceCode:      "testdevicecode",
+			UserCode:        "ABCD-5678",
+			VerificationURL: "https://example.com/auth/cli",
+			ExpiresIn:       900,
+			PollInterval:    5,
+		})
+	}))
+	defer server.Close()
+
+	result, err := createDeviceSession(server.Client(), server.URL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.UserCode != "ABCD-5678" {
+		t.Errorf("user_code: got %q, want %q", result.UserCode, "ABCD-5678")
+	}
+	if result.DeviceCode != "testdevicecode" {
+		t.Errorf("device_code: got %q, want %q", result.DeviceCode, "testdevicecode")
+	}
+}
+
+func TestPollDeviceStatusPending(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(deviceStatusResponse{Status: "pending"})
+	}))
+	defer server.Close()
+
+	result, err := pollDeviceStatus(server.Client(), server.URL, "testcode")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != "pending" {
+		t.Errorf("status: got %q, want %q", result.Status, "pending")
+	}
+}
+
+func TestPollDeviceStatusApproved(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(deviceStatusResponse{
+			Status: "approved",
+			APIKey: "justtunnel_testkey123",
+		})
+	}))
+	defer server.Close()
+
+	result, err := pollDeviceStatus(server.Client(), server.URL, "testcode")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != "approved" {
+		t.Errorf("status: got %q, want %q", result.Status, "approved")
+	}
+	if result.APIKey != "justtunnel_testkey123" {
+		t.Errorf("api_key: got %q, want %q", result.APIKey, "justtunnel_testkey123")
+	}
+}
+
+func TestPollDeviceStatusExpired(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(deviceStatusResponse{Status: "expired"})
+	}))
+	defer server.Close()
+
+	result, err := pollDeviceStatus(server.Client(), server.URL, "testcode")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != "expired" {
+		t.Errorf("status: got %q, want %q", result.Status, "expired")
+	}
+}
+
+func TestPollDeviceStatusRateLimited(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Retry-After", "5")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	_, err := pollDeviceStatus(server.Client(), server.URL, "testcode")
+	if err == nil {
+		t.Fatal("expected error for rate limited response")
+	}
+}
+
+func TestPollDeviceStatusNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	result, err := pollDeviceStatus(server.Client(), server.URL, "testcode")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != "expired" {
+		t.Errorf("status: got %q, want %q", result.Status, "expired")
 	}
 }
