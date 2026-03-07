@@ -23,6 +23,11 @@ jobs:
 
       - name: Build binaries
         run: |
+          VERSION="${GITHUB_REF_NAME}"
+          COMMIT="${GITHUB_SHA::8}"
+          BUILD_DATE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          LDFLAGS="-s -w -X github.com/justtunnel/justtunnel-cli/internal/version.Version=${VERSION} -X github.com/justtunnel/justtunnel-cli/internal/version.Commit=${COMMIT} -X github.com/justtunnel/justtunnel-cli/internal/version.Date=${BUILD_DATE}"
+
           platforms=(
             "darwin/arm64"
             "darwin/amd64"
@@ -34,7 +39,7 @@ jobs:
             GOARCH="${platform#*/}"
             output="justtunnel-${GOOS}-${GOARCH}"
             echo "Building ${output}..."
-            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o "$output" .
+            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="${LDFLAGS}" -o "$output" .
           done
 
       - name: Generate checksums
