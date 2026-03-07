@@ -1,0 +1,28 @@
+# Build output
+justtunnel
+bin/
+dist/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test
+coverage.out
+
+# Go binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
