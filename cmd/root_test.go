@@ -6,7 +6,7 @@ import (
 )
 
 func TestBuildServerURL_Subdomain(t *testing.T) {
-	result, err := buildServerURL("wss://api.justtunnel.dev/ws", "myapp", "")
+	result, err := buildServerURL("wss://api.justtunnel.dev/ws", "myapp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -18,28 +18,8 @@ func TestBuildServerURL_Subdomain(t *testing.T) {
 	}
 }
 
-func TestBuildServerURL_Domain(t *testing.T) {
-	result, err := buildServerURL("wss://api.justtunnel.dev/ws", "", "tunnel.example.com")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !strings.Contains(result, "domain=tunnel.example.com") {
-		t.Errorf("expected domain=tunnel.example.com in URL, got %q", result)
-	}
-}
-
-func TestBuildServerURL_MutuallyExclusive(t *testing.T) {
-	_, err := buildServerURL("wss://api.justtunnel.dev/ws", "myapp", "tunnel.example.com")
-	if err == nil {
-		t.Fatal("expected error when both subdomain and domain are set")
-	}
-	if !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Errorf("error should mention 'mutually exclusive', got %q", err.Error())
-	}
-}
-
-func TestBuildServerURL_Neither(t *testing.T) {
-	result, err := buildServerURL("wss://api.justtunnel.dev/ws", "", "")
+func TestBuildServerURL_NoSubdomain(t *testing.T) {
+	result, err := buildServerURL("wss://api.justtunnel.dev/ws", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

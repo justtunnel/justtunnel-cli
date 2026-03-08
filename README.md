@@ -40,7 +40,6 @@ Expose `localhost:<port>` to the internet.
 ```bash
 justtunnel 3000                           # random subdomain
 justtunnel 3000 --subdomain myapp        # reserved subdomain (Pro)
-justtunnel 3000 --domain tunnel.myco.com # custom domain (Team)
 justtunnel 3000 --log-level debug        # verbose logging
 ```
 
@@ -49,11 +48,8 @@ justtunnel 3000 --log-level debug        # verbose logging
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--subdomain` | `-s` | — | Request a specific reserved subdomain |
-| `--domain` | `-d` | — | Request a specific custom domain |
 | `--log-level` | — | `info` | `debug`, `info`, `warn`, `error` |
 | `--config` | — | `~/.config/justtunnel/config.yaml` | Config file path |
-
-`--subdomain` and `--domain` are mutually exclusive.
 
 ### `justtunnel auth <key>`
 
