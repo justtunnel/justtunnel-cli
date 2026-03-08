@@ -52,3 +52,67 @@ jobs:
             justtunnel-*
             checksums.txt
           generate_release_notes: true
+
+      - name: Update Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DARWIN_ARM64_SHA=$(grep 'justtunnel-darwin-arm64' checksums.txt | awk '{print $1}')
+          DARWIN_AMD64_SHA=$(grep 'justtunnel-darwin-amd64' checksums.txt | awk '{print $1}')
+          LINUX_AMD64_SHA=$(grep 'justtunnel-linux-amd64' checksums.txt | awk '{print $1}')
+          LINUX_ARM64_SHA=$(grep 'justtunnel-linux-arm64' checksums.txt | awk '{print $1}')
+
+          cat > justtunnel.rb <<FORMULA
+          class Justtunnel < Formula
+            desc "Expose your local services to the internet with a public URL"
+            homepage "https://justtunnel.dev"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/justtunnel/justtunnel-cli/releases/download/v#{version}/justtunnel-darwin-arm64"
+                sha256 "${DARWIN_ARM64_SHA}"
+              end
+
+              on_intel do
+                url "https://github.com/justtunnel/justtunnel-cli/releases/download/v#{version}/justtunnel-darwin-amd64"
+                sha256 "${DARWIN_AMD64_SHA}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/justtunnel/justtunnel-cli/releases/download/v#{version}/justtunnel-linux-arm64"
+                sha256 "${LINUX_ARM64_SHA}"
+              end
+
+              on_intel do
+                url "https://github.com/justtunnel/justtunnel-cli/releases/download/v#{version}/justtunnel-linux-amd64"
+                sha256 "${LINUX_AMD64_SHA}"
+              end
+            end
+
+            def install
+              binary_name = "justtunnel-#{OS.mac? ? "darwin" : "linux"}-#{Hardware::CPU.arm? ? "arm64" : "amd64"}"
+              bin.install binary_name => "justtunnel"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/justtunnel version")
+            end
+          end
+          FORMULA
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' justtunnel.rb
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/justtunnel/homebrew-tap.git" tap
+          cp justtunnel.rb tap/Formula/justtunnel.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/justtunnel.rb
+          git commit -m "Update justtunnel to ${VERSION}"
+          git push
