@@ -151,7 +151,7 @@ func (t *Tunnel) handleRequest(ctx context.Context, frame *RequestFrame) {
 		errFrame := ErrorFrame{
 			Type:    "error",
 			ID:      frame.ID,
-			Message: err.Error(),
+			Message: "target unreachable",
 		}
 		if writeErr := t.writeJSON(ctx, errFrame); writeErr != nil {
 			t.logger.Error("write error frame failed", "error", writeErr)
