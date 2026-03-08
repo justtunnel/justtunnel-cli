@@ -22,7 +22,6 @@ var (
 	cfgFile   string
 	logLevel  string
 	subdomain string
-	domain    string
 )
 
 var rootCmd = &cobra.Command{
@@ -37,7 +36,6 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default ~/.config/justtunnel/config.yaml)")
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.Flags().StringVarP(&subdomain, "subdomain", "s", "", "request a specific subdomain")
-	rootCmd.Flags().StringVarP(&domain, "domain", "d", "", "request a specific domain")
 }
 
 func Execute() error {
@@ -62,7 +60,7 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	level := parseLogLevel(logLevel)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	serverURL, err := buildServerURL(cfg.ServerURL, subdomain, domain)
+	serverURL, err := buildServerURL(cfg.ServerURL, subdomain)
 	if err != nil {
 		return err
 	}
@@ -93,26 +91,18 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	}
 }
 
-func buildServerURL(baseURL, sub, dom string) (string, error) {
-	if sub != "" && dom != "" {
-		return "", fmt.Errorf("--subdomain and --domain are mutually exclusive; use one or the other")
-	}
-	if sub == "" && dom == "" {
+func buildServerURL(baseURL, sub string) (string, error) {
+	if sub == "" {
 		return baseURL, nil
 	}
-	u, err := url.Parse(baseURL)
+	parsed, err := url.Parse(baseURL)
 	if err != nil {
 		return "", fmt.Errorf("parse server URL: %w", err)
 	}
-	query := u.Query()
-	if sub != "" {
-		query.Set("subdomain", sub)
-	}
-	if dom != "" {
-		query.Set("domain", dom)
-	}
-	u.RawQuery = query.Encode()
-	return u.String(), nil
+	query := parsed.Query()
+	query.Set("subdomain", sub)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
 }
 
 func parseLogLevel(s string) slog.Level {

@@ -10,10 +10,19 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 )
 
-type accountResponse struct {
-	Email         string `json:"email"`
-	Plan          string `json:"plan"`
-	ActiveTunnels int    `json:"active_tunnels"`
+type tunnelInfo struct {
+	ID        string `json:"id"`
+	Subdomain string `json:"subdomain"`
+	CreatedAt string `json:"created_at"`
+}
+
+type meResponse struct {
+	Email              string       `json:"email"`
+	GithubUsername     string       `json:"github_username"`
+	Plan               string       `json:"plan"`
+	IsPlatformAdmin    bool         `json:"is_platform_admin"`
+	Tunnels            []tunnelInfo `json:"tunnels"`
+	ReservedSubdomains []string     `json:"reserved_subdomains"`
 }
 
 var statusCmd = &cobra.Command{
@@ -43,7 +52,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
 
-	req, err := http.NewRequest("GET", baseURL+"/api/v1/account", nil)
+	req, err := http.NewRequest("GET", baseURL+"/api/me", nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -62,13 +71,13 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("server error (HTTP %d)", resp.StatusCode)
 	}
 
-	var account accountResponse
+	var account meResponse
 	if err := json.NewDecoder(resp.Body).Decode(&account); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 
 	fmt.Printf("Email:          %s\n", account.Email)
 	fmt.Printf("Plan:           %s\n", account.Plan)
-	fmt.Printf("Active tunnels: %d\n", account.ActiveTunnels)
+	fmt.Printf("Active tunnels: %d\n", len(account.Tunnels))
 	return nil
 }
