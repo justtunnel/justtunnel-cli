@@ -12,9 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
+	"github.com/justtunnel/justtunnel-cli/internal/display"
 	"github.com/justtunnel/justtunnel-cli/internal/tunnel"
 )
 
@@ -28,24 +30,35 @@ var rootCmd = &cobra.Command{
 	Use:   "justtunnel [port]",
 	Short: "Expose a local HTTP server to the internet",
 	Long:  "justtunnel creates a public URL that tunnels traffic to a local port via a persistent WebSocket connection.",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runTunnel,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runTunnel,
 }
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default ~/.config/justtunnel/config.yaml)")
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.Flags().StringVarP(&subdomain, "subdomain", "s", "", "request a specific subdomain")
+	rootCmd.SilenceErrors = true
+	rootCmd.SilenceUsage = true
+	rootCmd.CompletionOptions.DisableDefaultCmd = true
 }
 
 func Execute() error {
-	return rootCmd.Execute()
+	err := rootCmd.Execute()
+	if err != nil {
+		display.PrintError(err)
+	}
+	return err
 }
 
 func runTunnel(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return cmd.Help()
+	}
+
 	port, err := strconv.Atoi(args[0])
 	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("invalid port: %s (must be 1-65535)", args[0])
+		return display.InputError(fmt.Sprintf("invalid port: %s (must be 1-65535)", args[0]))
 	}
 
 	cfg, err := config.Load(cfgFile)
@@ -67,7 +80,47 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 
 	localTarget := fmt.Sprintf("http://localhost:%d", port)
 
-	tun := tunnel.New(serverURL, localTarget, cfg.AuthToken, logger)
+	var connectSpinner *display.Spinner
+	var reconnectSpinner *display.Spinner
+
+	callbacks := tunnel.Callbacks{
+		OnConnecting: func() {
+			connectSpinner = display.NewSpinner("Connecting...")
+			connectSpinner.Start()
+		},
+		OnConnected: func(sub, tunnelURL, target string) {
+			if connectSpinner != nil {
+				connectSpinner.Stop()
+				connectSpinner = nil
+			}
+			display.PrintBanner(sub, tunnelURL, target)
+		},
+		OnRequest: func(method, path string, status int, latency time.Duration) {
+			display.LogRequest(method, path, status, latency)
+		},
+		OnReconnecting: func(attempt int, backoff time.Duration) {
+			if reconnectSpinner != nil {
+				reconnectSpinner.Stop()
+			}
+			msg := fmt.Sprintf("Reconnecting (attempt %d, next try in %s)...", attempt, backoff.Round(time.Second))
+			reconnectSpinner = display.NewSpinner(msg)
+			reconnectSpinner.Start()
+		},
+		OnReconnectWait: func(attempt int, remaining time.Duration) {
+			if reconnectSpinner != nil {
+				msg := fmt.Sprintf("Reconnecting (attempt %d, next try in %s)...", attempt, remaining.Round(time.Second))
+				reconnectSpinner.Update(msg)
+			}
+		},
+		OnReconnected: func() {
+			if reconnectSpinner != nil {
+				reconnectSpinner.StopWithMessage(color.GreenString("✓") + " Reconnected")
+				reconnectSpinner = nil
+			}
+		},
+	}
+
+	tun := tunnel.New(serverURL, localTarget, cfg.AuthToken, logger, callbacks)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -80,10 +133,23 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 		errCh <- tun.Run(ctx)
 	}()
 
+	stopAllSpinners := func() {
+		if connectSpinner != nil {
+			connectSpinner.Stop()
+			connectSpinner = nil
+		}
+		if reconnectSpinner != nil {
+			reconnectSpinner.Stop()
+			reconnectSpinner = nil
+		}
+	}
+
 	select {
 	case err := <-errCh:
+		stopAllSpinners()
 		return err
 	case sig := <-sigCh:
+		stopAllSpinners()
 		logger.Info("received signal, shutting down", "signal", sig)
 		cancel()
 		tun.Shutdown(5 * time.Second)

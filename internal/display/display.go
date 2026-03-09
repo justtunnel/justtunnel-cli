@@ -2,36 +2,44 @@ package display
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"time"
 )
 
-func PrintBanner(subdomain, url, localTarget string) {
-	output := os.Stderr
-	fmt.Fprintln(output)
-	fmt.Fprintln(output, "  justtunnel")
-	fmt.Fprintln(output)
-	fmt.Fprintf(output, "  %-14s %s → %s\n", "Forwarding:", url, localTarget)
-	fmt.Fprintf(output, "  %-14s %s\n", "Subdomain:", subdomain)
-	fmt.Fprintln(output)
+var output io.Writer = os.Stderr
+
+// SetOutput overrides the default output writer (os.Stderr). Useful for testing.
+// Passing nil resets the output to os.Stderr.
+func SetOutput(writer io.Writer) {
+	if writer == nil {
+		output = os.Stderr
+		return
+	}
+	output = writer
 }
 
 func LogRequest(method, path string, status int, latency time.Duration) {
-	fmt.Fprintf(os.Stderr, "  %-7s %-30s %d  %s\n", method, path, status, latency.Round(time.Millisecond))
-}
+	method = sanitize(method)
+	path = sanitize(path)
+	colorDim.Fprintf(output, "  %-7s", method)
+	fmt.Fprintf(output, " %-30s ", path)
 
-func LogReconnecting(attempt int, backoff time.Duration) {
-	fmt.Fprintf(os.Stderr, "  reconnecting (attempt %d, backoff %s)...\n", attempt, backoff)
-}
+	statusColor := colorGreen
+	switch {
+	case status >= 500:
+		statusColor = colorRed
+	case status >= 300:
+		statusColor = colorYellow
+	}
+	statusColor.Fprintf(output, "%d", status)
 
-func LogReconnected() {
-	fmt.Fprintln(os.Stderr, "  reconnected")
+	colorDim.Fprintf(output, "  %s\n", latency.Round(time.Millisecond))
 }
 
 // LogRequestDetail prints debug-level headers and a truncated body preview.
 func LogRequestDetail(label string, headers map[string][]string, body []byte) {
-	output := os.Stderr
 	fmt.Fprintf(output, "    %s Headers:\n", label)
 
 	keys := make([]string, 0, len(headers))

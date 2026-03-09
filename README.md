@@ -4,7 +4,7 @@ Command-line tool that exposes a local HTTP server to the public internet via a 
 
 ## Prerequisites
 
-- Go 1.22+
+- Go 1.24+
 
 ## Quick Start
 
@@ -15,12 +15,18 @@ go build -o justtunnel .
 # Expose localhost:3000 (connects to justtunnel.dev by default)
 ./justtunnel 3000
 
-# Output:
-# justtunnel connected
-# https://a3kx9m.justtunnel.dev → http://localhost:3000
+# Output (with color in a real terminal):
+#    _         _  _                       _
+#   (_)_  _ __| || |_ _  _ _ _  _ _  ___| |
+#   | | || (_-<  _|  _| || | ' \| ' \/ -_) |
+#  _/ |\_,_/__/\__|\__|\_,_|_||_|_||_\___|_|
+# |__/
 #
-# GET  /api/users         200  12ms
-# POST /webhooks/stripe   200  45ms
+#   Forwarding:    https://a3kx9m.justtunnel.dev -> http://localhost:3000
+#   Subdomain:     a3kx9m
+#
+#   GET     /api/users                     200  12ms
+#   POST    /webhooks/stripe               200  45ms
 ```
 
 ## Local Development (with local server)
@@ -102,6 +108,28 @@ All fields can be overridden with environment variables (prefix `JUSTTUNNEL_`):
 | `JUSTTUNNEL_SERVER_URL` | `server_url` | `wss://api.justtunnel.dev/ws` |
 | `JUSTTUNNEL_LOG_LEVEL` | `log_level` | `info` |
 
+## Terminal Output
+
+The CLI uses colored output, animated spinners, and an ASCII banner when running in an interactive terminal.
+
+**Color-coded request logs:** 2xx responses are green, 3xx/4xx are yellow, 5xx are red.
+
+**Spinners** show progress during connection, reconnection (with countdown), and device auth flows. In non-TTY environments (e.g., piped output, CI), spinners are replaced with a single static line.
+
+**Disabling color:**
+
+- Set `NO_COLOR=1` (or any value) to disable all ANSI color output. This follows the [no-color.org](https://no-color.org) convention and is handled automatically by the `fatih/color` library.
+- When stdout/stderr is not a TTY (e.g., `justtunnel 3000 2>log.txt`), spinners and the ASCII banner are automatically suppressed. Plain text output is used instead.
+
+**Structured errors:** Errors are categorized for clearer messaging:
+
+| Category | Prefix shown | Auto-suggestion |
+|----------|-------------|-----------------|
+| Network | `Connection error` | Check your internet connection and try again. |
+| Auth | `Auth error` | Run \`justtunnel auth\` to re-authenticate. |
+| Input | `Error` | _(none)_ |
+| Server | `Server error` | Try again, or check https://status.justtunnel.dev |
+
 ## Tests
 
 ```bash
@@ -125,7 +153,12 @@ internal/
     tunnel.go                   WebSocket connect, proxy loop, reconnect
     frames.go                   JSON frame types (request, response, etc.)
     proxy.go                    Forward request frames to localhost
-  display/display.go            Terminal output (banner, request logs)
+  display/
+    display.go                  Request logging and output helpers
+    banner.go                   ASCII art banner on tunnel start
+    color.go                    Color primitives, TTY detection
+    errors.go                   Structured error types and printing
+    spinner.go                  Animated spinner (TTY-aware)
   version/version.go            Build-time version variables
 ```
 
