@@ -16,6 +16,7 @@ import (
 
 	"github.com/justtunnel/justtunnel-cli/internal/browser"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
+	"github.com/justtunnel/justtunnel-cli/internal/display"
 )
 
 type authVerifyResponse struct {
@@ -59,7 +60,7 @@ func runAuth(cmd *cobra.Command, args []string) error {
 
 func runKeyAuth(_ *cobra.Command, key string) error {
 	if !validateKeyFormat(key) {
-		return fmt.Errorf("invalid API key format (must start with justtunnel_)")
+		return display.InputError("invalid API key format (must start with justtunnel_)")
 	}
 
 	cfg, err := config.Load(cfgFile)
@@ -74,7 +75,7 @@ func runKeyAuth(_ *cobra.Command, key string) error {
 
 	result, err := verifyKey(http.DefaultClient, baseURL, key)
 	if err != nil {
-		return err
+		return categorizeAuthError(err)
 	}
 
 	cfg.AuthToken = key
@@ -122,11 +123,11 @@ func runDeviceAuth(cmd *cobra.Command) error {
 	// Create device session
 	deviceResp, err := createDeviceSession(http.DefaultClient, baseURL)
 	if err != nil {
-		return fmt.Errorf("create device session: %w", err)
+		return categorizeAuthError(err)
 	}
 
 	// Print user code prominently
-	fmt.Fprintf(os.Stderr, "\nYour code: \033[1m%s\033[0m\n\n", deviceResp.UserCode)
+	fmt.Fprintf(os.Stderr, "\nYour code: %s\n\n", display.Bold(deviceResp.UserCode))
 
 	// Try to open browser
 	verifyURL := deviceResp.VerificationURL + "?code=" + deviceResp.UserCode
@@ -136,7 +137,8 @@ func runDeviceAuth(cmd *cobra.Command) error {
 		fmt.Fprintf(os.Stderr, "Opening browser to authenticate...\n\n")
 	}
 
-	fmt.Fprintf(os.Stderr, "Waiting for approval...\n")
+	authSpinner := display.NewSpinner("Waiting for approval...")
+	authSpinner.Start()
 
 	// Poll for approval
 	pollInterval := max(time.Duration(deviceResp.PollInterval)*time.Second, 5*time.Second)
@@ -155,10 +157,11 @@ func runDeviceAuth(cmd *cobra.Command) error {
 	for {
 		select {
 		case <-sigCtx.Done():
+			authSpinner.Stop()
 			if sigCtx.Err() == context.DeadlineExceeded {
-				return fmt.Errorf("authentication timed out. Please run 'justtunnel auth' again")
+				return display.InputError("authentication timed out. Please run 'justtunnel auth' again")
 			}
-			return fmt.Errorf("authentication cancelled")
+			return display.InputError("authentication cancelled")
 		case <-ticker.C:
 			status, pollErr := pollDeviceStatus(http.DefaultClient, baseURL, deviceResp.DeviceCode)
 			if pollErr != nil {
@@ -169,8 +172,11 @@ func runDeviceAuth(cmd *cobra.Command) error {
 			case "pending":
 				continue
 			case "expired":
-				return fmt.Errorf("authentication timed out. Please run 'justtunnel auth' again")
+				authSpinner.Stop()
+				return display.InputError("authentication timed out. Please run 'justtunnel auth' again")
 			case "approved":
+				authSpinner.Stop()
+
 				// Save the key
 				cfg.AuthToken = status.APIKey
 				if saveErr := config.Save(cfg); saveErr != nil {
@@ -277,6 +283,20 @@ func verifyKey(client *http.Client, baseURL, key string) (*authVerifyResponse, e
 	}
 
 	return &result, nil
+}
+
+// categorizeAuthError wraps raw errors from verifyKey/createDeviceSession into
+// structured CLIError types based on message content.
+func categorizeAuthError(err error) error {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "could not reach"):
+		return display.NetworkError(msg)
+	case strings.Contains(msg, "invalid API key"):
+		return display.AuthError(msg)
+	default:
+		return err
+	}
 }
 
 // apiBaseURL derives the REST API base URL from the WebSocket server URL.

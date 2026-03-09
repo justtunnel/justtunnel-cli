@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
+	"github.com/justtunnel/justtunnel-cli/internal/display"
 )
 
 type tunnelInfo struct {
@@ -43,8 +44,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if cfg.AuthToken == "" {
-		fmt.Println("Not authenticated. Run: justtunnel auth <key>")
-		return nil
+		return display.AuthError("not authenticated")
 	}
 
 	baseURL, err := apiBaseURL(cfg.ServerURL)
@@ -60,15 +60,15 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("could not reach justtunnel server")
+		return display.NetworkError("could not reach justtunnel server")
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("authentication failed (HTTP %d). Try: justtunnel auth <key>", resp.StatusCode)
+		return display.AuthError(fmt.Sprintf("authentication failed (HTTP %d)", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server error (HTTP %d)", resp.StatusCode)
+		return display.ServerError(fmt.Sprintf("server error (HTTP %d)", resp.StatusCode))
 	}
 
 	var account meResponse

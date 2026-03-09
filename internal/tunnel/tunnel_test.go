@@ -90,7 +90,7 @@ func TestTunnelEndToEnd(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tun := New(wsURL, httpServer.URL, "", logger)
+	tun := New(wsURL, httpServer.URL, "", logger, Callbacks{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

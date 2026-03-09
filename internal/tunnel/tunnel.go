@@ -11,15 +11,23 @@ import (
 	"time"
 
 	"nhooyr.io/websocket"
-
-	"github.com/justtunnel/justtunnel-cli/internal/display"
 )
+
+type Callbacks struct {
+	OnConnecting    func()
+	OnConnected     func(subdomain, url, localTarget string)
+	OnRequest       func(method, path string, status int, latency time.Duration)
+	OnReconnecting  func(attempt int, backoff time.Duration)
+	OnReconnectWait func(attempt int, remaining time.Duration)
+	OnReconnected   func()
+}
 
 type Tunnel struct {
 	serverURL   string
 	localTarget string
 	authToken   string
 	logger      *slog.Logger
+	callbacks   Callbacks
 
 	conn   *websocket.Conn
 	connMu sync.Mutex // protects WebSocket writes
@@ -31,17 +39,22 @@ type Tunnel struct {
 	reconnectToken string
 }
 
-func New(serverURL, localTarget, authToken string, logger *slog.Logger) *Tunnel {
+func New(serverURL, localTarget, authToken string, logger *slog.Logger, callbacks Callbacks) *Tunnel {
 	return &Tunnel{
 		serverURL:   serverURL,
 		localTarget: localTarget,
 		authToken:   authToken,
 		logger:      logger,
+		callbacks:   callbacks,
 	}
 }
 
 // Run is the main lifecycle: connect, read loop, reconnect on failure.
 func (t *Tunnel) Run(ctx context.Context) error {
+	if t.callbacks.OnConnecting != nil {
+		t.callbacks.OnConnecting()
+	}
+
 	if err := t.connect(ctx); err != nil {
 		return fmt.Errorf("initial connection: %w", err)
 	}
@@ -109,7 +122,9 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 	t.tunnelID = assigned.TunnelID
 	t.reconnectToken = assigned.ReconnectToken
 
-	display.PrintBanner(assigned.Subdomain, assigned.URL, t.localTarget)
+	if t.callbacks.OnConnected != nil {
+		t.callbacks.OnConnected(assigned.Subdomain, assigned.URL, t.localTarget)
+	}
 
 	return nil
 }
@@ -156,7 +171,9 @@ func (t *Tunnel) handleRequest(ctx context.Context, frame *RequestFrame) {
 		if writeErr := t.writeJSON(ctx, errFrame); writeErr != nil {
 			t.logger.Error("write error frame failed", "error", writeErr)
 		}
-		display.LogRequest(frame.Method, frame.Path, 502, latency)
+		if t.callbacks.OnRequest != nil {
+			t.callbacks.OnRequest(frame.Method, frame.Path, 502, latency)
+		}
 		return
 	}
 
@@ -165,7 +182,9 @@ func (t *Tunnel) handleRequest(ctx context.Context, frame *RequestFrame) {
 		return
 	}
 
-	display.LogRequest(frame.Method, frame.Path, resp.Status, latency)
+	if t.callbacks.OnRequest != nil {
+		t.callbacks.OnRequest(frame.Method, frame.Path, resp.Status, latency)
+	}
 }
 
 func (t *Tunnel) writeJSON(ctx context.Context, v any) error {
@@ -216,12 +235,12 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 	const maxBackoff = 30 * time.Second
 
 	for attempt := 1; ; attempt++ {
-		display.LogReconnecting(attempt, backoff)
+		if t.callbacks.OnReconnecting != nil {
+			t.callbacks.OnReconnecting(attempt, backoff)
+		}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
+		if err := t.waitWithCountdown(ctx, attempt, backoff); err != nil {
+			return err
 		}
 
 		reconnectURL := t.buildReconnectURL()
@@ -234,8 +253,42 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 			continue
 		}
 
-		display.LogReconnected()
+		if t.callbacks.OnReconnected != nil {
+			t.callbacks.OnReconnected()
+		}
 		return nil
+	}
+}
+
+// waitWithCountdown waits for the given backoff duration, calling OnReconnectWait
+// every second with the remaining time.
+func (t *Tunnel) waitWithCountdown(ctx context.Context, attempt int, backoff time.Duration) error {
+	if t.callbacks.OnReconnectWait == nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+			return nil
+		}
+	}
+
+	deadline := time.Now().Add(backoff)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil
+		}
+
+		t.callbacks.OnReconnectWait(attempt, remaining)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
