@@ -2,9 +2,33 @@
 
 Command-line tool that exposes a local HTTP server to the public internet via a WebSocket tunnel to the justtunnel relay server.
 
+## Install
+
+**macOS / Linux:**
+
+```bash
+curl -fsSL https://justtunnel.dev/install | sh
+```
+
+**Homebrew:**
+
+```bash
+brew install justtunnel/tap/justtunnel
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://justtunnel.dev/install.ps1 | iex
+```
+
+Installs to `$env:LOCALAPPDATA\justtunnel\` and adds it to your user PATH.
+
+Pre-built binaries are available for macOS (arm64, amd64), Linux (arm64, amd64), and Windows (amd64, arm64).
+
 ## Prerequisites
 
-- Go 1.24+
+- Go 1.24+ (for building from source)
 
 ## Quick Start
 
