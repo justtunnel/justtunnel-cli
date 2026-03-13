@@ -79,6 +79,7 @@ justtunnel 3000 --log-level debug        # verbose logging
 |------|-------|---------|-------------|
 | `--subdomain` | `-s` | — | Request a specific reserved subdomain |
 | `--log-level` | — | `info` | `debug`, `info`, `warn`, `error` |
+| `--max-reconnect-attempts` | — | `50` | Max reconnection attempts before giving up (0 = unlimited) |
 | `--config` | — | `~/.config/justtunnel/config.yaml` | Config file path |
 
 ### `justtunnel auth <key>`
@@ -122,6 +123,7 @@ Config file: `~/.config/justtunnel/config.yaml`
 auth_token: "justtunnel_sk_live_abc123..."
 server_url: "wss://api.justtunnel.dev/ws"
 log_level: "info"
+max_reconnect_attempts: 50
 ```
 
 All fields can be overridden with environment variables (prefix `JUSTTUNNEL_`):
@@ -131,6 +133,7 @@ All fields can be overridden with environment variables (prefix `JUSTTUNNEL_`):
 | `JUSTTUNNEL_AUTH_TOKEN` | `auth_token` | — |
 | `JUSTTUNNEL_SERVER_URL` | `server_url` | `wss://api.justtunnel.dev/ws` |
 | `JUSTTUNNEL_LOG_LEVEL` | `log_level` | `info` |
+| `JUSTTUNNEL_MAX_RECONNECT_ATTEMPTS` | `max_reconnect_attempts` | `50` |
 
 ## Terminal Output
 
@@ -139,6 +142,15 @@ The CLI uses colored output, animated spinners, and an ASCII banner when running
 **Color-coded request logs:** 2xx responses are green, 3xx/4xx are yellow, 5xx are red.
 
 **Spinners** show progress during connection, reconnection (with countdown), and device auth flows. In non-TTY environments (e.g., piped output, CI), spinners are replaced with a single static line.
+
+**Reconnection behavior:** When the WebSocket connection drops, the CLI:
+
+1. Prints a timestamped "Disconnected" message
+2. Retries with exponential backoff (1s, 2s, 4s, ... up to 30s cap), showing a countdown spinner
+3. After reconnecting, prints a status block with the tunnel URL, forwarding target, and total downtime
+4. Warns if the subdomain changed (free-tier tunnels may get a new random subdomain)
+5. Gives up after 50 attempts by default (configurable via `--max-reconnect-attempts`, 0 = unlimited)
+6. Exits immediately on auth errors (401/403) instead of retrying
 
 **Disabling color:**
 
@@ -180,8 +192,9 @@ internal/
   display/
     display.go                  Request logging and output helpers
     banner.go                   ASCII art banner on tunnel start
-    color.go                    Color primitives, TTY detection
+    color.go                    Color primitives, TTY detection, C1 sanitization
     errors.go                   Structured error types and printing
+    reconnect.go                Disconnection/reconnection status output
     spinner.go                  Animated spinner (TTY-aware)
   version/version.go            Build-time version variables
 ```
@@ -194,4 +207,4 @@ internal/
 4. CLI receives the frame, forwards the request to `localhost:<port>`, and sends the response back
 5. Server writes the response to the original caller
 6. Heartbeat pings every 30s keep the connection alive
-7. On disconnect, the CLI reconnects with exponential backoff (1s → 30s cap)
+7. On disconnect, the CLI reconnects with exponential backoff (1s -> 30s cap), up to 50 attempts by default. Auth errors (401/403) exit immediately.

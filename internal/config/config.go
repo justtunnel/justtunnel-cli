@@ -11,9 +11,10 @@ import (
 )
 
 type Config struct {
-	AuthToken string `mapstructure:"auth_token" yaml:"auth_token,omitempty"`
-	ServerURL string `mapstructure:"server_url" yaml:"server_url,omitempty"`
-	LogLevel  string `mapstructure:"log_level" yaml:"log_level,omitempty"`
+	AuthToken            string `mapstructure:"auth_token" yaml:"auth_token,omitempty"`
+	ServerURL            string `mapstructure:"server_url" yaml:"server_url,omitempty"`
+	LogLevel             string `mapstructure:"log_level" yaml:"log_level,omitempty"`
+	MaxReconnectAttempts *int   `mapstructure:"max_reconnect_attempts" yaml:"max_reconnect_attempts,omitempty"`
 }
 
 var configFilePath string

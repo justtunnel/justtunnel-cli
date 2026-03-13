@@ -46,12 +46,17 @@ func Bold(text string) string {
 }
 
 // sanitize strips terminal control characters from server-controlled strings
-// to prevent ANSI injection attacks.
+// to prevent ANSI injection attacks. This includes C0 controls (except tab),
+// ESC (0x1B), and C1 control codes (U+0080-U+009F) which many terminals
+// interpret as CSI sequences.
 func sanitize(text string) string {
 	var builder strings.Builder
 	builder.Grow(len(text))
 	for _, char := range text {
 		if char == '\033' || (char < 0x20 && char != '\t') {
+			continue
+		}
+		if char >= 0x80 && char <= 0x9F {
 			continue
 		}
 		builder.WriteRune(char)
