@@ -178,6 +178,11 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case tea.KeySpace:
+		m.inputBuffer += " "
+		m.errorMessage = ""
+		return m, nil
+
 	case tea.KeyRunes:
 		m.inputBuffer += string(msg.Runes)
 		// Clear error on new input

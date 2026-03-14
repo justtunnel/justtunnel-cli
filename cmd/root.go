@@ -26,13 +26,14 @@ var (
 	logLevel             string
 	subdomain            string
 	maxReconnectAttempts int
+	tunnelConfigFile     string
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "justtunnel [port]",
 	Short: "Expose a local HTTP server to the internet",
 	Long:  "justtunnel creates a public URL that tunnels traffic to a local port via a persistent WebSocket connection.",
-	Args: cobra.MaximumNArgs(1),
+	Args: cobra.RangeArgs(0, 1),
 	RunE: runTunnel,
 }
 
@@ -41,6 +42,7 @@ func init() {
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.Flags().StringVarP(&subdomain, "subdomain", "s", "", "request a specific subdomain")
 	rootCmd.Flags().IntVar(&maxReconnectAttempts, "max-reconnect-attempts", 50, "maximum number of reconnection attempts (0 = unlimited)")
+	rootCmd.Flags().StringVar(&tunnelConfigFile, "config-file", "", "YAML config file with tunnel definitions")
 	rootCmd.SilenceErrors = true
 	rootCmd.SilenceUsage = true
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
@@ -55,13 +57,19 @@ func Execute() error {
 }
 
 func runTunnel(cmd *cobra.Command, args []string) error {
-	if len(args) == 0 {
-		return cmd.Help()
+	// Parse port arg if provided
+	var port int
+	if len(args) > 0 {
+		var parseErr error
+		port, parseErr = strconv.Atoi(args[0])
+		if parseErr != nil || port < 1 || port > 65535 {
+			return display.InputError(fmt.Sprintf("invalid port: %s (must be 1-65535)", args[0]))
+		}
 	}
 
-	port, err := strconv.Atoi(args[0])
-	if err != nil || port < 1 || port > 65535 {
-		return display.InputError(fmt.Sprintf("invalid port: %s (must be 1-65535)", args[0]))
+	// Need at least a port arg or a config file
+	if port == 0 && tunnelConfigFile == "" {
+		return cmd.Help()
 	}
 
 	cfg, err := config.Load(cfgFile)
@@ -86,6 +94,10 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 		return runTUI(port, cfg, serverURL, logger, cmd)
 	}
 
+	// Non-TTY requires a port arg (single-tunnel mode)
+	if port == 0 {
+		return display.InputError("port argument is required in non-TTY mode")
+	}
 	return runNonTTY(port, cfg, serverURL, logger, cmd)
 }
 
@@ -118,17 +130,65 @@ func runTUI(port int, cfg *config.Config, serverURL string, logger *slog.Logger,
 	manager := tui.NewTunnelManager(factory, sender)
 	model := tui.NewModelWithManager(manager, planInfo)
 
-	// Add the initial display entry before creating the program so it shows immediately.
-	initialName := fmt.Sprintf(":%d", port)
-	model.AddDisplayEntry(port, initialName)
+	// Load tunnel presets from config file if provided
+	var tunnelPresets []tui.TunnelPreset
+	if tunnelConfigFile != "" {
+		presetConfig, loadErr := tui.LoadConfig(tunnelConfigFile)
+		if loadErr != nil {
+			return fmt.Errorf("load tunnel config: %w", loadErr)
+		}
+		tunnelPresets = presetConfig.Tunnels
+	}
+
+	// Add the initial port arg tunnel (if provided)
+	if port > 0 {
+		initialName := fmt.Sprintf(":%d", port)
+		model.AddDisplayEntry(port, initialName)
+	}
+
+	// Add config file tunnels
+	for _, preset := range tunnelPresets {
+		// Skip if port arg already covers this port
+		if preset.Port == port {
+			continue
+		}
+		displayName := preset.Name
+		if displayName == "" {
+			displayName = fmt.Sprintf(":%d", preset.Port)
+		}
+		model.AddDisplayEntry(preset.Port, displayName)
+	}
 
 	program = tea.NewProgram(model, tea.WithAltScreen())
 	sender.program = program
 
-	// Start the initial tunnel via the manager. The manager's callbacks will
-	// send TunnelConnectedMsg to update the display entry's state.
-	if addErr := manager.Add(port, initialName, subdomain); addErr != nil {
-		return fmt.Errorf("start initial tunnel: %w", addErr)
+	// Start the initial tunnel via the manager
+	if port > 0 {
+		initialName := fmt.Sprintf(":%d", port)
+		if addErr := manager.Add(port, initialName, subdomain); addErr != nil {
+			return fmt.Errorf("start initial tunnel: %w", addErr)
+		}
+	}
+
+	// Start config file tunnels
+	for _, preset := range tunnelPresets {
+		if preset.Port == port {
+			continue
+		}
+		if addErr := manager.Add(preset.Port, preset.Name, preset.Subdomain); addErr != nil {
+			logger.Warn("could not start config tunnel", "port", preset.Port, "error", addErr)
+		}
+	}
+
+	// Start config file watcher for hot-reload
+	if tunnelConfigFile != "" {
+		watcher, watchErr := tui.NewConfigWatcher(tunnelConfigFile, manager, sender)
+		if watchErr != nil {
+			logger.Warn("could not start config watcher", "error", watchErr)
+		} else {
+			watcher.Start()
+			defer watcher.Stop()
+		}
 	}
 
 	// Run Bubble Tea — it handles Ctrl+C internally and delegates to manager.Shutdown()
