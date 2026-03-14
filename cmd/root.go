@@ -15,6 +15,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
+	"golang.org/x/term"
+
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
 	"github.com/justtunnel/justtunnel-cli/internal/tui"
@@ -90,7 +92,8 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	}
 
 	// Fork: TTY gets the Bubble Tea TUI; non-TTY gets the existing single-tunnel flow.
-	if display.IsTerminal() {
+	// Check stdout specifically since Bubble Tea renders there — stderr may still be a TTY.
+	if term.IsTerminal(int(os.Stdout.Fd())) {
 		return runTUI(port, cfg, serverURL, logger, cmd)
 	}
 
