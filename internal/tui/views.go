@@ -45,9 +45,11 @@ func renderListView(model Model) string {
 	if len(model.tunnels) == 0 {
 		builder.WriteString("  No active tunnels. Use /add <port> to start a tunnel.\n")
 	} else {
+		// Column format string — computed once, used for header and each row
+		urlFmt := fmt.Sprintf("%%-%ds", urlWidth)
+
 		// Column headers
-		urlHeaderFmt := fmt.Sprintf("%%-%ds", urlWidth)
-		headerLine := fmt.Sprintf("  %-3s %-15s %-15s "+urlHeaderFmt+" %-10s %-6s",
+		headerLine := fmt.Sprintf("  %-3s %-15s %-15s "+urlFmt+" %-10s %-6s",
 			"#", "Name", "Status", "URL", "Local", "Reqs")
 		builder.WriteString(styleColumnHeader.Render(headerLine))
 		builder.WriteString("\n")
@@ -61,7 +63,6 @@ func renderListView(model Model) string {
 
 			styledStatus := stateStyle(entry.State).Render(fmt.Sprintf("%-15s", stateLabel(entry.State)))
 
-			urlFmt := fmt.Sprintf("%%-%ds", urlWidth)
 			row := fmt.Sprintf("%-3d %-15s %s "+urlFmt+" %-10s %-6d",
 				entry.ID,
 				truncateString(entry.Name, 15),
