@@ -107,7 +107,15 @@ func (m *TunnelManager) removeLocked(port int, sliceIndex int) error {
 		return fmt.Errorf("no tunnel running on port %d", port)
 	}
 
-	// Shutdown the tunnel in the background to avoid holding the lock
+	// Cancel the context first so the tunnel goroutine stops firing callbacks
+	// before we remove the tunnel from the map. This prevents post-removal
+	// callback writes from racing with the tunnel's shutdown.
+	if managed.cancel != nil {
+		managed.cancel()
+	}
+
+	// Shutdown the runner in the background to avoid holding the lock.
+	// The context is already canceled, so no new callbacks will fire.
 	go managed.shutdown(shutdownTimeout)
 
 	delete(m.tunnelsByPort, port)

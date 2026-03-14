@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -35,9 +36,16 @@ type MessageSender interface {
 }
 
 // ManagedTunnel wraps a TunnelRunner with TUI metadata for display and coordination.
+// Fields that are written by callbacks from the tunnel goroutine are protected by mu.
+// Use the getter methods (GetState, GetSubdomain, etc.) for concurrent reads.
 type ManagedTunnel struct {
-	Name          string
-	Port          int
+	// Immutable fields — safe to read without lock.
+	Name   string
+	Port   int
+	Source string
+
+	// mu protects mutable fields written by callbacks from the tunnel goroutine.
+	mu            sync.RWMutex
 	Subdomain     string
 	LastSubdomain string
 	PublicURL     string
@@ -45,12 +53,46 @@ type ManagedTunnel struct {
 	Error         string
 	ConnectedAt   time.Time
 	Stats         *RequestStats
-	Source        string
 	Callbacks     TunnelCallbacks
 
 	runner TunnelRunner
 	cancel context.CancelFunc
 	sender MessageSender
+}
+
+// GetState returns the current tunnel state (thread-safe).
+func (m *ManagedTunnel) GetState() TunnelState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.State
+}
+
+// GetSubdomain returns the current subdomain (thread-safe).
+func (m *ManagedTunnel) GetSubdomain() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Subdomain
+}
+
+// GetPublicURL returns the current public URL (thread-safe).
+func (m *ManagedTunnel) GetPublicURL() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.PublicURL
+}
+
+// GetConnectedAt returns the time the tunnel connected (thread-safe).
+func (m *ManagedTunnel) GetConnectedAt() time.Time {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ConnectedAt
+}
+
+// GetError returns the error message if the tunnel is in StateError (thread-safe).
+func (m *ManagedTunnel) GetError() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Error
 }
 
 // newManagedTunnel creates a ManagedTunnel with callbacks wired to send messages
@@ -72,10 +114,12 @@ func newManagedTunnel(
 
 	callbacks := TunnelCallbacks{
 		OnConnected: func(sub, tunnelURL, localTarget string) {
+			managed.mu.Lock()
 			managed.Subdomain = sub
 			managed.PublicURL = tunnelURL
 			managed.State = StateConnected
 			managed.ConnectedAt = time.Now()
+			managed.mu.Unlock()
 			if sender != nil {
 				sender.Send(TunnelConnectedMsg{
 					Port:      port,
@@ -85,7 +129,9 @@ func newManagedTunnel(
 			}
 		},
 		OnDisconnected: func(timestamp time.Time) {
+			managed.mu.Lock()
 			managed.State = StateDisconnected
+			managed.mu.Unlock()
 			if sender != nil {
 				sender.Send(TunnelDisconnectedMsg{
 					Port:      port,
@@ -94,7 +140,9 @@ func newManagedTunnel(
 			}
 		},
 		OnReconnecting: func(attempt int, backoff time.Duration) {
+			managed.mu.Lock()
 			managed.State = StateReconnecting
+			managed.mu.Unlock()
 			if sender != nil {
 				sender.Send(TunnelReconnectingMsg{
 					Port:    port,
@@ -107,6 +155,7 @@ func newManagedTunnel(
 			managed.handleReconnected(sub, previousSub, tunnelURL, subdomainChanged)
 		},
 		OnRequest: func(method, path string, status int, latency time.Duration) {
+			// Stats has its own internal mutex, no need to hold managed.mu here.
 			managed.Stats.Record(RequestEntry{
 				Method:     method,
 				Path:       path,
@@ -135,13 +184,16 @@ func newManagedTunnel(
 // handleReconnected processes a reconnection event, resetting stats if the
 // subdomain changed (FR-5.3) and sending a TunnelReconnectedMsg.
 func (m *ManagedTunnel) handleReconnected(subdomain, previousSubdomain, tunnelURL string, subdomainChanged bool) {
+	m.mu.Lock()
 	m.LastSubdomain = previousSubdomain
 	m.Subdomain = subdomain
 	m.PublicURL = tunnelURL
 	m.State = StateConnected
 	m.ConnectedAt = time.Now()
+	m.mu.Unlock()
 
 	if subdomainChanged {
+		// Stats has its own internal mutex.
 		m.Stats.Reset()
 	}
 
@@ -155,11 +207,25 @@ func (m *ManagedTunnel) handleReconnected(subdomain, previousSubdomain, tunnelUR
 }
 
 // start launches the tunnel's Run method in a background goroutine.
+// If Run returns a non-context error, the tunnel state is set to StateError
+// and a TunnelErrorMsg is sent to the TUI.
 func (m *ManagedTunnel) start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	go func() {
-		_ = m.runner.Run(ctx)
+		runErr := m.runner.Run(ctx)
+		if runErr != nil && ctx.Err() == nil {
+			m.mu.Lock()
+			m.State = StateError
+			m.Error = runErr.Error()
+			m.mu.Unlock()
+			if m.sender != nil {
+				m.sender.Send(TunnelErrorMsg{
+					Port:    m.Port,
+					Message: runErr.Error(),
+				})
+			}
+		}
 	}()
 }
 
