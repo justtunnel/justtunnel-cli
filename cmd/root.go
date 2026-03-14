@@ -134,7 +134,12 @@ func runTUI(port int, cfg *config.Config, serverURL string, logger *slog.Logger,
 	// Run Bubble Tea — it handles Ctrl+C internally and delegates to manager.Shutdown()
 	_, runErr := program.Run()
 	if runErr != nil {
-		return fmt.Errorf("TUI error: %w", runErr)
+		// TUI initialization failed (e.g., terminal not supported, alt screen rejected).
+		// Shut down the manager's tunnels so we can fall back to the non-interactive path.
+		manager.Shutdown()
+		logger.Warn("TUI could not start, falling back to non-interactive mode", "error", runErr)
+		fmt.Fprintf(os.Stderr, "Warning: TUI failed to start (%v), falling back to single-tunnel mode\n", runErr)
+		return runNonTTY(port, cfg, serverURL, logger, cmd)
 	}
 
 	return nil

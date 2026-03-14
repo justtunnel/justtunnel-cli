@@ -6,6 +6,32 @@ import (
 	"time"
 )
 
+// minHeightForInputBar is the minimum terminal height to show the command input bar.
+// Below this threshold, only the tunnel list is displayed to conserve vertical space.
+const minHeightForInputBar = 10
+
+// fixedColumnsWidth is the total width consumed by non-URL columns in the list view.
+// Layout: marker(2) + ID(3+1) + Name(15+1) + Status(15+1) + Local(10+1) + Reqs(6) = ~55
+const fixedColumnsWidth = 55
+
+// inputBarVisible reports whether the terminal is tall enough to show the input bar.
+func inputBarVisible(terminalHeight int) bool {
+	return terminalHeight >= minHeightForInputBar
+}
+
+// urlColumnWidth calculates the available width for the URL column based on terminal width.
+// It subtracts fixed column space and clamps the result to a reasonable range.
+func urlColumnWidth(terminalWidth int) int {
+	available := terminalWidth - fixedColumnsWidth
+	if available < 10 {
+		available = 10
+	}
+	if available > 55 {
+		available = 55
+	}
+	return available
+}
+
 // renderListView renders the main list view showing all tunnels in a table.
 func renderListView(model Model) string {
 	var builder strings.Builder
@@ -14,11 +40,14 @@ func renderListView(model Model) string {
 	builder.WriteString(renderHeader(model))
 	builder.WriteString("\n\n")
 
+	urlWidth := urlColumnWidth(model.width)
+
 	if len(model.tunnels) == 0 {
 		builder.WriteString("  No active tunnels. Use /add <port> to start a tunnel.\n")
 	} else {
 		// Column headers
-		headerLine := fmt.Sprintf("  %-3s %-15s %-15s %-35s %-10s %-6s",
+		urlHeaderFmt := fmt.Sprintf("%%-%ds", urlWidth)
+		headerLine := fmt.Sprintf("  %-3s %-15s %-15s "+urlHeaderFmt+" %-10s %-6s",
 			"#", "Name", "Status", "URL", "Local", "Reqs")
 		builder.WriteString(styleColumnHeader.Render(headerLine))
 		builder.WriteString("\n")
@@ -32,11 +61,12 @@ func renderListView(model Model) string {
 
 			styledStatus := stateStyle(entry.State).Render(fmt.Sprintf("%-15s", stateLabel(entry.State)))
 
-			row := fmt.Sprintf("%-3d %-15s %s %-35s %-10s %-6d",
+			urlFmt := fmt.Sprintf("%%-%ds", urlWidth)
+			row := fmt.Sprintf("%-3d %-15s %s "+urlFmt+" %-10s %-6d",
 				entry.ID,
 				truncateString(entry.Name, 15),
 				styledStatus,
-				truncateString(entry.PublicURL, 35),
+				truncateString(entry.PublicURL, urlWidth),
 				fmt.Sprintf(":%d", entry.Port),
 				entry.Requests,
 			)
@@ -55,8 +85,10 @@ func renderListView(model Model) string {
 		builder.WriteString("\n")
 	}
 
-	// Input bar
-	builder.WriteString(renderInputBar(model))
+	// Input bar — only shown when terminal is tall enough
+	if inputBarVisible(model.height) {
+		builder.WriteString(renderInputBar(model))
+	}
 
 	return builder.String()
 }
@@ -127,8 +159,10 @@ func renderDetailView(model Model) string {
 		builder.WriteString("\n")
 	}
 
-	// Input bar
-	builder.WriteString(renderInputBar(model))
+	// Input bar — only shown when terminal is tall enough
+	if inputBarVisible(model.height) {
+		builder.WriteString(renderInputBar(model))
+	}
 
 	return builder.String()
 }
@@ -173,4 +207,62 @@ func formatUptime(duration time.Duration) string {
 	minutes := int(duration.Minutes()) % 60
 	seconds := int(duration.Seconds()) % 60
 	return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
+}
+
+// NonTTYEvent represents a tunnel event formatted for non-TTY (piped) output.
+// Each event produces a single line prefixed with [name:port].
+type NonTTYEvent struct {
+	TunnelName string
+	Port       int
+	EventType  string // "connected", "request", "disconnected", "reconnecting", "error"
+	URL        string // for connected events
+	Method     string // for request events
+	Path       string // for request events
+	Status     int    // for request events
+	Latency    time.Duration
+	Detail     string // free-form detail for reconnecting/error events
+}
+
+// FormatNonTTYEvent formats a tunnel event as a single line for non-TTY output.
+// Format: [name:port] event_details
+//
+// Examples:
+//
+//	[frontend:3000] connected https://abc123.justtunnel.dev
+//	[api:8080] GET /api/users 200 12ms
+//	[frontend:3000] disconnected
+//	[api:8080] reconnecting attempt 3
+func FormatNonTTYEvent(event NonTTYEvent) string {
+	prefix := fmt.Sprintf("[%s:%d]", event.TunnelName, event.Port)
+
+	switch event.EventType {
+	case "connected":
+		return fmt.Sprintf("%s connected %s", prefix, event.URL)
+
+	case "request":
+		return fmt.Sprintf("%s %s %s %d %s", prefix,
+			event.Method, event.Path, event.Status,
+			event.Latency.Round(time.Millisecond).String())
+
+	case "disconnected":
+		return fmt.Sprintf("%s disconnected", prefix)
+
+	case "reconnecting":
+		if event.Detail != "" {
+			return fmt.Sprintf("%s reconnecting %s", prefix, event.Detail)
+		}
+		return fmt.Sprintf("%s reconnecting", prefix)
+
+	case "error":
+		if event.Detail != "" {
+			return fmt.Sprintf("%s error %s", prefix, event.Detail)
+		}
+		return fmt.Sprintf("%s error", prefix)
+
+	default:
+		if event.Detail != "" {
+			return fmt.Sprintf("%s %s %s", prefix, event.EventType, event.Detail)
+		}
+		return fmt.Sprintf("%s %s", prefix, event.EventType)
+	}
 }

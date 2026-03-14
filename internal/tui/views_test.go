@@ -392,9 +392,10 @@ func TestRenderListViewCombinedNarrowAndShort(t *testing.T) {
 		t.Error("narrow+short terminal should truncate URLs")
 	}
 
-	// Should NOT contain the input bar
-	inputBarOutput := renderInputBar(model)
-	if strings.Contains(output, inputBarOutput) {
+	// Should NOT contain the input bar — use unique marker in input buffer
+	model.inputBuffer = "COMBINED_INPUT_MARKER"
+	output = renderListView(model) // re-render with the marker
+	if strings.Contains(output, "COMBINED_INPUT_MARKER") {
 		t.Error("narrow+short terminal should hide input bar")
 	}
 
