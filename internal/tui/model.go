@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+	"strconv"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -47,9 +49,16 @@ type Model struct {
 	tickCount     int
 	width         int
 	height        int
+
+	// manager is the tunnel lifecycle manager. When nil, the model operates
+	// in display-only mode (used by existing tests). When set, slash commands
+	// are dispatched to the manager for real tunnel operations.
+	manager *TunnelManager
 }
 
 // NewModel creates a new TUI model with the given tunnel entries and plan info.
+// This constructor creates a display-only model without a manager, preserving
+// backward compatibility with existing tests.
 func NewModel(tunnels []TunnelDisplayEntry, planInfo PlanInfo) Model {
 	return Model{
 		tunnels:   tunnels,
@@ -57,6 +66,20 @@ func NewModel(tunnels []TunnelDisplayEntry, planInfo PlanInfo) Model {
 		viewState: viewList,
 		width:     80,
 		height:    24,
+	}
+}
+
+// NewModelWithManager creates a TUI model wired to a TunnelManager for
+// real tunnel operations. Slash commands typed in the input bar are
+// dispatched to the manager.
+func NewModelWithManager(manager *TunnelManager, planInfo PlanInfo) Model {
+	return Model{
+		tunnels:   make([]TunnelDisplayEntry, 0),
+		planInfo:  planInfo,
+		viewState: viewList,
+		width:     80,
+		height:    24,
+		manager:   manager,
 	}
 }
 
@@ -111,6 +134,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC:
+		if m.manager != nil {
+			m.manager.Shutdown()
+		}
 		return m, tea.Quit
 
 	case tea.KeyUp:
@@ -126,16 +152,154 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEnter:
-		if m.viewState == viewList && len(m.tunnels) > 0 {
-			m.viewState = viewDetail
-		}
-		return m, nil
+		return m.handleEnter()
 
 	case tea.KeyEscape:
 		if m.viewState == viewDetail {
 			m.viewState = viewList
 		}
+		m.inputBuffer = ""
+		m.errorMessage = ""
 		return m, nil
+
+	case tea.KeyBackspace:
+		if len(m.inputBuffer) > 0 {
+			m.inputBuffer = m.inputBuffer[:len(m.inputBuffer)-1]
+		}
+		return m, nil
+
+	case tea.KeyRunes:
+		m.inputBuffer += string(msg.Runes)
+		// Clear error on new input
+		m.errorMessage = ""
+		return m, nil
+	}
+
+	return m, nil
+}
+
+// handleEnter processes the Enter key. When the input buffer has content,
+// it parses and executes the command. When empty, it switches to detail view.
+func (m Model) handleEnter() (tea.Model, tea.Cmd) {
+	if m.inputBuffer != "" {
+		return m.executeInputBuffer()
+	}
+
+	// No input — switch to detail view if in list view with tunnels
+	if m.viewState == viewList && len(m.tunnels) > 0 {
+		m.viewState = viewDetail
+	}
+	return m, nil
+}
+
+// executeInputBuffer parses the input buffer as a command and dispatches it.
+func (m Model) executeInputBuffer() (tea.Model, tea.Cmd) {
+	input := m.inputBuffer
+	m.inputBuffer = ""
+	m.errorMessage = ""
+
+	parsedCmd, parseErr := ParseCommand(input)
+	if parseErr != nil {
+		m.errorMessage = parseErr.Error()
+		return m, nil
+	}
+
+	// ParseCommand returns nil, nil for non-command input
+	if parsedCmd == nil {
+		return m, nil
+	}
+
+	switch cmd := parsedCmd.(type) {
+	case AddCommand:
+		return m.handleAddCommand(cmd)
+	case RemoveCommand:
+		return m.handleRemoveCommand(cmd)
+	case ListCommand:
+		m.viewState = viewList
+		return m, nil
+	case QuitCommand:
+		if m.manager != nil {
+			m.manager.Shutdown()
+		}
+		return m, tea.Quit
+	case HelpCommand:
+		m.errorMessage = "Commands: /add <port>, /remove <index>, /list, /quit, /help"
+		return m, nil
+	}
+
+	return m, nil
+}
+
+// handleAddCommand dispatches an /add command to the manager.
+func (m Model) handleAddCommand(cmd AddCommand) (tea.Model, tea.Cmd) {
+	if m.manager == nil {
+		m.errorMessage = "tunnel manager not available"
+		return m, nil
+	}
+
+	addErr := m.manager.Add(cmd.Port, cmd.Name, cmd.Subdomain)
+	if addErr != nil {
+		m.errorMessage = addErr.Error()
+		return m, nil
+	}
+
+	// Add a display entry for the new tunnel
+	nextID := len(m.tunnels) + 1
+	displayName := cmd.Name
+	if displayName == "" {
+		displayName = fmt.Sprintf(":%d", cmd.Port)
+	}
+
+	m.tunnels = append(m.tunnels, TunnelDisplayEntry{
+		ID:    nextID,
+		Name:  displayName,
+		Port:  cmd.Port,
+		State: StateConnecting,
+	})
+
+	return m, nil
+}
+
+// handleRemoveCommand dispatches a /remove command to the manager.
+// The target can be a 1-based index or a port number.
+func (m Model) handleRemoveCommand(cmd RemoveCommand) (tea.Model, tea.Cmd) {
+	if m.manager == nil {
+		m.errorMessage = "tunnel manager not available"
+		return m, nil
+	}
+
+	target, parseErr := strconv.Atoi(cmd.Target)
+	if parseErr != nil {
+		m.errorMessage = fmt.Sprintf("invalid target: %s (must be an index or port number)", cmd.Target)
+		return m, nil
+	}
+
+	// Try as 1-based index first, then as port number
+	var removeErr error
+	if target >= 1 && target <= len(m.tunnels) {
+		// Looks like a valid index — get the port before removing
+		port := m.tunnels[target-1].Port
+		removeErr = m.manager.RemoveByIndex(target)
+		if removeErr == nil {
+			m.RemoveTunnel(port)
+			// If we were in detail view of the removed tunnel, go back to list
+			if m.viewState == viewDetail && m.selectedIndex >= len(m.tunnels) {
+				m.viewState = viewList
+			}
+		}
+	} else {
+		// Try as port number
+		removeErr = m.manager.RemoveByPort(target)
+		if removeErr == nil {
+			m.RemoveTunnel(target)
+			if m.viewState == viewDetail && m.selectedIndex >= len(m.tunnels) {
+				m.viewState = viewList
+			}
+		}
+	}
+
+	if removeErr != nil {
+		m.errorMessage = removeErr.Error()
 	}
 
 	return m, nil

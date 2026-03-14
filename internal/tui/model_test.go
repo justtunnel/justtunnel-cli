@@ -519,3 +519,381 @@ func TestDetailViewArrowKeysIgnored(t *testing.T) {
 		t.Errorf("viewState changed after arrow key in detail view: got %d, want %d", model.viewState, viewDetail)
 	}
 }
+
+// --- Tests for command input and manager wiring ---
+
+// newManagedTestModel creates a Model wired to a TunnelManager with mock tunnels,
+// suitable for testing command dispatch behavior.
+func newManagedTestModel(t *testing.T) (Model, map[int]*mockTunnel) {
+	t.Helper()
+	mocks := make(map[int]*mockTunnel)
+	collector := newMsgCollector()
+	mgr := NewTunnelManager(mockTunnelFactory(mocks), collector)
+	model := NewModelWithManager(mgr, PlanInfo{Name: "Pro", MaxTunnels: 5})
+	return model, mocks
+}
+
+// typeCommand simulates typing a string into the input buffer via rune messages.
+func typeCommand(t *testing.T, model Model, text string) Model {
+	t.Helper()
+	for _, char := range text {
+		msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{char}}
+		updatedModel, _ := model.Update(msg)
+		model = updatedModel.(Model)
+	}
+	return model
+}
+
+// pressEnter simulates pressing the Enter key.
+func pressEnter(t *testing.T, model Model) (Model, tea.Cmd) {
+	t.Helper()
+	enterMsg := tea.KeyMsg{Type: tea.KeyEnter}
+	updatedModel, cmd := model.Update(enterMsg)
+	return updatedModel.(Model), cmd
+}
+
+func TestInputBufferTyping(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rune input appends to input buffer", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 2)
+		model = typeCommand(t, model, "/add 8080")
+
+		if model.inputBuffer != "/add 8080" {
+			t.Errorf("inputBuffer = %q, want %q", model.inputBuffer, "/add 8080")
+		}
+	})
+
+	t.Run("backspace removes last character from buffer", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 2)
+		model = typeCommand(t, model, "/add")
+
+		backspaceMsg := tea.KeyMsg{Type: tea.KeyBackspace}
+		updatedModel, _ := model.Update(backspaceMsg)
+		model = updatedModel.(Model)
+
+		if model.inputBuffer != "/ad" {
+			t.Errorf("inputBuffer = %q, want %q", model.inputBuffer, "/ad")
+		}
+	})
+
+	t.Run("backspace on empty buffer is no-op", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 2)
+
+		backspaceMsg := tea.KeyMsg{Type: tea.KeyBackspace}
+		updatedModel, _ := model.Update(backspaceMsg)
+		model = updatedModel.(Model)
+
+		if model.inputBuffer != "" {
+			t.Errorf("inputBuffer = %q, want empty", model.inputBuffer)
+		}
+	})
+
+	t.Run("escape clears the input buffer", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 2)
+		model = typeCommand(t, model, "/add 8080")
+
+		escMsg := tea.KeyMsg{Type: tea.KeyEscape}
+		updatedModel, _ := model.Update(escMsg)
+		model = updatedModel.(Model)
+
+		if model.inputBuffer != "" {
+			t.Errorf("inputBuffer = %q, want empty after Esc", model.inputBuffer)
+		}
+	})
+
+	t.Run("enter with input buffer executes command and clears buffer", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+		model = typeCommand(t, model, "/add 8080")
+
+		model, _ = pressEnter(t, model)
+
+		if model.inputBuffer != "" {
+			t.Errorf("inputBuffer = %q, want empty after Enter", model.inputBuffer)
+		}
+	})
+
+	t.Run("enter with empty input buffer and tunnels switches to detail view", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 3)
+
+		model, _ = pressEnter(t, model)
+
+		if model.viewState != viewDetail {
+			t.Errorf("viewState = %d, want viewDetail (%d)", model.viewState, viewDetail)
+		}
+	})
+}
+
+func TestAddCommandDispatch(t *testing.T) {
+	t.Parallel()
+
+	t.Run("add command creates tunnel via manager", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+		model = typeCommand(t, model, "/add 8080")
+
+		model, _ = pressEnter(t, model)
+
+		if model.errorMessage != "" {
+			t.Errorf("unexpected error: %s", model.errorMessage)
+		}
+		if len(model.tunnels) != 1 {
+			t.Fatalf("expected 1 tunnel in display, got %d", len(model.tunnels))
+		}
+		if model.tunnels[0].Port != 8080 {
+			t.Errorf("tunnel port = %d, want 8080", model.tunnels[0].Port)
+		}
+		if model.tunnels[0].State != StateConnecting {
+			t.Errorf("tunnel state = %v, want StateConnecting", model.tunnels[0].State)
+		}
+	})
+
+	t.Run("add command with name uses provided name", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+		model = typeCommand(t, model, "/add 8080 --name web")
+
+		model, _ = pressEnter(t, model)
+
+		if len(model.tunnels) != 1 {
+			t.Fatalf("expected 1 tunnel, got %d", len(model.tunnels))
+		}
+		if model.tunnels[0].Name != "web" {
+			t.Errorf("tunnel name = %q, want %q", model.tunnels[0].Name, "web")
+		}
+	})
+
+	t.Run("add duplicate port shows error", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+		model = typeCommand(t, model, "/add 8080")
+		model, _ = pressEnter(t, model)
+
+		model = typeCommand(t, model, "/add 8080")
+		model, _ = pressEnter(t, model)
+
+		if model.errorMessage == "" {
+			t.Error("expected error for duplicate port, got empty error")
+		}
+		if len(model.tunnels) != 1 {
+			t.Errorf("expected 1 tunnel (no duplicate), got %d", len(model.tunnels))
+		}
+	})
+
+	t.Run("add command without manager shows error", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 0)
+		model = typeCommand(t, model, "/add 8080")
+		model, _ = pressEnter(t, model)
+
+		if model.errorMessage == "" {
+			t.Error("expected error when manager is nil")
+		}
+	})
+}
+
+func TestRemoveCommandDispatch(t *testing.T) {
+	t.Parallel()
+
+	t.Run("remove by index removes tunnel from manager and display", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+
+		// Add two tunnels
+		model = typeCommand(t, model, "/add 3000")
+		model, _ = pressEnter(t, model)
+		model = typeCommand(t, model, "/add 8080")
+		model, _ = pressEnter(t, model)
+
+		if len(model.tunnels) != 2 {
+			t.Fatalf("expected 2 tunnels, got %d", len(model.tunnels))
+		}
+
+		// Remove tunnel at index 1 (1-based)
+		model = typeCommand(t, model, "/remove 1")
+		model, _ = pressEnter(t, model)
+
+		if model.errorMessage != "" {
+			t.Errorf("unexpected error: %s", model.errorMessage)
+		}
+		if len(model.tunnels) != 1 {
+			t.Fatalf("expected 1 tunnel after removal, got %d", len(model.tunnels))
+		}
+		if model.tunnels[0].Port != 8080 {
+			t.Errorf("remaining tunnel port = %d, want 8080", model.tunnels[0].Port)
+		}
+	})
+
+	t.Run("remove non-existent index shows error", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+		model = typeCommand(t, model, "/add 8080")
+		model, _ = pressEnter(t, model)
+
+		model = typeCommand(t, model, "/remove 5")
+		model, _ = pressEnter(t, model)
+
+		if model.errorMessage == "" {
+			t.Error("expected error for non-existent index")
+		}
+	})
+
+	t.Run("remove without manager shows error", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 2)
+		model = typeCommand(t, model, "/remove 1")
+		model, _ = pressEnter(t, model)
+
+		if model.errorMessage == "" {
+			t.Error("expected error when manager is nil")
+		}
+	})
+}
+
+func TestQuitCommandDispatch(t *testing.T) {
+	t.Parallel()
+
+	t.Run("quit command with manager calls shutdown and quits", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+
+		// Add a tunnel first
+		model = typeCommand(t, model, "/add 8080")
+		model, _ = pressEnter(t, model)
+
+		model = typeCommand(t, model, "/quit")
+		_, cmd := pressEnter(t, model)
+
+		if cmd == nil {
+			t.Fatal("/quit should produce a quit command")
+		}
+		quitMsg := cmd()
+		if _, isQuit := quitMsg.(tea.QuitMsg); !isQuit {
+			t.Errorf("/quit produced %T, want tea.QuitMsg", quitMsg)
+		}
+	})
+
+	t.Run("quit command without manager just quits", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 0)
+		model = typeCommand(t, model, "/quit")
+		_, cmd := pressEnter(t, model)
+
+		if cmd == nil {
+			t.Fatal("/quit should produce a quit command")
+		}
+	})
+}
+
+func TestHelpCommandDispatch(t *testing.T) {
+	t.Parallel()
+
+	model, _ := newManagedTestModel(t)
+	model = typeCommand(t, model, "/help")
+	model, _ = pressEnter(t, model)
+
+	if model.errorMessage == "" {
+		t.Error("expected help text in errorMessage")
+	}
+	if !strings.Contains(model.errorMessage, "/add") {
+		t.Errorf("help text should mention /add, got %q", model.errorMessage)
+	}
+}
+
+func TestListCommandDispatch(t *testing.T) {
+	t.Parallel()
+
+	model, _ := newManagedTestModel(t)
+
+	// Add a tunnel, go to detail view
+	model = typeCommand(t, model, "/add 8080")
+	model, _ = pressEnter(t, model)
+
+	enterMsg := tea.KeyMsg{Type: tea.KeyEnter}
+	updatedModel, _ := model.Update(enterMsg)
+	model = updatedModel.(Model)
+
+	if model.viewState != viewDetail {
+		t.Fatalf("expected detail view, got %d", model.viewState)
+	}
+
+	// /list should return to list view
+	model = typeCommand(t, model, "/list")
+	model, _ = pressEnter(t, model)
+
+	if model.viewState != viewList {
+		t.Errorf("viewState after /list = %d, want viewList", model.viewState)
+	}
+}
+
+func TestUnknownCommandShowsError(t *testing.T) {
+	t.Parallel()
+
+	model, _ := newManagedTestModel(t)
+	model = typeCommand(t, model, "/unknown")
+	model, _ = pressEnter(t, model)
+
+	if model.errorMessage == "" {
+		t.Error("expected error for unknown command")
+	}
+	if !strings.Contains(model.errorMessage, "Unknown command") {
+		t.Errorf("error = %q, want to contain 'Unknown command'", model.errorMessage)
+	}
+}
+
+func TestCtrlCWithManagerCallsShutdown(t *testing.T) {
+	t.Parallel()
+
+	model, _ := newManagedTestModel(t)
+
+	// Add a tunnel
+	model = typeCommand(t, model, "/add 8080")
+	model, _ = pressEnter(t, model)
+
+	// Manager should have 1 tunnel
+	if model.manager.Count() != 1 {
+		t.Fatalf("expected 1 tunnel in manager, got %d", model.manager.Count())
+	}
+
+	// Press Ctrl+C
+	ctrlCMsg := tea.KeyMsg{Type: tea.KeyCtrlC}
+	_, cmd := model.Update(ctrlCMsg)
+
+	if cmd == nil {
+		t.Fatal("Ctrl+C should produce a quit command")
+	}
+
+	// Manager should have been shut down (0 tunnels)
+	if model.manager.Count() != 0 {
+		t.Errorf("expected 0 tunnels after Ctrl+C shutdown, got %d", model.manager.Count())
+	}
+}
+
+func TestNewModelWithManagerInitialState(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewTunnelManager(mockTunnelFactory(nil), nil)
+	model := NewModelWithManager(mgr, PlanInfo{Name: "starter", MaxTunnels: 2})
+
+	if model.manager == nil {
+		t.Fatal("manager should be set")
+	}
+	if len(model.tunnels) != 0 {
+		t.Errorf("initial tunnel count = %d, want 0", len(model.tunnels))
+	}
+	if model.planInfo.Name != "starter" {
+		t.Errorf("plan name = %q, want %q", model.planInfo.Name, "starter")
+	}
+	if model.planInfo.MaxTunnels != 2 {
+		t.Errorf("max tunnels = %d, want 2", model.planInfo.MaxTunnels)
+	}
+	if model.viewState != viewList {
+		t.Errorf("viewState = %d, want viewList", model.viewState)
+	}
+}
