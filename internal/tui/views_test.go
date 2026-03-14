@@ -102,16 +102,19 @@ func TestRenderListViewShortTerminal(t *testing.T) {
 			model := newTestModel(t, 2)
 			model.height = tt.terminalHeight
 			model.width = 80
+			// Set a unique input buffer so we can detect the input bar
+			// even when lipgloss strips ANSI codes and the "> " prompt
+			// would be indistinguishable from the selection marker.
+			model.inputBuffer = "INPUTBAR_MARKER"
 
 			output := renderListView(model)
 
-			// The input bar contains "> " prompt from renderInputBar
-			hasInputBar := strings.Contains(output, "> ")
+			hasInputBar := strings.Contains(output, "INPUTBAR_MARKER")
 			if tt.wantInputBar && !hasInputBar {
-				t.Errorf("height=%d should show input bar, but '> ' not found in output", tt.terminalHeight)
+				t.Errorf("height=%d should show input bar, but input bar content not found", tt.terminalHeight)
 			}
 			if !tt.wantInputBar && hasInputBar {
-				t.Errorf("height=%d should hide input bar, but '> ' was found in output", tt.terminalHeight)
+				t.Errorf("height=%d should hide input bar, but input bar content was found", tt.terminalHeight)
 			}
 		})
 	}
@@ -302,11 +305,12 @@ func TestShortTerminalHidesInputBarInDetailView(t *testing.T) {
 	model.viewState = viewDetail
 	model.height = 8
 	model.width = 80
+	model.inputBuffer = "DETAIL_INPUT_MARKER"
 
 	output := renderDetailView(model)
 
 	// Input bar should be hidden when height < 10
-	if strings.Contains(output, "> ") {
+	if strings.Contains(output, "DETAIL_INPUT_MARKER") {
 		t.Error("short terminal (height=8) should hide input bar in detail view")
 	}
 }
@@ -389,17 +393,8 @@ func TestRenderListViewCombinedNarrowAndShort(t *testing.T) {
 	}
 
 	// Should NOT contain the input bar
-	// The ">" could appear in the selection marker, so check for "> " (the input prompt)
-	lines := strings.Split(output, "\n")
-	lastNonEmpty := ""
-	for lineIdx := len(lines) - 1; lineIdx >= 0; lineIdx-- {
-		if strings.TrimSpace(lines[lineIdx]) != "" {
-			lastNonEmpty = lines[lineIdx]
-			break
-		}
-	}
-	// The last non-empty line should NOT be the input prompt
-	if strings.HasPrefix(strings.TrimSpace(lastNonEmpty), "> ") || lastNonEmpty == "> " {
+	inputBarOutput := renderInputBar(model)
+	if strings.Contains(output, inputBarOutput) {
 		t.Error("narrow+short terminal should hide input bar")
 	}
 
@@ -411,6 +406,177 @@ func TestRenderListViewCombinedNarrowAndShort(t *testing.T) {
 	// Should still contain tunnel data
 	if !strings.Contains(output, "3000") {
 		t.Error("even narrow+short terminal should show port numbers")
+	}
+}
+
+func TestRenderListViewWithThreeTunnels(t *testing.T) {
+	t.Parallel()
+
+	tunnels := []TunnelDisplayEntry{
+		{ID: 1, Name: "api", Port: 3000, Subdomain: "api-sub", PublicURL: "https://api-sub.justtunnel.dev", State: StateConnected, Requests: 42},
+		{ID: 2, Name: "web", Port: 8080, Subdomain: "web-sub", PublicURL: "https://web-sub.justtunnel.dev", State: StateConnecting, Requests: 0},
+		{ID: 3, Name: "worker", Port: 9090, Subdomain: "", PublicURL: "", State: StateDisconnected, Requests: 7},
+	}
+
+	model := NewModel(tunnels, PlanInfo{Name: "pro", MaxTunnels: 5})
+	output := renderListView(model)
+
+	// All three tunnels should appear
+	for _, name := range []string{"api", "web", "worker"} {
+		if !strings.Contains(output, name) {
+			t.Errorf("list view missing tunnel name %q", name)
+		}
+	}
+
+	// All three ports should appear
+	for _, port := range []string{":3000", ":8080", ":9090"} {
+		if !strings.Contains(output, port) {
+			t.Errorf("list view missing port %s", port)
+		}
+	}
+
+	// All state labels should appear
+	for _, label := range []string{"[connected]", "[connecting]", "[disconnected]"} {
+		if !strings.Contains(output, label) {
+			t.Errorf("list view missing state label %s", label)
+		}
+	}
+
+	// Quota should reflect 3 tunnels
+	if !strings.Contains(output, "3/5") {
+		t.Error("list view missing quota '3/5'")
+	}
+}
+
+func TestRenderListViewEmpty(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(nil, PlanInfo{Name: "free", MaxTunnels: 1})
+	output := renderListView(model)
+
+	if !strings.Contains(output, "No active tunnels") {
+		t.Error("empty list view missing 'No active tunnels' message")
+	}
+	if !strings.Contains(output, "/add") {
+		t.Error("empty list view missing '/add' hint")
+	}
+	if !strings.Contains(output, "0/1") {
+		t.Error("empty list view missing '0/1' quota")
+	}
+}
+
+func TestRenderDetailViewDirect(t *testing.T) {
+	t.Parallel()
+
+	tunnels := []TunnelDisplayEntry{
+		{
+			ID:          1,
+			Name:        "api",
+			Port:        3000,
+			Subdomain:   "api-sub",
+			PublicURL:   "https://api-sub.justtunnel.dev",
+			State:       StateConnected,
+			ConnectedAt: time.Now().Add(-5 * time.Minute),
+			Requests:    25,
+			AvgReqSec:   1.5,
+		},
+	}
+
+	model := NewModel(tunnels, PlanInfo{Name: "pro", MaxTunnels: 5})
+	model.viewState = viewDetail
+	model.selectedIndex = 0
+
+	output := renderDetailView(model)
+
+	// URL
+	if !strings.Contains(output, "https://api-sub.justtunnel.dev") {
+		t.Error("detail view missing public URL")
+	}
+	// Port
+	if !strings.Contains(output, ":3000") {
+		t.Error("detail view missing local port")
+	}
+	// Status
+	if !strings.Contains(output, "[connected]") {
+		t.Error("detail view missing status label")
+	}
+	// Subdomain
+	if !strings.Contains(output, "api-sub") {
+		t.Error("detail view missing subdomain")
+	}
+	// Request count
+	if !strings.Contains(output, "25") {
+		t.Error("detail view missing request count")
+	}
+	// Avg req/sec
+	if !strings.Contains(output, "1.5") {
+		t.Error("detail view missing avg req/sec")
+	}
+	// Recent requests section
+	if !strings.Contains(output, "Recent Requests") {
+		t.Error("detail view missing 'Recent Requests' header")
+	}
+	// Uptime (should show ~5m)
+	if !strings.Contains(output, "5m") {
+		t.Error("detail view missing uptime")
+	}
+	// Esc hint
+	if !strings.Contains(output, "Esc") {
+		t.Error("detail view missing Esc navigation hint")
+	}
+}
+
+func TestRenderHeaderPlanQuota(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		tunnels    int
+		planName   string
+		maxTunnels int
+		wantQuota  string
+	}{
+		{"empty free plan", 0, "free", 1, "0/1"},
+		{"2 of 5 pro plan", 2, "pro", 5, "2/5"},
+		{"at limit starter", 2, "starter", 2, "2/2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			entries := make([]TunnelDisplayEntry, tt.tunnels)
+			for idx := range tt.tunnels {
+				entries[idx] = TunnelDisplayEntry{ID: idx + 1, Port: 3000 + idx}
+			}
+
+			model := NewModel(entries, PlanInfo{Name: tt.planName, MaxTunnels: tt.maxTunnels})
+			header := renderHeader(model)
+
+			if !strings.Contains(header, "justtunnel") {
+				t.Error("header missing 'justtunnel'")
+			}
+			if !strings.Contains(header, tt.wantQuota) {
+				t.Errorf("header missing quota %q, got: %s", tt.wantQuota, header)
+			}
+			if !strings.Contains(header, tt.planName) {
+				t.Errorf("header missing plan name %q", tt.planName)
+			}
+		})
+	}
+}
+
+func TestRenderDetailViewFallbackOnBadIndex(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(nil, PlanInfo{Name: "free", MaxTunnels: 1})
+	model.selectedIndex = 5 // Out of bounds
+
+	output := renderDetailView(model)
+
+	// Should fallback to list view rendering
+	if !strings.Contains(output, "No active tunnels") {
+		t.Error("detail view with out-of-bounds index should fall back to list view")
 	}
 }
 
