@@ -94,6 +94,19 @@ func mockTunnelFactory(mocks map[int]*mockTunnel) TunnelFactory {
 	}
 }
 
+// mockTunnelFactoryWithError creates a factory that produces mockTunnels
+// pre-configured to return the given error from Run().
+func mockTunnelFactoryWithError(runErr error, mocks map[int]*mockTunnel) TunnelFactory {
+	return func(port int, name string, subdomain string, callbacks TunnelCallbacks) TunnelRunner {
+		mock := newMockTunnel(port)
+		mock.runErr = runErr
+		if mocks != nil {
+			mocks[port] = mock
+		}
+		return mock
+	}
+}
+
 func TestManagerAddTunnel(t *testing.T) {
 	t.Run("add tunnel appears in list with correct port and state", func(t *testing.T) {
 		mgr := NewTunnelManager(mockTunnelFactory(nil), nil)
@@ -519,4 +532,126 @@ func TestManagerRemoveByIndexBounds(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestManagerRunErrorPropagation(t *testing.T) {
+	t.Run("runner.Run error sends TunnelErrorMsg and sets StateError", func(t *testing.T) {
+		collector := newMsgCollector()
+		tunnelErr := fmt.Errorf("plan limit reached: upgrade to add more tunnels")
+		mocks := make(map[int]*mockTunnel)
+		mgr := NewTunnelManager(mockTunnelFactoryWithError(tunnelErr, mocks), collector)
+
+		err := mgr.Add(8080, "web", "")
+		if err != nil {
+			t.Fatalf("Add(8080) returned unexpected error: %v", err)
+		}
+
+		// The mock returns the error immediately from Run(), so give the
+		// goroutine a moment to propagate the error.
+		time.Sleep(50 * time.Millisecond)
+
+		// Verify that a TunnelErrorMsg was sent with the correct port and message
+		msgs := collector.Messages()
+		foundError := false
+		for _, msg := range msgs {
+			if errMsg, ok := msg.(TunnelErrorMsg); ok {
+				if errMsg.Port == 8080 && errMsg.Message == tunnelErr.Error() {
+					foundError = true
+					break
+				}
+			}
+		}
+		if !foundError {
+			t.Errorf("expected TunnelErrorMsg for port 8080 with message %q, got messages: %v", tunnelErr.Error(), msgs)
+		}
+
+		// Verify that the managed tunnel's state is set to StateError
+		managed := mgr.getManagedTunnel(8080)
+		if managed == nil {
+			t.Fatal("expected managed tunnel for port 8080")
+		}
+		if managed.GetState() != StateError {
+			t.Errorf("expected state %v, got %v", StateError, managed.GetState())
+		}
+	})
+
+	t.Run("context cancellation error is not propagated as TunnelErrorMsg", func(t *testing.T) {
+		collector := newMsgCollector()
+		mocks := make(map[int]*mockTunnel)
+		mgr := NewTunnelManager(mockTunnelFactory(mocks), collector)
+
+		err := mgr.Add(8080, "web", "")
+		if err != nil {
+			t.Fatalf("Add(8080) returned unexpected error: %v", err)
+		}
+
+		// Remove the tunnel, which cancels the context
+		err = mgr.RemoveByPort(8080)
+		if err != nil {
+			t.Fatalf("RemoveByPort(8080) returned unexpected error: %v", err)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Verify no TunnelErrorMsg was sent (context.Canceled is not a real error)
+		msgs := collector.Messages()
+		for _, msg := range msgs {
+			if errMsg, ok := msg.(TunnelErrorMsg); ok {
+				t.Errorf("unexpected TunnelErrorMsg: %+v", errMsg)
+			}
+		}
+	})
+}
+
+func TestManagedTunnelConcurrentAccess(t *testing.T) {
+	// This test verifies that concurrent reads and writes to ManagedTunnel
+	// fields don't race. Run with -race to detect data races.
+	collector := newMsgCollector()
+	mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
+
+	_ = mgr.Add(8080, "web", "")
+
+	managed := mgr.getManagedTunnel(8080)
+	if managed == nil {
+		t.Fatal("expected managed tunnel for port 8080")
+	}
+
+	// Spawn concurrent writers (simulating callbacks)
+	var writeWg sync.WaitGroup
+	writeWg.Add(3)
+	go func() {
+		defer writeWg.Done()
+		for iter := 0; iter < 100; iter++ {
+			managed.Callbacks.OnConnected("sub", "https://sub.example.com", "localhost:8080")
+		}
+	}()
+	go func() {
+		defer writeWg.Done()
+		for iter := 0; iter < 100; iter++ {
+			managed.Callbacks.OnDisconnected(time.Now())
+		}
+	}()
+	go func() {
+		defer writeWg.Done()
+		for iter := 0; iter < 100; iter++ {
+			managed.Callbacks.OnReconnecting(iter, time.Second)
+		}
+	}()
+
+	// Spawn concurrent readers (simulating TUI render loop)
+	var readWg sync.WaitGroup
+	readWg.Add(1)
+	go func() {
+		defer readWg.Done()
+		for iter := 0; iter < 100; iter++ {
+			_ = managed.GetState()
+			_ = managed.GetSubdomain()
+			_ = managed.GetPublicURL()
+			_ = managed.GetConnectedAt()
+			_ = managed.GetError()
+		}
+	}()
+
+	writeWg.Wait()
+	readWg.Wait()
 }
