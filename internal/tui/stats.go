@@ -46,19 +46,7 @@ func (s *RequestStats) Record(entry RequestEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.totalCount++
-
-	// Add to rolling log, evicting oldest if at capacity.
-	if len(s.recentRequests) >= maxRecentRequests {
-		// Shift everything left by one to drop the oldest entry.
-		copy(s.recentRequests, s.recentRequests[1:])
-		s.recentRequests[len(s.recentRequests)-1] = entry
-	} else {
-		s.recentRequests = append(s.recentRequests, entry)
-	}
-
-	// Add timestamp to sliding window.
-	s.windowTimestamps = append(s.windowTimestamps, entry.Timestamp)
+	s.recordLocked(entry, entry.Timestamp)
 }
 
 // RecordWithTimestamp adds a request entry using a specific timestamp for the sliding window.
@@ -67,6 +55,11 @@ func (s *RequestStats) RecordWithTimestamp(entry RequestEntry, windowTime time.T
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.recordLocked(entry, windowTime)
+}
+
+// recordLocked performs the actual recording. Must be called with s.mu held.
+func (s *RequestStats) recordLocked(entry RequestEntry, windowTime time.Time) {
 	s.totalCount++
 
 	// Add to rolling log, evicting oldest if at capacity.
@@ -77,7 +70,7 @@ func (s *RequestStats) RecordWithTimestamp(entry RequestEntry, windowTime time.T
 		s.recentRequests = append(s.recentRequests, entry)
 	}
 
-	// Add the explicit timestamp to sliding window.
+	// Add timestamp to sliding window.
 	s.windowTimestamps = append(s.windowTimestamps, windowTime)
 }
 
@@ -108,23 +101,28 @@ func (s *RequestStats) RecentRequests() []RequestEntry {
 
 // AvgReqPerSec calculates the average requests per second over the sliding window.
 // It counts timestamps within the last 60 seconds and divides by 60.
+// Expired timestamps are pruned to prevent unbounded memory growth.
 func (s *RequestStats) AvgReqPerSec() float64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if len(s.windowTimestamps) == 0 {
 		return 0.0
 	}
 
 	cutoff := time.Now().Add(-slidingWindowDuration)
-	recentCount := 0
+
+	// Prune expired timestamps and count remaining in one pass.
+	writeIdx := 0
 	for _, timestamp := range s.windowTimestamps {
 		if !timestamp.Before(cutoff) {
-			recentCount++
+			s.windowTimestamps[writeIdx] = timestamp
+			writeIdx++
 		}
 	}
+	s.windowTimestamps = s.windowTimestamps[:writeIdx]
 
-	return float64(recentCount) / slidingWindowDuration.Seconds()
+	return float64(writeIdx) / slidingWindowDuration.Seconds()
 }
 
 // Reset clears all statistics. Called when a tunnel reconnects with a different subdomain.
