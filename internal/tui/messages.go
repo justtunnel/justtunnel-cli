@@ -53,6 +53,12 @@ type ConfigChangedMsg struct {
 	ToRemove []int
 }
 
+// ConfigReloadErrorMsg indicates the config file could not be reloaded (invalid YAML, missing file, etc.).
+// Existing tunnels are left untouched.
+type ConfigReloadErrorMsg struct {
+	Error string
+}
+
 // TunnelPreset holds the configuration for a tunnel from a config file.
 type TunnelPreset struct {
 	Port      int    `yaml:"port"`

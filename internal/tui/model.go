@@ -128,6 +128,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case TunnelErrorMsg:
 		return m.handleTunnelError(msg)
+
+	case ConfigChangedMsg:
+		return m.handleConfigChanged(msg)
+
+	case ConfigReloadErrorMsg:
+		m.errorMessage = msg.Error
+		return m, nil
 	}
 
 	return m, nil
@@ -379,6 +386,46 @@ func (m Model) handleTunnelError(msg TunnelErrorMsg) (tea.Model, tea.Cmd) {
 			break
 		}
 	}
+	return m, nil
+}
+
+// handleConfigChanged processes a config file hot-reload event. It adds and
+// removes tunnels based on the diff between the desired config and current state.
+func (m Model) handleConfigChanged(msg ConfigChangedMsg) (tea.Model, tea.Cmd) {
+	if m.manager == nil {
+		m.errorMessage = "tunnel manager not available"
+		return m, nil
+	}
+
+	// Remove tunnels that are no longer in the config
+	for _, port := range msg.ToRemove {
+		removeErr := m.manager.RemoveByPort(port)
+		if removeErr == nil {
+			m.RemoveTunnel(port)
+		}
+	}
+
+	// Add tunnels that are new in the config
+	for _, preset := range msg.ToAdd {
+		addErr := m.manager.Add(preset.Port, preset.Name, preset.Subdomain)
+		if addErr != nil {
+			continue
+		}
+
+		nextID := len(m.tunnels) + 1
+		displayName := preset.Name
+		if displayName == "" {
+			displayName = fmt.Sprintf(":%d", preset.Port)
+		}
+		m.tunnels = append(m.tunnels, TunnelDisplayEntry{
+			ID:    nextID,
+			Name:  displayName,
+			Port:  preset.Port,
+			State: StateConnecting,
+		})
+	}
+
+	m.clampSelectedIndex()
 	return m, nil
 }
 
