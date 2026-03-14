@@ -118,23 +118,25 @@ func runTUI(port int, cfg *config.Config, serverURL string, logger *slog.Logger,
 	manager := tui.NewTunnelManager(factory, sender)
 	model := tui.NewModelWithManager(manager, planInfo)
 
+	// Add the initial display entry before creating the program so it shows immediately.
+	initialName := fmt.Sprintf(":%d", port)
+	model.AddDisplayEntry(port, initialName)
+
 	program = tea.NewProgram(model, tea.WithAltScreen())
 	sender.program = program
 
-	// Add the initial tunnel from the CLI port argument
-	initialName := fmt.Sprintf(":%d", port)
+	// Start the initial tunnel via the manager. The manager's callbacks will
+	// send TunnelConnectedMsg to update the display entry's state.
 	if addErr := manager.Add(port, initialName, subdomain); addErr != nil {
 		return fmt.Errorf("start initial tunnel: %w", addErr)
 	}
 
 	// Run Bubble Tea — it handles Ctrl+C internally and delegates to manager.Shutdown()
-	finalModel, runErr := program.Run()
+	_, runErr := program.Run()
 	if runErr != nil {
 		return fmt.Errorf("TUI error: %w", runErr)
 	}
 
-	// Check if the final model has any error to report
-	_ = finalModel
 	return nil
 }
 

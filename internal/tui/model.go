@@ -120,6 +120,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case TunnelReconnectingMsg:
 		return m.handleTunnelReconnecting(msg)
 
+	case TunnelReconnectedMsg:
+		return m.handleTunnelReconnected(msg)
+
 	case TunnelRequestMsg:
 		return m.handleTunnelRequest(msg)
 
@@ -312,6 +315,7 @@ func (m Model) handleTunnelConnected(msg TunnelConnectedMsg) (tea.Model, tea.Cmd
 			m.tunnels[idx].State = StateConnected
 			m.tunnels[idx].Subdomain = msg.Subdomain
 			m.tunnels[idx].PublicURL = msg.PublicURL
+			m.tunnels[idx].ConnectedAt = time.Now()
 			break
 		}
 	}
@@ -323,6 +327,21 @@ func (m Model) handleTunnelDisconnected(msg TunnelDisconnectedMsg) (tea.Model, t
 	for idx := range m.tunnels {
 		if m.tunnels[idx].Port == msg.Port {
 			m.tunnels[idx].State = StateDisconnected
+			break
+		}
+	}
+	return m, nil
+}
+
+// handleTunnelReconnected updates the tunnel entry when a reconnect succeeds.
+func (m Model) handleTunnelReconnected(msg TunnelReconnectedMsg) (tea.Model, tea.Cmd) {
+	for idx := range m.tunnels {
+		if m.tunnels[idx].Port == msg.Port {
+			m.tunnels[idx].State = StateConnected
+			if msg.SubdomainChanged {
+				m.tunnels[idx].Subdomain = msg.NewSubdomain
+			}
+			m.tunnels[idx].ConnectedAt = time.Now()
 			break
 		}
 	}
@@ -372,6 +391,23 @@ func (m *Model) clampSelectedIndex() {
 	if m.selectedIndex >= len(m.tunnels) {
 		m.selectedIndex = len(m.tunnels) - 1
 	}
+}
+
+// AddDisplayEntry adds a display entry for a tunnel that was started outside the
+// command dispatch flow (e.g., the initial tunnel from CLI args). This is used
+// to populate the model before tea.Program.Run() starts.
+func (m *Model) AddDisplayEntry(port int, name string) {
+	nextID := len(m.tunnels) + 1
+	displayName := name
+	if displayName == "" {
+		displayName = fmt.Sprintf(":%d", port)
+	}
+	m.tunnels = append(m.tunnels, TunnelDisplayEntry{
+		ID:    nextID,
+		Name:  displayName,
+		Port:  port,
+		State: StateConnecting,
+	})
 }
 
 // RemoveTunnel removes a tunnel by port and clamps the selection. Returns true if found.
