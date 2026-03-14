@@ -15,14 +15,14 @@ func newTestModel(t *testing.T, tunnelCount int) Model {
 	tunnels := make([]TunnelDisplayEntry, 0, tunnelCount)
 	for idx := range tunnelCount {
 		tunnels = append(tunnels, TunnelDisplayEntry{
-			ID:        idx + 1,
-			Name:      "tunnel-" + string(rune('a'+idx)),
-			Port:      3000 + idx,
-			Subdomain: "sub-" + string(rune('a'+idx)),
-			PublicURL: "https://sub-" + string(rune('a'+idx)) + ".justtunnel.io",
-			State:     StateConnected,
-			Uptime:    time.Duration(idx+1) * time.Minute,
-			Requests:  int64(idx * 10),
+			ID:          idx + 1,
+			Name:        "tunnel-" + string(rune('a'+idx)),
+			Port:        3000 + idx,
+			Subdomain:   "sub-" + string(rune('a'+idx)),
+			PublicURL:   "https://sub-" + string(rune('a'+idx)) + ".justtunnel.io",
+			State:       StateConnected,
+			ConnectedAt: time.Now().Add(-time.Duration(idx+1) * time.Minute),
+			Requests:    int64(idx * 10),
 		})
 	}
 
@@ -435,6 +435,62 @@ func TestListViewSelectionMarker(t *testing.T) {
 	if !foundSelected {
 		t.Error("Selection marker '>' should be on the line for port 3001 (index 1)")
 	}
+}
+
+func TestRemoveTunnelClampsSelection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("remove last tunnel clamps selectedIndex", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 3)
+
+		// Select last tunnel (index 2)
+		model.selectedIndex = 2
+		model.RemoveTunnel(3002) // remove last tunnel
+
+		if model.selectedIndex != 1 {
+			t.Errorf("selectedIndex = %d, want 1 after removing last", model.selectedIndex)
+		}
+	})
+
+	t.Run("remove only tunnel clamps to 0", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 1)
+		model.RemoveTunnel(3000)
+
+		if model.selectedIndex != 0 {
+			t.Errorf("selectedIndex = %d, want 0 after removing only tunnel", model.selectedIndex)
+		}
+		if len(model.tunnels) != 0 {
+			t.Errorf("tunnels length = %d, want 0", len(model.tunnels))
+		}
+	})
+
+	t.Run("remove tunnel in detail view returns to list if selected was removed", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 2)
+		model.viewState = viewDetail
+		model.selectedIndex = 1
+
+		model.RemoveTunnel(3001)
+
+		if model.selectedIndex != 0 {
+			t.Errorf("selectedIndex = %d, want 0", model.selectedIndex)
+		}
+	})
+
+	t.Run("remove non-existent port returns false", func(t *testing.T) {
+		t.Parallel()
+		model := newTestModel(t, 2)
+
+		found := model.RemoveTunnel(9999)
+		if found {
+			t.Error("RemoveTunnel should return false for non-existent port")
+		}
+		if len(model.tunnels) != 2 {
+			t.Errorf("tunnels length = %d, want 2", len(model.tunnels))
+		}
+	})
 }
 
 func TestDetailViewArrowKeysIgnored(t *testing.T) {

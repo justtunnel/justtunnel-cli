@@ -30,20 +30,17 @@ func renderListView(model Model) string {
 				marker = styleSelected.Render("> ")
 			}
 
-			statusText := stateStyle(entry.State).Render(stateLabel(entry.State))
+			styledStatus := stateStyle(entry.State).Render(fmt.Sprintf("%-15s", stateLabel(entry.State)))
 
-			row := fmt.Sprintf("%-3d %-15s %-15s %-35s %-10s %-6d",
+			row := fmt.Sprintf("%-3d %-15s %s %-35s %-10s %-6d",
 				entry.ID,
 				truncateString(entry.Name, 15),
-				stateLabel(entry.State),
+				styledStatus,
 				truncateString(entry.PublicURL, 35),
 				fmt.Sprintf(":%d", entry.Port),
 				entry.Requests,
 			)
 
-			// We render the marker separately, then the row with status colored
-			// For now, output the plain text with status label embedded
-			_ = statusText // used for styled output in real terminal
 			builder.WriteString(marker)
 			builder.WriteString(row)
 			builder.WriteString("\n")
@@ -99,9 +96,13 @@ func renderDetailView(model Model) string {
 		styleDetailLabel.Render("Status:"),
 		statusText))
 
+	uptime := time.Duration(0)
+	if !entry.ConnectedAt.IsZero() {
+		uptime = time.Since(entry.ConnectedAt)
+	}
 	builder.WriteString(fmt.Sprintf("  %s  %s\n",
 		styleDetailLabel.Render("Uptime:"),
-		formatUptime(entry.Uptime)))
+		formatUptime(uptime)))
 
 	builder.WriteString(fmt.Sprintf("  %s  %d\n",
 		styleDetailLabel.Render("Total Requests:"),
@@ -146,15 +147,16 @@ func renderInputBar(model Model) string {
 	return prompt + model.inputBuffer
 }
 
-// truncateString truncates a string to maxLen, adding "..." if truncated.
+// truncateString truncates a string to maxLen runes, adding "..." if truncated.
 func truncateString(text string, maxLen int) string {
-	if len(text) <= maxLen {
+	runes := []rune(text)
+	if len(runes) <= maxLen {
 		return text
 	}
 	if maxLen <= 3 {
-		return text[:maxLen]
+		return string(runes[:maxLen])
 	}
-	return text[:maxLen-3] + "..."
+	return string(runes[:maxLen-3]) + "..."
 }
 
 // formatUptime converts a duration into a human-readable uptime string.
@@ -169,5 +171,6 @@ func formatUptime(duration time.Duration) string {
 	}
 	hours := int(duration.Hours())
 	minutes := int(duration.Minutes()) % 60
-	return fmt.Sprintf("%dh %dm", hours, minutes)
+	seconds := int(duration.Seconds()) % 60
+	return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
 }

@@ -17,16 +17,16 @@ const (
 // TunnelDisplayEntry holds the display data for a single tunnel in the TUI.
 // This is a view-layer struct — no real tunnel connections, just display state.
 type TunnelDisplayEntry struct {
-	ID        int
-	Name      string
-	Port      int
-	Subdomain string
-	PublicURL string
-	State     TunnelState
-	Error     string
-	Uptime    time.Duration
-	Requests  int64
-	AvgReqSec float64
+	ID          int
+	Name        string
+	Port        int
+	Subdomain   string
+	PublicURL   string
+	State       TunnelState
+	Error       string
+	ConnectedAt time.Time
+	Requests    int64
+	AvgReqSec   float64
 	// RecentRequests would hold the request log for detail view (Phase 2).
 }
 
@@ -197,6 +197,33 @@ func (m Model) handleTunnelError(msg TunnelErrorMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// clampSelectedIndex ensures selectedIndex is within valid bounds after tunnel list changes.
+func (m *Model) clampSelectedIndex() {
+	if len(m.tunnels) == 0 {
+		m.selectedIndex = 0
+		return
+	}
+	if m.selectedIndex >= len(m.tunnels) {
+		m.selectedIndex = len(m.tunnels) - 1
+	}
+}
+
+// RemoveTunnel removes a tunnel by port and clamps the selection. Returns true if found.
+func (m *Model) RemoveTunnel(port int) bool {
+	for idx := range m.tunnels {
+		if m.tunnels[idx].Port == port {
+			m.tunnels = append(m.tunnels[:idx], m.tunnels[idx+1:]...)
+			m.clampSelectedIndex()
+			// If in detail view and the removed tunnel was selected, return to list
+			if m.viewState == viewDetail && m.selectedIndex >= len(m.tunnels) {
+				m.viewState = viewList
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // View renders the current state of the model as a string.
