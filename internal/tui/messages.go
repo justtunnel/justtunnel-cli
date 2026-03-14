@@ -34,6 +34,13 @@ type TunnelRequestMsg struct {
 	Latency time.Duration
 }
 
+// TunnelReconnectedMsg indicates a tunnel has successfully reconnected.
+type TunnelReconnectedMsg struct {
+	Port             int
+	SubdomainChanged bool
+	NewSubdomain     string
+}
+
 // TunnelErrorMsg carries an error event for a specific tunnel.
 type TunnelErrorMsg struct {
 	Port    int
