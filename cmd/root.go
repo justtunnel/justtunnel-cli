@@ -12,10 +12,14 @@ import (
 	"syscall"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
+
+	"golang.org/x/term"
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/tui"
 	"github.com/justtunnel/justtunnel-cli/internal/tunnel"
 )
 
@@ -24,13 +28,14 @@ var (
 	logLevel             string
 	subdomain            string
 	maxReconnectAttempts int
+	tunnelConfigFile     string
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "justtunnel [port]",
 	Short: "Expose a local HTTP server to the internet",
 	Long:  "justtunnel creates a public URL that tunnels traffic to a local port via a persistent WebSocket connection.",
-	Args: cobra.MaximumNArgs(1),
+	Args: cobra.RangeArgs(0, 1),
 	RunE: runTunnel,
 }
 
@@ -39,6 +44,7 @@ func init() {
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.Flags().StringVarP(&subdomain, "subdomain", "s", "", "request a specific subdomain")
 	rootCmd.Flags().IntVar(&maxReconnectAttempts, "max-reconnect-attempts", 50, "maximum number of reconnection attempts (0 = unlimited)")
+	rootCmd.Flags().StringVar(&tunnelConfigFile, "config-file", "", "YAML config file with tunnel definitions")
 	rootCmd.SilenceErrors = true
 	rootCmd.SilenceUsage = true
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
@@ -53,13 +59,19 @@ func Execute() error {
 }
 
 func runTunnel(cmd *cobra.Command, args []string) error {
-	if len(args) == 0 {
-		return cmd.Help()
+	// Parse port arg if provided
+	var port int
+	if len(args) > 0 {
+		var parseErr error
+		port, parseErr = strconv.Atoi(args[0])
+		if parseErr != nil || port < 1 || port > 65535 {
+			return display.InputError(fmt.Sprintf("invalid port: %s (must be 1-65535)", args[0]))
+		}
 	}
 
-	port, err := strconv.Atoi(args[0])
-	if err != nil || port < 1 || port > 65535 {
-		return display.InputError(fmt.Sprintf("invalid port: %s (must be 1-65535)", args[0]))
+	// Need at least a port arg or a config file
+	if port == 0 && tunnelConfigFile == "" {
+		return cmd.Help()
 	}
 
 	cfg, err := config.Load(cfgFile)
@@ -79,6 +91,198 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Fork: TTY gets the Bubble Tea TUI; non-TTY gets the existing single-tunnel flow.
+	// Check stdout specifically since Bubble Tea renders there — stderr may still be a TTY.
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		return runTUI(port, cfg, serverURL, logger, cmd)
+	}
+
+	// Non-TTY requires a port arg (single-tunnel mode)
+	if port == 0 {
+		return display.InputError("port argument is required in non-TTY mode")
+	}
+	return runNonTTY(port, cfg, serverURL, logger, cmd)
+}
+
+// runTUI launches the Bubble Tea TUI with the TunnelManager. This path is used
+// when stdout is a terminal. It supports multiple tunnels via slash commands.
+func runTUI(port int, cfg *config.Config, serverURL string, logger *slog.Logger, cmd *cobra.Command) error {
+	// Fetch plan info to show tunnel limits in the header.
+	// If it fails (e.g., no auth token), fall back to free plan defaults.
+	planInfo := tui.PlanInfo{Name: "free", MaxTunnels: 1}
+	if cfg.AuthToken != "" {
+		fetchedPlan, fetchErr := tui.FetchPlanInfo(serverURL, cfg.AuthToken)
+		if fetchErr == nil {
+			planInfo = fetchedPlan
+		} else {
+			logger.Warn("could not fetch plan info, using free defaults", "error", fetchErr)
+		}
+	}
+
+	// Create a factory that produces real tunnel.Tunnel instances
+	factory := newTunnelFactory(serverURL, cfg.AuthToken, logger, cmd)
+
+	// Create the tea.Program first, then the manager (which needs the program as sender)
+	// We use a deferred setup: create model/program, then wire the manager.
+	var program *tea.Program
+
+	// programSender wraps *tea.Program to satisfy the MessageSender interface.
+	// We use an indirection because the program isn't created until after the manager.
+	sender := &programSender{}
+
+	manager := tui.NewTunnelManager(factory, sender)
+	model := tui.NewModelWithManager(manager, planInfo)
+
+	// Load tunnel presets from config file if provided
+	var tunnelPresets []tui.TunnelPreset
+	if tunnelConfigFile != "" {
+		presetConfig, loadErr := tui.LoadConfig(tunnelConfigFile)
+		if loadErr != nil {
+			return fmt.Errorf("load tunnel config: %w", loadErr)
+		}
+		tunnelPresets = presetConfig.Tunnels
+	}
+
+	// Add the initial port arg tunnel (if provided)
+	if port > 0 {
+		initialName := fmt.Sprintf(":%d", port)
+		model.AddDisplayEntry(port, initialName)
+	}
+
+	// Add config file tunnels
+	for _, preset := range tunnelPresets {
+		// Skip if port arg already covers this port
+		if preset.Port == port {
+			continue
+		}
+		displayName := preset.Name
+		if displayName == "" {
+			displayName = fmt.Sprintf(":%d", preset.Port)
+		}
+		model.AddDisplayEntry(preset.Port, displayName)
+	}
+
+	program = tea.NewProgram(model, tea.WithAltScreen())
+	sender.program = program
+
+	// Start the initial tunnel via the manager
+	if port > 0 {
+		initialName := fmt.Sprintf(":%d", port)
+		if addErr := manager.Add(port, initialName, subdomain); addErr != nil {
+			return fmt.Errorf("start initial tunnel: %w", addErr)
+		}
+	}
+
+	// Start config file tunnels
+	for _, preset := range tunnelPresets {
+		if preset.Port == port {
+			continue
+		}
+		if addErr := manager.Add(preset.Port, preset.Name, preset.Subdomain); addErr != nil {
+			logger.Warn("could not start config tunnel", "port", preset.Port, "error", addErr)
+		}
+	}
+
+	// Start config file watcher for hot-reload
+	if tunnelConfigFile != "" {
+		watcher, watchErr := tui.NewConfigWatcher(tunnelConfigFile, manager, sender)
+		if watchErr != nil {
+			logger.Warn("could not start config watcher", "error", watchErr)
+		} else {
+			watcher.Start()
+			defer watcher.Stop()
+		}
+	}
+
+	// Run Bubble Tea — it handles Ctrl+C internally and delegates to manager.Shutdown()
+	_, runErr := program.Run()
+	if runErr != nil {
+		// TUI initialization failed (e.g., terminal not supported, alt screen rejected).
+		// Shut down the manager's tunnels so we can fall back to the non-interactive path.
+		manager.Shutdown()
+		logger.Warn("TUI could not start, falling back to non-interactive mode", "error", runErr)
+		fmt.Fprintf(os.Stderr, "Warning: TUI failed to start (%v), falling back to single-tunnel mode\n", runErr)
+		return runNonTTY(port, cfg, serverURL, logger, cmd)
+	}
+
+	return nil
+}
+
+// programSender wraps a *tea.Program to satisfy the tui.MessageSender interface.
+// This indirection is needed because the program must be created after the model,
+// but the manager (which needs the sender) is created before the model.
+type programSender struct {
+	program *tea.Program
+}
+
+func (ps *programSender) Send(msg tea.Msg) {
+	if ps.program != nil {
+		ps.program.Send(msg)
+	}
+}
+
+// newTunnelFactory creates a tui.TunnelFactory that produces real tunnel.Tunnel
+// instances wired to the TUI callback system.
+func newTunnelFactory(serverURL, authToken string, logger *slog.Logger, cmd *cobra.Command) tui.TunnelFactory {
+	return func(port int, name string, tunnelSubdomain string, callbacks tui.TunnelCallbacks) tui.TunnelRunner {
+		localTarget := fmt.Sprintf("http://localhost:%d", port)
+
+		// Build the server URL with an optional subdomain for this tunnel
+		dialURL := serverURL
+		if tunnelSubdomain != "" {
+			if built, buildErr := buildServerURL(serverURL, tunnelSubdomain); buildErr == nil {
+				dialURL = built
+			}
+		}
+
+		// Bridge TUI callbacks to tunnel.Callbacks
+		tunnelCallbacks := tunnel.Callbacks{
+			OnConnected: func(sub, tunnelURL, target string) {
+				if callbacks.OnConnected != nil {
+					callbacks.OnConnected(sub, tunnelURL, target)
+				}
+			},
+			OnRequest: func(method, path string, status int, latency time.Duration) {
+				if callbacks.OnRequest != nil {
+					callbacks.OnRequest(method, path, status, latency)
+				}
+			},
+			OnReconnecting: func(attempt int, backoff time.Duration) {
+				if callbacks.OnReconnecting != nil {
+					callbacks.OnReconnecting(attempt, backoff)
+				}
+			},
+			OnDisconnected: func(timestamp time.Time) {
+				if callbacks.OnDisconnected != nil {
+					callbacks.OnDisconnected(timestamp)
+				}
+			},
+			OnReconnected: func(info tunnel.ReconnectInfo) {
+				if callbacks.OnReconnected != nil {
+					callbacks.OnReconnected(
+						info.Subdomain,
+						info.PreviousSubdomain,
+						info.TunnelURL,
+						info.SubdomainChanged,
+					)
+				}
+			},
+		}
+
+		tun := tunnel.New(dialURL, localTarget, authToken, logger, tunnelCallbacks)
+
+		// Apply max reconnect attempts
+		if cmd.Flags().Changed("max-reconnect-attempts") {
+			tun.SetMaxReconnectAttempts(maxReconnectAttempts)
+		}
+
+		return tun
+	}
+}
+
+// runNonTTY is the original single-tunnel flow for non-terminal output (pipes, etc.).
+// This code path is UNCHANGED from the pre-TUI implementation to avoid regressions.
+func runNonTTY(port int, cfg *config.Config, serverURL string, logger *slog.Logger, cmd *cobra.Command) error {
 	localTarget := fmt.Sprintf("http://localhost:%d", port)
 
 	var connectSpinner *display.Spinner

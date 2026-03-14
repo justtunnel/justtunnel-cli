@@ -36,21 +36,14 @@ Pre-built binaries are available for macOS (arm64, amd64), Linux (arm64, amd64),
 # Build
 go build -o justtunnel .
 
-# Expose localhost:3000 (connects to justtunnel.dev by default)
+# Expose localhost:3000 — launches an interactive TUI
 ./justtunnel 3000
 
-# Output (with color in a real terminal):
-#    _         _  _                       _
-#   (_)_  _ __| || |_ _  _ _ _  _ _  ___| |
-#   | | || (_-<  _|  _| || | ' \| ' \/ -_) |
-#  _/ |\_,_/__/\__|\__|\_,_|_||_|_||_\___|_|
-# |__/
-#
-#   Forwarding:    https://a3kx9m.justtunnel.dev -> http://localhost:3000
-#   Subdomain:     a3kx9m
-#
-#   GET     /api/users                     200  12ms
-#   POST    /webhooks/stripe               200  45ms
+# Multiple tunnels from a config file
+./justtunnel --config-file tunnels.yaml
+
+# Both: config tunnels + an extra port
+./justtunnel 3000 --config-file tunnels.yaml
 ```
 
 ## Local Development (with local server)
@@ -63,13 +56,15 @@ JUSTTUNNEL_SERVER_URL=ws://localhost:8080/ws go run . 3000
 
 ## Commands
 
-### `justtunnel <port>`
+### `justtunnel [port]`
 
-Expose `localhost:<port>` to the internet.
+Expose `localhost:<port>` to the internet. When running in a terminal, launches an interactive TUI that supports multiple tunnels.
 
 ```bash
-justtunnel 3000                           # random subdomain
+justtunnel 3000                           # single tunnel, random subdomain
 justtunnel 3000 --subdomain myapp        # reserved subdomain (Pro)
+justtunnel --config-file tunnels.yaml    # multi-tunnel from config
+justtunnel 3000 --config-file tunnels.yaml  # config + extra port
 justtunnel 3000 --log-level debug        # verbose logging
 ```
 
@@ -78,9 +73,10 @@ justtunnel 3000 --log-level debug        # verbose logging
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--subdomain` | `-s` | — | Request a specific reserved subdomain |
+| `--config-file` | — | — | YAML config file with tunnel definitions |
 | `--log-level` | — | `info` | `debug`, `info`, `warn`, `error` |
 | `--max-reconnect-attempts` | — | `50` | Max reconnection attempts before giving up (0 = unlimited) |
-| `--config` | — | `~/.config/justtunnel/config.yaml` | Config file path |
+| `--config` | — | `~/.config/justtunnel/config.yaml` | Auth config file path |
 
 ### `justtunnel auth <key>`
 
@@ -117,7 +113,9 @@ Print version, commit, and build date.
 
 ## Configuration
 
-Config file: `~/.config/justtunnel/config.yaml`
+### Auth config
+
+`~/.config/justtunnel/config.yaml`
 
 ```yaml
 auth_token: "justtunnel_sk_live_abc123..."
@@ -135,9 +133,56 @@ All fields can be overridden with environment variables (prefix `JUSTTUNNEL_`):
 | `JUSTTUNNEL_LOG_LEVEL` | `log_level` | `info` |
 | `JUSTTUNNEL_MAX_RECONNECT_ATTEMPTS` | `max_reconnect_attempts` | `50` |
 
-## Terminal Output
+### Tunnel config file
 
-The CLI uses colored output, animated spinners, and an ASCII banner when running in an interactive terminal.
+Used with `--config-file` to define multiple tunnels:
+
+```yaml
+tunnels:
+  - port: 3000
+    name: frontend
+    subdomain: my-frontend
+  - port: 8080
+    name: api
+  - port: 9090
+```
+
+Each tunnel entry supports:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `port` | yes | Local port to expose (1-65535) |
+| `name` | no | Display name in the TUI |
+| `subdomain` | no | Request a specific subdomain |
+
+The config file is watched for changes — editing it while the TUI is running will automatically add or remove tunnels.
+
+## Interactive TUI
+
+When running in a terminal, the CLI launches a Bubble Tea TUI with a list/detail view for managing multiple tunnels.
+
+**Slash commands** (type in the input bar at the bottom):
+
+| Command | Description |
+|---------|-------------|
+| `/add <port>` | Add a tunnel. Options: `--name`, `--subdomain` |
+| `/remove <index>` | Remove a tunnel by its list number |
+| `/list` | Switch to list view |
+| `/help` | Show available commands |
+| `/quit` | Shut down all tunnels and exit |
+
+**Keyboard shortcuts:**
+
+| Key | Action |
+|-----|--------|
+| Up/Down | Navigate tunnel list |
+| Enter | Detail view (or execute command) |
+| Esc | Back to list view / clear input |
+| Ctrl+C | Quit |
+
+**Non-TTY mode:** When stdout is piped (e.g., `justtunnel 3000 | cat`), the CLI falls back to plain text output with one line per event.
+
+## Terminal Output
 
 **Color-coded request logs:** 2xx responses are green, 3xx/4xx are yellow, 5xx are red.
 
@@ -178,13 +223,25 @@ go test -race ./...      # with race detector
 ```
 main.go                         Entry point
 cmd/
-  root.go                       Root command (tunnel creation)
+  root.go                       Root command, TTY fork, TUI/non-TTY paths
   auth.go                       justtunnel auth <key>
   status.go                     justtunnel status
   logout.go                     justtunnel logout
   version.go                    justtunnel version
 internal/
   config/config.go              Viper-based config (YAML + env)
+  tui/
+    model.go                    Bubble Tea model, key handling, command dispatch
+    views.go                    List/detail view rendering, non-TTY formatting
+    messages.go                 Bubble Tea message types
+    commands.go                 Slash command parser (/add, /remove, etc.)
+    manager.go                  TunnelManager: multi-tunnel coordination
+    managed_tunnel.go           ManagedTunnel: lifecycle callbacks, state
+    stats.go                    Per-tunnel request stats, rolling log
+    plan.go                     Plan info fetch from /api/me
+    config.go                   YAML tunnel config loading, validation, diff
+    watcher.go                  Config file hot-reload with fsnotify
+    errors.go                   Server error parsing (plan limits, auth)
   tunnel/
     tunnel.go                   WebSocket connect, proxy loop, reconnect
     frames.go                   JSON frame types (request, response, etc.)
