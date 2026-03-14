@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
@@ -21,9 +20,10 @@ import (
 )
 
 var (
-	cfgFile   string
-	logLevel  string
-	subdomain string
+	cfgFile              string
+	logLevel             string
+	subdomain            string
+	maxReconnectAttempts int
 )
 
 var rootCmd = &cobra.Command{
@@ -38,6 +38,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default ~/.config/justtunnel/config.yaml)")
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.Flags().StringVarP(&subdomain, "subdomain", "s", "", "request a specific subdomain")
+	rootCmd.Flags().IntVar(&maxReconnectAttempts, "max-reconnect-attempts", 50, "maximum number of reconnection attempts (0 = unlimited)")
 	rootCmd.SilenceErrors = true
 	rootCmd.SilenceUsage = true
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
@@ -112,15 +113,38 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 				reconnectSpinner.Update(msg)
 			}
 		},
-		OnReconnected: func() {
+		OnDisconnected: func(timestamp time.Time) {
 			if reconnectSpinner != nil {
-				reconnectSpinner.StopWithMessage(color.GreenString("✓") + " Reconnected")
+				reconnectSpinner.Stop()
 				reconnectSpinner = nil
 			}
+			display.PrintDisconnected(timestamp)
+		},
+		OnReconnected: func(info tunnel.ReconnectInfo) {
+			if reconnectSpinner != nil {
+				reconnectSpinner.Stop()
+				reconnectSpinner = nil
+			}
+			display.PrintReconnected(
+				info.Subdomain,
+				info.PreviousSubdomain,
+				info.TunnelURL,
+				info.LocalTarget,
+				info.SubdomainChanged,
+				info.DowntimeDuration,
+			)
 		},
 	}
 
 	tun := tunnel.New(serverURL, localTarget, cfg.AuthToken, logger, callbacks)
+
+	// Apply max reconnect attempts: CLI flag takes precedence, then config file.
+	// A config value of 0 means unlimited, which is valid and must not be ignored.
+	if cmd.Flags().Changed("max-reconnect-attempts") {
+		tun.SetMaxReconnectAttempts(maxReconnectAttempts)
+	} else if cfg.MaxReconnectAttempts != nil {
+		tun.SetMaxReconnectAttempts(*cfg.MaxReconnectAttempts)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

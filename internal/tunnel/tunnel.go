@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -11,7 +12,19 @@ import (
 	"time"
 
 	"nhooyr.io/websocket"
+
+	"github.com/justtunnel/justtunnel-cli/internal/display"
 )
+
+// ReconnectInfo contains details about a successful reconnection.
+type ReconnectInfo struct {
+	Subdomain         string
+	PreviousSubdomain string
+	TunnelURL         string
+	LocalTarget       string
+	SubdomainChanged  bool
+	DowntimeDuration  time.Duration
+}
 
 type Callbacks struct {
 	OnConnecting    func()
@@ -19,7 +32,8 @@ type Callbacks struct {
 	OnRequest       func(method, path string, status int, latency time.Duration)
 	OnReconnecting  func(attempt int, backoff time.Duration)
 	OnReconnectWait func(attempt int, remaining time.Duration)
-	OnReconnected   func()
+	OnReconnected   func(info ReconnectInfo)
+	OnDisconnected  func(timestamp time.Time)
 }
 
 type Tunnel struct {
@@ -30,23 +44,37 @@ type Tunnel struct {
 	callbacks   Callbacks
 
 	conn   *websocket.Conn
-	connMu sync.Mutex // protects WebSocket writes
+	connMu sync.Mutex // protects conn field and WebSocket writes
 	wg     sync.WaitGroup
 
 	subdomain      string
 	tunnelURL      string
 	tunnelID       string
 	reconnectToken string
+
+	maxReconnectAttempts int
+	reconnecting         bool
+	disconnectedAt       time.Time
 }
 
 func New(serverURL, localTarget, authToken string, logger *slog.Logger, callbacks Callbacks) *Tunnel {
 	return &Tunnel{
-		serverURL:   serverURL,
-		localTarget: localTarget,
-		authToken:   authToken,
-		logger:      logger,
-		callbacks:   callbacks,
+		serverURL:            serverURL,
+		localTarget:          localTarget,
+		authToken:            authToken,
+		logger:               logger,
+		callbacks:            callbacks,
+		maxReconnectAttempts: 50,
 	}
+}
+
+// SetMaxReconnectAttempts sets the maximum number of reconnection attempts.
+// A value of 0 means unlimited attempts. Negative values are clamped to 0.
+func (t *Tunnel) SetMaxReconnectAttempts(maxAttempts int) {
+	if maxAttempts < 0 {
+		maxAttempts = 0
+	}
+	t.maxReconnectAttempts = maxAttempts
 }
 
 // Run is the main lifecycle: connect, read loop, reconnect on failure.
@@ -66,6 +94,11 @@ func (t *Tunnel) Run(ctx context.Context) error {
 		}
 		if err != nil {
 			t.logger.Error("connection lost", "error", err)
+			now := time.Now()
+			t.disconnectedAt = now
+			if t.callbacks.OnDisconnected != nil {
+				t.callbacks.OnDisconnected(now)
+			}
 			if reconnErr := t.reconnect(ctx); reconnErr != nil {
 				return reconnErr
 			}
@@ -85,8 +118,11 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 		}
 	}
 
-	conn, _, err := websocket.Dial(ctx, dialURL, opts)
+	conn, httpResp, err := websocket.Dial(ctx, dialURL, opts)
 	if err != nil {
+		if httpResp != nil && (httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden) {
+			return display.AuthError(fmt.Sprintf("server returned %d: %v", httpResp.StatusCode, err))
+		}
 		return fmt.Errorf("dial: %w", err)
 	}
 
@@ -122,7 +158,8 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 	t.tunnelID = assigned.TunnelID
 	t.reconnectToken = assigned.ReconnectToken
 
-	if t.callbacks.OnConnected != nil {
+	// Only fire OnConnected for the initial connection, not during reconnects.
+	if !t.reconnecting && t.callbacks.OnConnected != nil {
 		t.callbacks.OnConnected(assigned.Subdomain, assigned.URL, t.localTarget)
 	}
 
@@ -131,7 +168,11 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 
 func (t *Tunnel) readLoop(ctx context.Context) error {
 	for {
-		_, data, err := t.conn.Read(ctx)
+		t.connMu.Lock()
+		activeConn := t.conn
+		t.connMu.Unlock()
+
+		_, data, err := activeConn.Read(ctx)
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
@@ -157,6 +198,11 @@ func (t *Tunnel) readLoop(ctx context.Context) error {
 func (t *Tunnel) handleRequest(ctx context.Context, frame *RequestFrame) {
 	defer t.wg.Done()
 
+	// Capture the active connection so we can detect if it changed during proxying.
+	t.connMu.Lock()
+	activeConn := t.conn
+	t.connMu.Unlock()
+
 	start := time.Now()
 	resp, err := ProxyRequest(ctx, *frame, t.localTarget, t.logger)
 	latency := time.Since(start)
@@ -168,7 +214,7 @@ func (t *Tunnel) handleRequest(ctx context.Context, frame *RequestFrame) {
 			ID:      frame.ID,
 			Message: "target unreachable",
 		}
-		if writeErr := t.writeJSON(ctx, errFrame); writeErr != nil {
+		if writeErr := t.writeJSONTo(ctx, activeConn, errFrame); writeErr != nil {
 			t.logger.Error("write error frame failed", "error", writeErr)
 		}
 		if t.callbacks.OnRequest != nil {
@@ -177,7 +223,7 @@ func (t *Tunnel) handleRequest(ctx context.Context, frame *RequestFrame) {
 		return
 	}
 
-	if err := t.writeJSON(ctx, resp); err != nil {
+	if err := t.writeJSONTo(ctx, activeConn, resp); err != nil {
 		t.logger.Error("write response failed", "id", frame.ID, "error", err)
 		return
 	}
@@ -187,14 +233,28 @@ func (t *Tunnel) handleRequest(ctx context.Context, frame *RequestFrame) {
 	}
 }
 
-func (t *Tunnel) writeJSON(ctx context.Context, v any) error {
+// writeJSONTo writes JSON to the specified connection, but only if it is still
+// the active connection. This prevents stale responses from being written to a
+// new connection after a reconnect.
+func (t *Tunnel) writeJSONTo(ctx context.Context, targetConn *websocket.Conn, v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
 	t.connMu.Lock()
 	defer t.connMu.Unlock()
+	if targetConn != t.conn {
+		t.logger.Warn("skipping write to stale connection")
+		return fmt.Errorf("connection replaced during request handling")
+	}
 	return t.conn.Write(ctx, websocket.MessageText, data)
+}
+
+// isAuthError checks if an error is an authentication/authorization failure
+// by checking if it wraps a display.CLIError with CategoryAuth.
+func isAuthError(err error) bool {
+	var cliErr *display.CLIError
+	return errors.As(err, &cliErr) && cliErr.Category == display.CategoryAuth
 }
 
 // buildReconnectURL appends reconnect token parameters to the server URL
@@ -231,10 +291,29 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 		t.logger.Warn("timed out waiting for in-flight requests before reconnect")
 	}
 
+	// Close old connection before attempting to dial a new one.
+	t.connMu.Lock()
+	if t.conn != nil {
+		t.conn.Close(websocket.StatusAbnormalClosure, "reconnecting")
+	}
+	t.connMu.Unlock()
+
+	t.reconnecting = true
+	previousSubdomain := t.subdomain
+
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
 
 	for attempt := 1; ; attempt++ {
+		// Check max reconnect attempts (0 = unlimited).
+		if t.maxReconnectAttempts > 0 && attempt > t.maxReconnectAttempts {
+			elapsed := time.Since(t.disconnectedAt).Round(time.Second)
+			return display.NetworkError(fmt.Sprintf(
+				"gave up reconnecting after %d attempts (disconnected for %s). Check your internet connection and restart the tunnel.",
+				attempt-1, elapsed,
+			))
+		}
+
 		if t.callbacks.OnReconnecting != nil {
 			t.callbacks.OnReconnecting(attempt, backoff)
 		}
@@ -246,6 +325,12 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 		reconnectURL := t.buildReconnectURL()
 		if err := t.connectWithURL(ctx, reconnectURL); err != nil {
 			t.logger.Error("reconnect attempt failed", "attempt", attempt, "error", err)
+
+			// Don't retry on auth errors — credentials won't change between attempts.
+			if isAuthError(err) {
+				return display.AuthError("authentication failed during reconnect - run 'justtunnel auth' to re-authenticate")
+			}
+
 			backoff *= 2
 			if backoff > maxBackoff {
 				backoff = maxBackoff
@@ -253,8 +338,18 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 			continue
 		}
 
+		t.reconnecting = false
+
 		if t.callbacks.OnReconnected != nil {
-			t.callbacks.OnReconnected()
+			info := ReconnectInfo{
+				Subdomain:         t.subdomain,
+				PreviousSubdomain: previousSubdomain,
+				TunnelURL:         t.tunnelURL,
+				LocalTarget:       t.localTarget,
+				SubdomainChanged:  t.subdomain != previousSubdomain,
+				DowntimeDuration:  time.Since(t.disconnectedAt),
+			}
+			t.callbacks.OnReconnected(info)
 		}
 		return nil
 	}
