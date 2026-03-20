@@ -129,6 +129,12 @@ func renderDetailView(model Model) string {
 		styleDetailLabel.Render("Status:"),
 		statusText))
 
+	if entry.Error != "" {
+		builder.WriteString(fmt.Sprintf("  %s  %s\n",
+			styleDetailLabel.Render("Error:"),
+			styleError.Render(entry.Error)))
+	}
+
 	uptime := time.Duration(0)
 	if !entry.ConnectedAt.IsZero() {
 		uptime = time.Since(entry.ConnectedAt)
@@ -147,10 +153,23 @@ func renderDetailView(model Model) string {
 
 	builder.WriteString("\n")
 
-	// Recent requests table header
+	// Recent requests table
 	builder.WriteString(styleColumnHeader.Render("  Recent Requests"))
 	builder.WriteString("\n")
-	builder.WriteString("  (no requests yet)\n")
+	if len(entry.RecentRequests) == 0 {
+		builder.WriteString("  (no requests yet)\n")
+	} else {
+		// Show newest first
+		for idx := len(entry.RecentRequests) - 1; idx >= 0; idx-- {
+			req := entry.RecentRequests[idx]
+			statusStyle := requestStatusStyle(req.StatusCode)
+			builder.WriteString(fmt.Sprintf("  %s %s %s %s\n",
+				req.Method,
+				req.Path,
+				statusStyle.Render(fmt.Sprintf("%d", req.StatusCode)),
+				styleDim.Render(req.Duration.Round(time.Millisecond).String())))
+		}
+	}
 
 	builder.WriteString("\n")
 
