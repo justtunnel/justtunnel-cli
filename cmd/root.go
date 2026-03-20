@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/justtunnel/justtunnel-cli/internal/browser"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
 	"github.com/justtunnel/justtunnel-cli/internal/tui"
@@ -77,6 +79,11 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+
+	// Auto-authenticate on first run if no auth token is configured.
+	if err := ensureAuthenticated(cfg, cmd); err != nil {
+		return err
 	}
 
 	if !cmd.Flags().Changed("log-level") && cfg.LogLevel != "" {
@@ -409,5 +416,98 @@ func parseLogLevel(s string) slog.Level {
 		return slog.LevelError
 	default:
 		return slog.LevelInfo
+	}
+}
+
+// ensureAuthenticated checks for an auth token and triggers device auth if missing.
+// In interactive terminals, it auto-starts the browser-based sign-in flow so the user
+// can go from `justtunnel 3000` to a working tunnel without running `auth` first.
+func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
+	if cfg.AuthToken != "" {
+		return nil
+	}
+
+	// Non-interactive: can't run device auth, tell the user what to do.
+	if !term.IsTerminal(int(os.Stderr.Fd())) {
+		return display.AuthError("not authenticated. Set JUSTTUNNEL_AUTH_TOKEN or run `justtunnel auth` first")
+	}
+
+	baseURL, err := apiBaseURL(cfg.ServerURL)
+	if err != nil {
+		return fmt.Errorf("parse server URL: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "\n  Welcome to justtunnel! Sign in with GitHub to get started.\n\n")
+
+	deviceResp, err := createDeviceSession(http.DefaultClient, baseURL)
+	if err != nil {
+		return categorizeAuthError(err)
+	}
+
+	fmt.Fprintf(os.Stderr, "  Your code: %s\n\n", display.Bold(deviceResp.UserCode))
+
+	verifyURL := deviceResp.VerificationURL + "?code=" + deviceResp.UserCode
+	if openErr := browser.Open(verifyURL); openErr != nil {
+		fmt.Fprintf(os.Stderr, "  Open this URL to authenticate:\n    %s\n\n", verifyURL)
+	} else {
+		fmt.Fprintf(os.Stderr, "  Opening browser to authenticate...\n\n")
+	}
+
+	authSpinner := display.NewSpinner("Waiting for approval...")
+	authSpinner.Start()
+
+	pollInterval := max(time.Duration(deviceResp.PollInterval)*time.Second, 5*time.Second)
+	timeout := time.Duration(deviceResp.ExpiresIn) * time.Second
+
+	ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+	defer cancel()
+
+	sigCtx, sigCancel := signal.NotifyContext(ctx, os.Interrupt)
+	defer sigCancel()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sigCtx.Done():
+			authSpinner.Stop()
+			if ctx.Err() == context.DeadlineExceeded {
+				return display.InputError("authentication timed out. Run 'justtunnel auth' to try again")
+			}
+			return display.InputError("authentication cancelled")
+		case <-ticker.C:
+			status, pollErr := pollDeviceStatus(http.DefaultClient, baseURL, deviceResp.DeviceCode)
+			if pollErr != nil {
+				continue
+			}
+
+			switch status.Status {
+			case "pending":
+				continue
+			case "expired":
+				authSpinner.Stop()
+				return display.InputError("authentication timed out. Run 'justtunnel auth' to try again")
+			case "approved":
+				authSpinner.Stop()
+
+				cfg.AuthToken = status.APIKey
+				if saveErr := config.Save(cfg); saveErr != nil {
+					return fmt.Errorf("save config: %w", saveErr)
+				}
+
+				result, verifyErr := verifyKey(http.DefaultClient, baseURL, status.APIKey)
+				if verifyErr != nil {
+					fmt.Fprintf(os.Stderr, "\n  Authenticated successfully. Starting tunnel...\n\n")
+					return nil
+				}
+				displayName := result.GitHubUsername
+				if displayName == "" {
+					displayName = result.Email
+				}
+				fmt.Fprintf(os.Stderr, "\n  Authenticated as %s (%s plan). Starting tunnel...\n\n", displayName, result.Plan)
+				return nil
+			}
+		}
 	}
 }
