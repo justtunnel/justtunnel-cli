@@ -49,7 +49,25 @@ var (
 	// styleDetailValue is the style for values in the detail view.
 	styleDetailValue = lipgloss.NewStyle().
 				Foreground(colorCyan)
+
+	// styleDim is the style for dimmed/secondary text.
+	styleDim = lipgloss.NewStyle().
+			Foreground(colorDim)
 )
+
+// requestStatusStyle returns a style colored by HTTP status code range.
+func requestStatusStyle(statusCode int) lipgloss.Style {
+	switch {
+	case statusCode >= 500:
+		return lipgloss.NewStyle().Foreground(colorRed)
+	case statusCode >= 400:
+		return lipgloss.NewStyle().Foreground(colorYellow)
+	case statusCode >= 300:
+		return lipgloss.NewStyle().Foreground(colorYellow)
+	default:
+		return lipgloss.NewStyle().Foreground(colorGreen)
+	}
+}
 
 // stateStyle returns the appropriate Lip Gloss style for a tunnel state.
 func stateStyle(state TunnelState) lipgloss.Style {

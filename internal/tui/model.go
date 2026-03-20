@@ -29,7 +29,7 @@ type TunnelDisplayEntry struct {
 	ConnectedAt time.Time
 	Requests    int64
 	AvgReqSec   float64
-	// RecentRequests would hold the request log for detail view (Phase 2).
+	RecentRequests []RequestEntry
 }
 
 // PlanInfo holds the user's plan name and tunnel limit.
@@ -371,11 +371,29 @@ func (m Model) handleTunnelReconnecting(msg TunnelReconnectingMsg) (tea.Model, t
 	return m, nil
 }
 
+// maxDisplayRequests is the maximum number of recent requests shown in the detail view.
+const maxDisplayRequests = 10
+
 // handleTunnelRequest updates the tunnel entry with a new request event.
 func (m Model) handleTunnelRequest(msg TunnelRequestMsg) (tea.Model, tea.Cmd) {
 	for idx := range m.tunnels {
 		if m.tunnels[idx].Port == msg.Port {
 			m.tunnels[idx].Requests++
+			entry := RequestEntry{
+				Method:     msg.Method,
+				Path:       msg.Path,
+				StatusCode: msg.Status,
+				Duration:   msg.Latency,
+				Timestamp:  time.Now(),
+			}
+			recent := m.tunnels[idx].RecentRequests
+			if len(recent) >= maxDisplayRequests {
+				copy(recent, recent[1:])
+				recent[len(recent)-1] = entry
+			} else {
+				recent = append(recent, entry)
+			}
+			m.tunnels[idx].RecentRequests = recent
 			break
 		}
 	}
