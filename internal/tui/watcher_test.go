@@ -282,7 +282,7 @@ func TestModelHandlesConfigChangedMsg(t *testing.T) {
 		model := NewModelWithManager(mgr, PlanInfo{Name: "Pro", MaxTunnels: 5})
 
 		// Pre-add a tunnel that will be removed
-		addErr := mgr.Add(3000, "frontend", "")
+		addErr := mgr.Add(3000, "frontend", "", "")
 		if addErr != nil {
 			t.Fatalf("Add(3000) failed: %v", addErr)
 		}
@@ -318,7 +318,7 @@ func TestModelHandlesConfigChangedMsg(t *testing.T) {
 		mgr := NewTunnelManager(mockTunnelFactory(mocks), collector)
 		model := NewModelWithManager(mgr, PlanInfo{Name: "Pro", MaxTunnels: 5})
 
-		addErr := mgr.Add(3000, "frontend", "")
+		addErr := mgr.Add(3000, "frontend", "", "")
 		if addErr != nil {
 			t.Fatalf("Add(3000) failed: %v", addErr)
 		}
@@ -393,7 +393,7 @@ func TestConfigWatcher_DiffComputedCorrectly(t *testing.T) {
 	mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
 	// Add port 3000 to manager so it's already running
-	addErr := mgr.Add(3000, "frontend", "")
+	addErr := mgr.Add(3000, "frontend", "", "")
 	if addErr != nil {
 		t.Fatalf("failed to add initial tunnel: %v", addErr)
 	}

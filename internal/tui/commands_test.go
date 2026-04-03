@@ -51,6 +51,23 @@ func TestParseCommand(t *testing.T) {
 			wantCmd: AddCommand{Port: 65535},
 		},
 
+		// /add with --password flag
+		{
+			name:    "add with password flag",
+			input:   "/add 8080 --password secret123",
+			wantCmd: AddCommand{Port: 8080, Password: "secret123"},
+		},
+		{
+			name:    "add with all flags including password",
+			input:   "/add 8080 --name api --subdomain my-api --password mypass",
+			wantCmd: AddCommand{Port: 8080, Name: "api", Subdomain: "my-api", Password: "mypass"},
+		},
+		{
+			name:    "add with password in different order",
+			input:   "/add 8080 --password pw1234 --name api",
+			wantCmd: AddCommand{Port: 8080, Name: "api", Password: "pw1234"},
+		},
+
 		// Case-insensitive commands
 		{
 			name:    "add uppercase",
@@ -155,7 +172,7 @@ func TestParseCommand(t *testing.T) {
 			name:       "add missing port",
 			input:      "/add",
 			wantErr:    true,
-			wantErrMsg: "Usage: /add <port> [--name <name>] [--subdomain <subdomain>]",
+			wantErrMsg: "Usage: /add <port> [--name <name>] [--subdomain <subdomain>] [--password <password>]",
 		},
 		{
 			name:       "remove missing target",
@@ -216,6 +233,9 @@ func TestParseCommand(t *testing.T) {
 				}
 				if got.Subdomain != expected.Subdomain {
 					t.Errorf("Subdomain = %q, want %q", got.Subdomain, expected.Subdomain)
+				}
+				if got.Password != expected.Password {
+					t.Errorf("Password = %q, want %q", got.Password, expected.Password)
 				}
 
 			case RemoveCommand:

@@ -29,6 +29,7 @@ var (
 	cfgFile              string
 	logLevel             string
 	subdomain            string
+	password             string
 	maxReconnectAttempts int
 	tunnelConfigFile     string
 )
@@ -47,6 +48,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&subdomain, "subdomain", "s", "", "request a specific subdomain")
 	rootCmd.Flags().IntVar(&maxReconnectAttempts, "max-reconnect-attempts", 50, "maximum number of reconnection attempts (0 = unlimited)")
 	rootCmd.Flags().StringVar(&tunnelConfigFile, "config-file", "", "YAML config file with tunnel definitions")
+	rootCmd.Flags().StringVar(&password, "password", "", "password-protect the tunnel (4-128 chars)")
 	rootCmd.SilenceErrors = true
 	rootCmd.SilenceUsage = true
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
@@ -68,6 +70,13 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 		port, parseErr = strconv.Atoi(args[0])
 		if parseErr != nil || port < 1 || port > 65535 {
 			return display.InputError(fmt.Sprintf("invalid port: %s (must be 1-65535)", args[0]))
+		}
+	}
+
+	// Validate password length if provided
+	if password != "" {
+		if len(password) < 4 || len(password) > 128 {
+			return display.InputError("password must be between 4 and 128 characters")
 		}
 	}
 
@@ -175,7 +184,7 @@ func runTUI(port int, cfg *config.Config, serverURL string, logger *slog.Logger,
 	// Start the initial tunnel via the manager
 	if port > 0 {
 		initialName := fmt.Sprintf(":%d", port)
-		if addErr := manager.Add(port, initialName, subdomain); addErr != nil {
+		if addErr := manager.Add(port, initialName, subdomain, password); addErr != nil {
 			return fmt.Errorf("start initial tunnel: %w", addErr)
 		}
 	}
@@ -185,7 +194,7 @@ func runTUI(port int, cfg *config.Config, serverURL string, logger *slog.Logger,
 		if preset.Port == port {
 			continue
 		}
-		if addErr := manager.Add(preset.Port, preset.Name, preset.Subdomain); addErr != nil {
+		if addErr := manager.Add(preset.Port, preset.Name, preset.Subdomain, preset.Password); addErr != nil {
 			logger.Warn("could not start config tunnel", "port", preset.Port, "error", addErr)
 		}
 	}
@@ -231,7 +240,7 @@ func (ps *programSender) Send(msg tea.Msg) {
 // newTunnelFactory creates a tui.TunnelFactory that produces real tunnel.Tunnel
 // instances wired to the TUI callback system.
 func newTunnelFactory(serverURL, authToken string, logger *slog.Logger, cmd *cobra.Command) tui.TunnelFactory {
-	return func(port int, name string, tunnelSubdomain string, callbacks tui.TunnelCallbacks) tui.TunnelRunner {
+	return func(port int, name string, tunnelSubdomain string, tunnelPassword string, callbacks tui.TunnelCallbacks) tui.TunnelRunner {
 		localTarget := fmt.Sprintf("http://localhost:%d", port)
 
 		// Build the server URL with an optional subdomain for this tunnel
@@ -244,9 +253,9 @@ func newTunnelFactory(serverURL, authToken string, logger *slog.Logger, cmd *cob
 
 		// Bridge TUI callbacks to tunnel.Callbacks
 		tunnelCallbacks := tunnel.Callbacks{
-			OnConnected: func(sub, tunnelURL, target string) {
+			OnConnected: func(sub, tunnelURL, target string, passwordProtected bool) {
 				if callbacks.OnConnected != nil {
-					callbacks.OnConnected(sub, tunnelURL, target)
+					callbacks.OnConnected(sub, tunnelURL, target, passwordProtected)
 				}
 			},
 			OnRequest: func(method, path string, status int, latency time.Duration) {
@@ -278,6 +287,10 @@ func newTunnelFactory(serverURL, authToken string, logger *slog.Logger, cmd *cob
 
 		tun := tunnel.New(dialURL, localTarget, authToken, logger, tunnelCallbacks)
 
+		if tunnelPassword != "" {
+			tun.SetPassword(tunnelPassword)
+		}
+
 		// Apply max reconnect attempts
 		if cmd.Flags().Changed("max-reconnect-attempts") {
 			tun.SetMaxReconnectAttempts(maxReconnectAttempts)
@@ -300,7 +313,7 @@ func runNonTTY(port int, cfg *config.Config, serverURL string, logger *slog.Logg
 			connectSpinner = display.NewSpinner("Connecting...")
 			connectSpinner.Start()
 		},
-		OnConnected: func(sub, tunnelURL, target string) {
+		OnConnected: func(sub, tunnelURL, target string, passwordProtected bool) {
 			if connectSpinner != nil {
 				connectSpinner.Stop()
 				connectSpinner = nil
@@ -348,6 +361,10 @@ func runNonTTY(port int, cfg *config.Config, serverURL string, logger *slog.Logg
 	}
 
 	tun := tunnel.New(serverURL, localTarget, cfg.AuthToken, logger, callbacks)
+
+	if password != "" {
+		tun.SetPassword(password)
+	}
 
 	// Apply max reconnect attempts: CLI flag takes precedence, then config file.
 	// A config value of 0 means unlimited, which is valid and must not be ignored.

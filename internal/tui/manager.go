@@ -44,7 +44,7 @@ func NewTunnelManager(factory TunnelFactory, sender MessageSender) *TunnelManage
 
 // Add creates and starts a new tunnel on the given port.
 // Returns an error if the port is invalid or already in use.
-func (m *TunnelManager) Add(port int, name string, subdomain string) error {
+func (m *TunnelManager) Add(port int, name string, subdomain string, password string) error {
 	if port < minPort || port > maxPort {
 		return fmt.Errorf("invalid port %d: must be between %d and %d", port, minPort, maxPort)
 	}
@@ -56,7 +56,7 @@ func (m *TunnelManager) Add(port int, name string, subdomain string) error {
 		return fmt.Errorf("tunnel already running on port %d", port)
 	}
 
-	managed := newManagedTunnel(port, name, subdomain, m.factory, m.sender)
+	managed := newManagedTunnel(port, name, subdomain, password, m.factory, m.sender)
 	m.tunnelsByPort[port] = managed
 	m.insertionOrder = append(m.insertionOrder, port)
 

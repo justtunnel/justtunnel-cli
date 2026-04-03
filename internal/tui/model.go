@@ -19,17 +19,18 @@ const (
 // TunnelDisplayEntry holds the display data for a single tunnel in the TUI.
 // This is a view-layer struct — no real tunnel connections, just display state.
 type TunnelDisplayEntry struct {
-	ID          int
-	Name        string
-	Port        int
-	Subdomain   string
-	PublicURL   string
-	State       TunnelState
-	Error       string
-	ConnectedAt time.Time
-	Requests    int64
-	AvgReqSec   float64
-	RecentRequests []RequestEntry
+	ID                int
+	Name              string
+	Port              int
+	Subdomain         string
+	PublicURL         string
+	State             TunnelState
+	Error             string
+	ConnectedAt       time.Time
+	Requests          int64
+	AvgReqSec         float64
+	PasswordProtected bool
+	RecentRequests    []RequestEntry
 }
 
 // PlanInfo holds the user's plan name and tunnel limit.
@@ -252,7 +253,7 @@ func (m Model) handleAddCommand(cmd AddCommand) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	addErr := m.manager.Add(cmd.Port, cmd.Name, cmd.Subdomain)
+	addErr := m.manager.Add(cmd.Port, cmd.Name, cmd.Subdomain, cmd.Password)
 	if addErr != nil {
 		m.errorMessage = addErr.Error()
 		return m, nil
@@ -328,6 +329,7 @@ func (m Model) handleTunnelConnected(msg TunnelConnectedMsg) (tea.Model, tea.Cmd
 			m.tunnels[idx].Subdomain = msg.Subdomain
 			m.tunnels[idx].PublicURL = msg.PublicURL
 			m.tunnels[idx].ConnectedAt = time.Now()
+			m.tunnels[idx].PasswordProtected = msg.PasswordProtected
 			break
 		}
 	}
@@ -430,7 +432,7 @@ func (m Model) handleConfigChanged(msg ConfigChangedMsg) (tea.Model, tea.Cmd) {
 
 	// Add tunnels that are new in the config
 	for _, preset := range msg.ToAdd {
-		addErr := m.manager.Add(preset.Port, preset.Name, preset.Subdomain)
+		addErr := m.manager.Add(preset.Port, preset.Name, preset.Subdomain, preset.Password)
 		if addErr != nil {
 			continue
 		}

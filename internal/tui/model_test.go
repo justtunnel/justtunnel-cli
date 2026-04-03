@@ -875,6 +875,79 @@ func TestCtrlCWithManagerCallsShutdown(t *testing.T) {
 	}
 }
 
+func TestPasswordProtectedDisplayEntry(t *testing.T) {
+	t.Parallel()
+
+	t.Run("TunnelConnectedMsg with PasswordProtected sets display entry flag", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+
+		// Add a tunnel
+		model = typeCommand(t, model, "/add 8080")
+		model, _ = pressEnter(t, model)
+
+		if len(model.tunnels) != 1 {
+			t.Fatalf("expected 1 tunnel, got %d", len(model.tunnels))
+		}
+
+		// Simulate connected message with password protection
+		connMsg := TunnelConnectedMsg{
+			Port:              8080,
+			Subdomain:         "my-sub",
+			PublicURL:         "https://my-sub.justtunnel.dev",
+			PasswordProtected: true,
+		}
+		updatedModel, _ := model.Update(connMsg)
+		model = updatedModel.(Model)
+
+		if !model.tunnels[0].PasswordProtected {
+			t.Error("expected PasswordProtected to be true in display entry")
+		}
+	})
+
+	t.Run("TunnelConnectedMsg without PasswordProtected leaves display entry false", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+
+		model = typeCommand(t, model, "/add 8080")
+		model, _ = pressEnter(t, model)
+
+		connMsg := TunnelConnectedMsg{
+			Port:              8080,
+			Subdomain:         "my-sub",
+			PublicURL:         "https://my-sub.justtunnel.dev",
+			PasswordProtected: false,
+		}
+		updatedModel, _ := model.Update(connMsg)
+		model = updatedModel.(Model)
+
+		if model.tunnels[0].PasswordProtected {
+			t.Error("expected PasswordProtected to be false in display entry")
+		}
+	})
+}
+
+func TestAddCommandWithPassword(t *testing.T) {
+	t.Parallel()
+
+	t.Run("add command with --password passes password to manager", func(t *testing.T) {
+		t.Parallel()
+		model, _ := newManagedTestModel(t)
+		model = typeCommand(t, model, "/add 8080 --password secret123")
+		model, _ = pressEnter(t, model)
+
+		if model.errorMessage != "" {
+			t.Errorf("unexpected error: %s", model.errorMessage)
+		}
+		if len(model.tunnels) != 1 {
+			t.Fatalf("expected 1 tunnel, got %d", len(model.tunnels))
+		}
+		if model.tunnels[0].Port != 8080 {
+			t.Errorf("tunnel port = %d, want 8080", model.tunnels[0].Port)
+		}
+	})
+}
+
 func TestNewModelWithManagerInitialState(t *testing.T) {
 	t.Parallel()
 

@@ -61,7 +61,11 @@ func renderListView(model Model) string {
 				marker = styleSelected.Render("> ")
 			}
 
-			styledStatus := stateStyle(entry.State).Render(fmt.Sprintf("%-15s", stateLabel(entry.State)))
+			statusText := stateLabel(entry.State)
+			if entry.PasswordProtected {
+				statusText += " [P]"
+			}
+			styledStatus := stateStyle(entry.State).Render(fmt.Sprintf("%-15s", statusText))
 
 			row := fmt.Sprintf("%-3d %-15s %s "+urlFmt+" %-10s %-6d",
 				entry.ID,
@@ -124,10 +128,16 @@ func renderDetailView(model Model) string {
 		styleDetailLabel.Render("Subdomain:"),
 		entry.Subdomain))
 
-	statusText := stateStyle(entry.State).Render(stateLabel(entry.State))
+	detailStatusText := stateStyle(entry.State).Render(stateLabel(entry.State))
 	builder.WriteString(fmt.Sprintf("  %s  %s\n",
 		styleDetailLabel.Render("Status:"),
-		statusText))
+		detailStatusText))
+
+	if entry.PasswordProtected {
+		builder.WriteString(fmt.Sprintf("  %s  %s\n",
+			styleDetailLabel.Render("Protected:"),
+			stateStyle(StateConnected).Render("Yes")))
+	}
 
 	if entry.Error != "" {
 		builder.WriteString(fmt.Sprintf("  %s  %s\n",

@@ -3,6 +3,7 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -116,6 +117,134 @@ func TestLoadConfig(t *testing.T) {
 				t.Errorf("got %d tunnels, want %d", len(cfg.Tunnels), tt.wantTunnels)
 			}
 		})
+	}
+}
+
+func TestLoadConfig_PasswordField(t *testing.T) {
+	t.Parallel()
+
+	yamlContent := `tunnels:
+  - port: 3000
+    name: frontend
+    password: mysecret
+  - port: 8080
+    name: api
+`
+	configPath := writeTestConfig(t, yamlContent)
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Tunnels) != 2 {
+		t.Fatalf("got %d tunnels, want 2", len(cfg.Tunnels))
+	}
+	if cfg.Tunnels[0].Password != "mysecret" {
+		t.Errorf("first tunnel password = %q, want %q", cfg.Tunnels[0].Password, "mysecret")
+	}
+	if cfg.Tunnels[1].Password != "" {
+		t.Errorf("second tunnel password = %q, want empty", cfg.Tunnels[1].Password)
+	}
+}
+
+func TestLoadConfig_PasswordValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr bool
+	}{
+		{
+			name: "valid password (4 chars)",
+			yaml: `tunnels:
+  - port: 3000
+    name: frontend
+    password: abcd
+`,
+			wantErr: false,
+		},
+		{
+			name: "password too short (3 chars)",
+			yaml: `tunnels:
+  - port: 3000
+    name: frontend
+    password: abc
+`,
+			wantErr: true,
+		},
+		{
+			name: "password too short (1 char)",
+			yaml: `tunnels:
+  - port: 3000
+    name: frontend
+    password: x
+`,
+			wantErr: true,
+		},
+		{
+			name: "empty password is valid (means no password)",
+			yaml: `tunnels:
+  - port: 3000
+    name: frontend
+`,
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			configPath := writeTestConfig(t, tt.yaml)
+
+			_, err := LoadConfig(configPath)
+			if tt.wantErr && err == nil {
+				t.Error("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_PasswordTooShortErrorIncludesName(t *testing.T) {
+	t.Parallel()
+
+	yamlContent := `tunnels:
+  - port: 3000
+    name: frontend
+    password: ab
+`
+	configPath := writeTestConfig(t, yamlContent)
+
+	_, err := LoadConfig(configPath)
+	if err == nil {
+		t.Fatal("expected error for short password, got nil")
+	}
+	if !strings.Contains(err.Error(), "frontend") {
+		t.Errorf("error should mention tunnel name, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "password must be between 4 and 128") {
+		t.Errorf("error should mention password length requirement, got: %v", err)
+	}
+}
+
+func TestLoadConfig_PasswordTooShortUsesPortWhenNoName(t *testing.T) {
+	t.Parallel()
+
+	yamlContent := `tunnels:
+  - port: 3000
+    password: ab
+`
+	configPath := writeTestConfig(t, yamlContent)
+
+	_, err := LoadConfig(configPath)
+	if err == nil {
+		t.Fatal("expected error for short password, got nil")
+	}
+	if !strings.Contains(err.Error(), "port 3000") {
+		t.Errorf("error should mention port when no name is set, got: %v", err)
 	}
 }
 

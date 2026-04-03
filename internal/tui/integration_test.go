@@ -18,11 +18,11 @@ func TestMultiTunnelSpawn(t *testing.T) {
 	mocks := make(map[int]*mockTunnel)
 	mgr := NewTunnelManager(mockTunnelFactory(mocks), collector)
 
-	err := mgr.Add(3000, "api", "")
+	err := mgr.Add(3000, "api", "", "")
 	if err != nil {
 		t.Fatalf("Add(3000) failed: %v", err)
 	}
-	err = mgr.Add(8080, "web", "")
+	err = mgr.Add(8080, "web", "", "")
 	if err != nil {
 		t.Fatalf("Add(8080) failed: %v", err)
 	}
@@ -86,10 +86,10 @@ func TestMultiTunnelSpawnWithModelView(t *testing.T) {
 
 	// Simulate both tunnels connecting
 	managed3000 := mgr.getManagedTunnel(3000)
-	managed3000.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000")
+	managed3000.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000", false)
 
 	managed8080 := mgr.getManagedTunnel(8080)
-	managed8080.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080")
+	managed8080.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080", false)
 
 	// Process the TunnelConnectedMsg messages through the model
 	for _, msg := range collector.Messages() {
@@ -163,11 +163,11 @@ func TestReconnectionIndependence(t *testing.T) {
 	mgr := NewTunnelManager(mockTunnelFactory(mocks), collector)
 
 	// Add and connect two tunnels
-	err := mgr.Add(3000, "api", "")
+	err := mgr.Add(3000, "api", "", "")
 	if err != nil {
 		t.Fatalf("Add(3000) failed: %v", err)
 	}
-	err = mgr.Add(8080, "web", "")
+	err = mgr.Add(8080, "web", "", "")
 	if err != nil {
 		t.Fatalf("Add(8080) failed: %v", err)
 	}
@@ -176,8 +176,8 @@ func TestReconnectionIndependence(t *testing.T) {
 	managedWeb := mgr.getManagedTunnel(8080)
 
 	// Both connect successfully
-	managedAPI.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000")
-	managedWeb.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080")
+	managedAPI.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000", false)
+	managedWeb.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080", false)
 
 	// Verify both connected
 	if managedAPI.State != StateConnected {
@@ -217,14 +217,14 @@ func TestGracefulShutdownMultipleTunnels(t *testing.T) {
 	mgr := NewTunnelManager(mockTunnelFactory(mocks), collector)
 
 	// Add and connect two tunnels
-	_ = mgr.Add(3000, "api", "")
-	_ = mgr.Add(8080, "web", "")
+	_ = mgr.Add(3000, "api", "", "")
+	_ = mgr.Add(8080, "web", "", "")
 
 	managedAPI := mgr.getManagedTunnel(3000)
 	managedWeb := mgr.getManagedTunnel(8080)
 
-	managedAPI.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000")
-	managedWeb.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080")
+	managedAPI.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000", false)
+	managedWeb.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080", false)
 
 	// Verify tunnels are running
 	if mgr.Count() != 2 {
@@ -257,11 +257,11 @@ func TestSubdomainChangeOnReconnectResetsStats(t *testing.T) {
 		collector := newMsgCollector()
 		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-		_ = mgr.Add(8080, "web", "")
+		_ = mgr.Add(8080, "web", "", "")
 		managed := mgr.getManagedTunnel(8080)
 
 		// Connect and record some requests
-		managed.Callbacks.OnConnected("old-sub", "https://old-sub.justtunnel.dev", "localhost:8080")
+		managed.Callbacks.OnConnected("old-sub", "https://old-sub.justtunnel.dev", "localhost:8080", false)
 		managed.Callbacks.OnRequest("GET", "/api/users", 200, 25*time.Millisecond)
 		managed.Callbacks.OnRequest("POST", "/api/data", 201, 50*time.Millisecond)
 
@@ -310,11 +310,11 @@ func TestSubdomainChangeOnReconnectResetsStats(t *testing.T) {
 		collector := newMsgCollector()
 		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-		_ = mgr.Add(8080, "web", "")
+		_ = mgr.Add(8080, "web", "", "")
 		managed := mgr.getManagedTunnel(8080)
 
 		// Connect and record requests
-		managed.Callbacks.OnConnected("my-sub", "https://my-sub.justtunnel.dev", "localhost:8080")
+		managed.Callbacks.OnConnected("my-sub", "https://my-sub.justtunnel.dev", "localhost:8080", false)
 		managed.Callbacks.OnRequest("GET", "/health", 200, 5*time.Millisecond)
 		managed.Callbacks.OnRequest("GET", "/status", 200, 8*time.Millisecond)
 		managed.Callbacks.OnRequest("POST", "/webhook", 200, 12*time.Millisecond)
@@ -349,7 +349,7 @@ func TestConcurrentTunnelOperations(t *testing.T) {
 		wg.Add(1)
 		go func(port int) {
 			defer wg.Done()
-			_ = mgr.Add(port, "svc", "")
+			_ = mgr.Add(port, "svc", "", "")
 		}(10000 + portOffset)
 	}
 	wg.Wait()
@@ -388,15 +388,15 @@ func TestMultiTunnelCallbackIsolation(t *testing.T) {
 	collector := newMsgCollector()
 	mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-	_ = mgr.Add(3000, "api", "")
-	_ = mgr.Add(8080, "web", "")
+	_ = mgr.Add(3000, "api", "", "")
+	_ = mgr.Add(8080, "web", "", "")
 
 	managedAPI := mgr.getManagedTunnel(3000)
 	managedWeb := mgr.getManagedTunnel(8080)
 
 	// Connect both
-	managedAPI.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000")
-	managedWeb.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080")
+	managedAPI.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000", false)
+	managedWeb.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080", false)
 
 	// Record requests only on the API tunnel
 	managedAPI.Callbacks.OnRequest("GET", "/api/users", 200, 10*time.Millisecond)
@@ -430,15 +430,15 @@ func TestReconnectingStateDoesNotAffectOtherTunnels(t *testing.T) {
 	collector := newMsgCollector()
 	mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-	_ = mgr.Add(3000, "api", "")
-	_ = mgr.Add(8080, "web", "")
+	_ = mgr.Add(3000, "api", "", "")
+	_ = mgr.Add(8080, "web", "", "")
 
 	managedAPI := mgr.getManagedTunnel(3000)
 	managedWeb := mgr.getManagedTunnel(8080)
 
 	// Both connect
-	managedAPI.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000")
-	managedWeb.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080")
+	managedAPI.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000", false)
+	managedWeb.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080", false)
 
 	// API tunnel starts reconnecting
 	managedAPI.Callbacks.OnDisconnected(time.Now())
@@ -490,8 +490,8 @@ func TestFullLifecycleIntegration(t *testing.T) {
 	managed3000 := mgr.getManagedTunnel(3000)
 	managed8080 := mgr.getManagedTunnel(8080)
 
-	managed3000.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000")
-	managed8080.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080")
+	managed3000.Callbacks.OnConnected("api-sub", "https://api-sub.justtunnel.dev", "localhost:3000", false)
+	managed8080.Callbacks.OnConnected("web-sub", "https://web-sub.justtunnel.dev", "localhost:8080", false)
 
 	// Process connected messages
 	for _, msg := range collector.Messages() {

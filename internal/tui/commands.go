@@ -13,11 +13,12 @@ type Command interface {
 }
 
 // AddCommand represents a parsed /add command with a validated port
-// and optional name/subdomain flags.
+// and optional name/subdomain/password flags.
 type AddCommand struct {
 	Port      int
 	Name      string
 	Subdomain string
+	Password  string
 }
 
 func (AddCommand) commandType() string { return "add" }
@@ -77,10 +78,10 @@ func ParseCommand(input string) (Command, error) {
 	}
 }
 
-// parseAddCommand parses the arguments for /add: <port> [--name <name>] [--subdomain <subdomain>].
+// parseAddCommand parses the arguments for /add: <port> [--name <name>] [--subdomain <subdomain>] [--password <password>].
 func parseAddCommand(args []string) (Command, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("Usage: /add <port> [--name <name>] [--subdomain <subdomain>]")
+		return nil, fmt.Errorf("Usage: /add <port> [--name <name>] [--subdomain <subdomain>] [--password <password>]")
 	}
 
 	portStr := args[0]
@@ -97,16 +98,22 @@ func parseAddCommand(args []string) (Command, error) {
 		switch flagArgs[idx] {
 		case "--name":
 			if idx+1 >= len(flagArgs) {
-				return nil, fmt.Errorf("Usage: /add <port> [--name <name>] [--subdomain <subdomain>]")
+				return nil, fmt.Errorf("Usage: /add <port> [--name <name>] [--subdomain <subdomain>] [--password <password>]")
 			}
 			idx++
 			cmd.Name = flagArgs[idx]
 		case "--subdomain":
 			if idx+1 >= len(flagArgs) {
-				return nil, fmt.Errorf("Usage: /add <port> [--name <name>] [--subdomain <subdomain>]")
+				return nil, fmt.Errorf("Usage: /add <port> [--name <name>] [--subdomain <subdomain>] [--password <password>]")
 			}
 			idx++
 			cmd.Subdomain = flagArgs[idx]
+		case "--password":
+			if idx+1 >= len(flagArgs) {
+				return nil, fmt.Errorf("Usage: /add <port> [--name <name>] [--subdomain <subdomain>] [--password <password>]")
+			}
+			idx++
+			cmd.Password = flagArgs[idx]
 		}
 	}
 

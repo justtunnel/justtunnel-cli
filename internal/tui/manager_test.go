@@ -85,7 +85,7 @@ func (mc *msgCollector) Messages() []tea.Msg {
 
 // mockTunnelFactory creates a factory that produces mockTunnels and records them.
 func mockTunnelFactory(mocks map[int]*mockTunnel) TunnelFactory {
-	return func(port int, name string, subdomain string, callbacks TunnelCallbacks) TunnelRunner {
+	return func(port int, name string, subdomain string, password string, callbacks TunnelCallbacks) TunnelRunner {
 		mock := newMockTunnel(port)
 		if mocks != nil {
 			mocks[port] = mock
@@ -97,7 +97,7 @@ func mockTunnelFactory(mocks map[int]*mockTunnel) TunnelFactory {
 // mockTunnelFactoryWithError creates a factory that produces mockTunnels
 // pre-configured to return the given error from Run().
 func mockTunnelFactoryWithError(runErr error, mocks map[int]*mockTunnel) TunnelFactory {
-	return func(port int, name string, subdomain string, callbacks TunnelCallbacks) TunnelRunner {
+	return func(port int, name string, subdomain string, password string, callbacks TunnelCallbacks) TunnelRunner {
 		mock := newMockTunnel(port)
 		mock.runErr = runErr
 		if mocks != nil {
@@ -111,7 +111,7 @@ func TestManagerAddTunnel(t *testing.T) {
 	t.Run("add tunnel appears in list with correct port and state", func(t *testing.T) {
 		mgr := NewTunnelManager(mockTunnelFactory(nil), nil)
 
-		err := mgr.Add(8080, "web", "")
+		err := mgr.Add(8080, "web", "", "")
 		if err != nil {
 			t.Fatalf("Add(8080) returned unexpected error: %v", err)
 		}
@@ -135,9 +135,9 @@ func TestManagerAddTunnel(t *testing.T) {
 	t.Run("add multiple tunnels in insertion order", func(t *testing.T) {
 		mgr := NewTunnelManager(mockTunnelFactory(nil), nil)
 
-		_ = mgr.Add(3000, "api", "")
-		_ = mgr.Add(8080, "web", "")
-		_ = mgr.Add(5432, "db", "")
+		_ = mgr.Add(3000, "api", "", "")
+		_ = mgr.Add(8080, "web", "", "")
+		_ = mgr.Add(5432, "db", "", "")
 
 		tunnels := mgr.Tunnels()
 		if len(tunnels) != 3 {
@@ -156,12 +156,12 @@ func TestManagerAddTunnel(t *testing.T) {
 func TestManagerAddDuplicatePort(t *testing.T) {
 	mgr := NewTunnelManager(mockTunnelFactory(nil), nil)
 
-	err := mgr.Add(8080, "web", "")
+	err := mgr.Add(8080, "web", "", "")
 	if err != nil {
 		t.Fatalf("first Add(8080) failed: %v", err)
 	}
 
-	err = mgr.Add(8080, "web2", "")
+	err = mgr.Add(8080, "web2", "", "")
 	if err == nil {
 		t.Fatal("expected error for duplicate port, got nil")
 	}
@@ -187,7 +187,7 @@ func TestManagerAddInvalidPort(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mgr := NewTunnelManager(mockTunnelFactory(nil), nil)
-			err := mgr.Add(tt.port, "", "")
+			err := mgr.Add(tt.port, "", "", "")
 			if err == nil {
 				t.Errorf("expected error for port %d, got nil", tt.port)
 			}
@@ -199,9 +199,9 @@ func TestManagerRemoveByIndex(t *testing.T) {
 	mocks := make(map[int]*mockTunnel)
 	mgr := NewTunnelManager(mockTunnelFactory(mocks), nil)
 
-	_ = mgr.Add(3000, "api", "")
-	_ = mgr.Add(8080, "web", "")
-	_ = mgr.Add(5432, "db", "")
+	_ = mgr.Add(3000, "api", "", "")
+	_ = mgr.Add(8080, "web", "", "")
+	_ = mgr.Add(5432, "db", "", "")
 
 	// Remove index 2 (1-based) = port 8080
 	err := mgr.RemoveByIndex(2)
@@ -227,8 +227,8 @@ func TestManagerRemoveByPort(t *testing.T) {
 	mocks := make(map[int]*mockTunnel)
 	mgr := NewTunnelManager(mockTunnelFactory(mocks), nil)
 
-	_ = mgr.Add(3000, "api", "")
-	_ = mgr.Add(8080, "web", "")
+	_ = mgr.Add(3000, "api", "", "")
+	_ = mgr.Add(8080, "web", "", "")
 
 	err := mgr.RemoveByPort(3000)
 	if err != nil {
@@ -246,7 +246,7 @@ func TestManagerRemoveByPort(t *testing.T) {
 
 func TestManagerRemoveNonExistentIndex(t *testing.T) {
 	mgr := NewTunnelManager(mockTunnelFactory(nil), nil)
-	_ = mgr.Add(8080, "web", "")
+	_ = mgr.Add(8080, "web", "", "")
 
 	err := mgr.RemoveByIndex(5)
 	if err == nil {
@@ -261,7 +261,7 @@ func TestManagerRemoveNonExistentIndex(t *testing.T) {
 
 func TestManagerRemoveNonExistentPort(t *testing.T) {
 	mgr := NewTunnelManager(mockTunnelFactory(nil), nil)
-	_ = mgr.Add(8080, "web", "")
+	_ = mgr.Add(8080, "web", "", "")
 
 	err := mgr.RemoveByPort(9999)
 	if err == nil {
@@ -273,8 +273,8 @@ func TestManagerShutdownAll(t *testing.T) {
 	mocks := make(map[int]*mockTunnel)
 	mgr := NewTunnelManager(mockTunnelFactory(mocks), nil)
 
-	_ = mgr.Add(3000, "api", "")
-	_ = mgr.Add(8080, "web", "")
+	_ = mgr.Add(3000, "api", "", "")
+	_ = mgr.Add(8080, "web", "", "")
 
 	mgr.Shutdown()
 
@@ -288,7 +288,7 @@ func TestManagerCountAfterRemoveAll(t *testing.T) {
 	mocks := make(map[int]*mockTunnel)
 	mgr := NewTunnelManager(mockTunnelFactory(mocks), nil)
 
-	_ = mgr.Add(8080, "web", "")
+	_ = mgr.Add(8080, "web", "", "")
 
 	err := mgr.RemoveByPort(8080)
 	if err != nil {
@@ -306,7 +306,7 @@ func TestManagerTunnelsStableInsertionOrder(t *testing.T) {
 
 	ports := []int{9090, 3000, 8080, 4000, 5000}
 	for _, port := range ports {
-		_ = mgr.Add(port, fmt.Sprintf("svc-%d", port), "")
+		_ = mgr.Add(port, fmt.Sprintf("svc-%d", port), "", "")
 	}
 
 	tunnels := mgr.Tunnels()
@@ -333,14 +333,14 @@ func TestManagerCallbackBridge(t *testing.T) {
 		collector := newMsgCollector()
 		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-		_ = mgr.Add(8080, "web", "")
+		_ = mgr.Add(8080, "web", "", "")
 
 		// Simulate the connected callback
 		managed := mgr.getManagedTunnel(8080)
 		if managed == nil {
 			t.Fatal("expected managed tunnel for port 8080")
 		}
-		managed.Callbacks.OnConnected("test-sub", "https://test-sub.justtunnel.dev", "localhost:8080")
+		managed.Callbacks.OnConnected("test-sub", "https://test-sub.justtunnel.dev", "localhost:8080", false)
 
 		msgs := collector.Messages()
 		if len(msgs) == 0 {
@@ -363,7 +363,7 @@ func TestManagerCallbackBridge(t *testing.T) {
 		collector := newMsgCollector()
 		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-		_ = mgr.Add(8080, "web", "")
+		_ = mgr.Add(8080, "web", "", "")
 
 		managed := mgr.getManagedTunnel(8080)
 		now := time.Now()
@@ -386,7 +386,7 @@ func TestManagerCallbackBridge(t *testing.T) {
 		collector := newMsgCollector()
 		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-		_ = mgr.Add(8080, "web", "")
+		_ = mgr.Add(8080, "web", "", "")
 
 		managed := mgr.getManagedTunnel(8080)
 		managed.Callbacks.OnReconnecting(3, 4*time.Second)
@@ -410,7 +410,7 @@ func TestManagerCallbackBridge(t *testing.T) {
 		collector := newMsgCollector()
 		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-		_ = mgr.Add(8080, "web", "")
+		_ = mgr.Add(8080, "web", "", "")
 
 		managed := mgr.getManagedTunnel(8080)
 		managed.Callbacks.OnRequest("GET", "/api/users", 200, 50*time.Millisecond)
@@ -436,11 +436,11 @@ func TestManagerReconnectSubdomainChange(t *testing.T) {
 		collector := newMsgCollector()
 		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-		_ = mgr.Add(8080, "web", "")
+		_ = mgr.Add(8080, "web", "", "")
 
 		managed := mgr.getManagedTunnel(8080)
 		// Simulate initial connection: set subdomain
-		managed.Callbacks.OnConnected("old-sub", "https://old-sub.justtunnel.dev", "localhost:8080")
+		managed.Callbacks.OnConnected("old-sub", "https://old-sub.justtunnel.dev", "localhost:8080", false)
 
 		// Record some stats
 		managed.Stats.Record(RequestEntry{
@@ -483,10 +483,10 @@ func TestManagerReconnectSubdomainChange(t *testing.T) {
 		collector := newMsgCollector()
 		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-		_ = mgr.Add(8080, "web", "")
+		_ = mgr.Add(8080, "web", "", "")
 
 		managed := mgr.getManagedTunnel(8080)
-		managed.Callbacks.OnConnected("same-sub", "https://same-sub.justtunnel.dev", "localhost:8080")
+		managed.Callbacks.OnConnected("same-sub", "https://same-sub.justtunnel.dev", "localhost:8080", false)
 
 		managed.Stats.Record(RequestEntry{
 			Method:     "GET",
@@ -520,8 +520,8 @@ func TestManagerRemoveByIndexBounds(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mgr := NewTunnelManager(mockTunnelFactory(nil), nil)
-			_ = mgr.Add(8080, "web", "")
-			_ = mgr.Add(3000, "api", "")
+			_ = mgr.Add(8080, "web", "", "")
+			_ = mgr.Add(3000, "api", "", "")
 
 			err := mgr.RemoveByIndex(tt.index)
 			if err == nil {
@@ -541,7 +541,7 @@ func TestManagerRunErrorPropagation(t *testing.T) {
 		mocks := make(map[int]*mockTunnel)
 		mgr := NewTunnelManager(mockTunnelFactoryWithError(tunnelErr, mocks), collector)
 
-		err := mgr.Add(8080, "web", "")
+		err := mgr.Add(8080, "web", "", "")
 		if err != nil {
 			t.Fatalf("Add(8080) returned unexpected error: %v", err)
 		}
@@ -580,7 +580,7 @@ func TestManagerRunErrorPropagation(t *testing.T) {
 		mocks := make(map[int]*mockTunnel)
 		mgr := NewTunnelManager(mockTunnelFactory(mocks), collector)
 
-		err := mgr.Add(8080, "web", "")
+		err := mgr.Add(8080, "web", "", "")
 		if err != nil {
 			t.Fatalf("Add(8080) returned unexpected error: %v", err)
 		}
@@ -603,13 +603,79 @@ func TestManagerRunErrorPropagation(t *testing.T) {
 	})
 }
 
+func TestManagerCallbackPasswordProtected(t *testing.T) {
+	t.Run("connected callback with passwordProtected sets flag and sends it in message", func(t *testing.T) {
+		collector := newMsgCollector()
+		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
+
+		_ = mgr.Add(8080, "web", "", "")
+
+		managed := mgr.getManagedTunnel(8080)
+		if managed == nil {
+			t.Fatal("expected managed tunnel for port 8080")
+		}
+
+		// Simulate connection with password protection enabled
+		managed.Callbacks.OnConnected("test-sub", "https://test-sub.justtunnel.dev", "localhost:8080", true)
+
+		// Verify ManagedTunnel.PasswordProtected is set
+		managed.mu.RLock()
+		pwProtected := managed.PasswordProtected
+		managed.mu.RUnlock()
+		if !pwProtected {
+			t.Error("expected PasswordProtected to be true on ManagedTunnel")
+		}
+
+		// Verify the TunnelConnectedMsg carries PasswordProtected
+		msgs := collector.Messages()
+		foundMsg := false
+		for _, msg := range msgs {
+			if connMsg, ok := msg.(TunnelConnectedMsg); ok {
+				if connMsg.Port == 8080 && connMsg.PasswordProtected {
+					foundMsg = true
+					break
+				}
+			}
+		}
+		if !foundMsg {
+			t.Error("expected TunnelConnectedMsg with PasswordProtected=true")
+		}
+	})
+
+	t.Run("connected callback without password protection leaves flag false", func(t *testing.T) {
+		collector := newMsgCollector()
+		mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
+
+		_ = mgr.Add(8080, "web", "", "")
+
+		managed := mgr.getManagedTunnel(8080)
+		managed.Callbacks.OnConnected("test-sub", "https://test-sub.justtunnel.dev", "localhost:8080", false)
+
+		managed.mu.RLock()
+		pwProtected := managed.PasswordProtected
+		managed.mu.RUnlock()
+		if pwProtected {
+			t.Error("expected PasswordProtected to be false")
+		}
+
+		msgs := collector.Messages()
+		for _, msg := range msgs {
+			if connMsg, ok := msg.(TunnelConnectedMsg); ok {
+				if connMsg.Port == 8080 && connMsg.PasswordProtected {
+					t.Error("expected TunnelConnectedMsg with PasswordProtected=false")
+				}
+			}
+		}
+	})
+}
+
 func TestManagedTunnelConcurrentAccess(t *testing.T) {
 	// This test verifies that concurrent reads and writes to ManagedTunnel
 	// fields don't race. Run with -race to detect data races.
 	collector := newMsgCollector()
 	mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
 
-	_ = mgr.Add(8080, "web", "")
+	_ = mgr.Add(8080, "web", "", "")
 
 	managed := mgr.getManagedTunnel(8080)
 	if managed == nil {
@@ -622,7 +688,7 @@ func TestManagedTunnelConcurrentAccess(t *testing.T) {
 	go func() {
 		defer writeWg.Done()
 		for iter := 0; iter < 100; iter++ {
-			managed.Callbacks.OnConnected("sub", "https://sub.example.com", "localhost:8080")
+			managed.Callbacks.OnConnected("sub", "https://sub.example.com", "localhost:8080", false)
 		}
 	}()
 	go func() {

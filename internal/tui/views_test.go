@@ -376,6 +376,110 @@ func TestTruncateString(t *testing.T) {
 	}
 }
 
+func TestRenderListViewPasswordProtectedIndicator(t *testing.T) {
+	t.Parallel()
+
+	tunnels := []TunnelDisplayEntry{
+		{
+			ID:                1,
+			Name:              "api",
+			Port:              3000,
+			PublicURL:         "https://api.justtunnel.dev",
+			State:             StateConnected,
+			PasswordProtected: true,
+			Requests:          10,
+		},
+		{
+			ID:        2,
+			Name:      "web",
+			Port:      8080,
+			PublicURL: "https://web.justtunnel.dev",
+			State:     StateConnected,
+			Requests:  5,
+		},
+	}
+
+	model := NewModel(tunnels, PlanInfo{Name: "Pro", MaxTunnels: 5})
+	model.width = 120
+	model.height = 24
+	output := renderListView(model)
+
+	// The password-protected tunnel should show [P] in its row
+	lines := strings.Split(output, "\n")
+	foundProtectedIndicator := false
+	for _, line := range lines {
+		if strings.Contains(line, "3000") && strings.Contains(line, "[P]") {
+			foundProtectedIndicator = true
+		}
+	}
+	if !foundProtectedIndicator {
+		t.Error("list view should show [P] indicator for password-protected tunnel on port 3000")
+	}
+
+	// The non-protected tunnel should NOT show [P]
+	for _, line := range lines {
+		if strings.Contains(line, "8080") && strings.Contains(line, "[P]") {
+			t.Error("list view should NOT show [P] indicator for non-protected tunnel on port 8080")
+		}
+	}
+}
+
+func TestRenderDetailViewPasswordProtected(t *testing.T) {
+	t.Parallel()
+
+	tunnels := []TunnelDisplayEntry{
+		{
+			ID:                1,
+			Name:              "api",
+			Port:              3000,
+			Subdomain:         "api-sub",
+			PublicURL:         "https://api-sub.justtunnel.dev",
+			State:             StateConnected,
+			PasswordProtected: true,
+			Requests:          10,
+		},
+	}
+
+	model := NewModel(tunnels, PlanInfo{Name: "Pro", MaxTunnels: 5})
+	model.viewState = viewDetail
+	model.selectedIndex = 0
+
+	output := renderDetailView(model)
+
+	if !strings.Contains(output, "Protected:") {
+		t.Error("detail view should show 'Protected:' label for password-protected tunnel")
+	}
+	if !strings.Contains(output, "Yes") {
+		t.Error("detail view should show 'Yes' for password-protected tunnel")
+	}
+}
+
+func TestRenderDetailViewNotPasswordProtected(t *testing.T) {
+	t.Parallel()
+
+	tunnels := []TunnelDisplayEntry{
+		{
+			ID:        1,
+			Name:      "api",
+			Port:      3000,
+			Subdomain: "api-sub",
+			PublicURL: "https://api-sub.justtunnel.dev",
+			State:     StateConnected,
+			Requests:  10,
+		},
+	}
+
+	model := NewModel(tunnels, PlanInfo{Name: "Pro", MaxTunnels: 5})
+	model.viewState = viewDetail
+	model.selectedIndex = 0
+
+	output := renderDetailView(model)
+
+	if strings.Contains(output, "Protected:") {
+		t.Error("detail view should NOT show 'Protected:' label for non-protected tunnel")
+	}
+}
+
 func TestRenderListViewCombinedNarrowAndShort(t *testing.T) {
 	t.Parallel()
 
