@@ -7,9 +7,10 @@ type TickMsg time.Time
 
 // TunnelConnectedMsg indicates a tunnel has successfully connected.
 type TunnelConnectedMsg struct {
-	Port      int
-	Subdomain string
-	PublicURL string
+	Port              int
+	Subdomain         string
+	PublicURL         string
+	PasswordProtected bool
 }
 
 // TunnelDisconnectedMsg indicates a tunnel has lost its connection.
@@ -64,4 +65,5 @@ type TunnelPreset struct {
 	Port      int    `yaml:"port"`
 	Name      string `yaml:"name,omitempty"`
 	Subdomain string `yaml:"subdomain,omitempty"`
+	Password  string `yaml:"password,omitempty"`
 }

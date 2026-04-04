@@ -53,6 +53,14 @@ func validateConfig(cfg *TunnelPresetConfig) error {
 			return fmt.Errorf("tunnel[%d]: duplicate port %d", idx, preset.Port)
 		}
 		seenPorts[preset.Port] = true
+
+		if preset.Password != "" && (len(preset.Password) < 4 || len(preset.Password) > 128) {
+			name := preset.Name
+			if name == "" {
+				name = fmt.Sprintf("port %d", preset.Port)
+			}
+			return fmt.Errorf("tunnel %q password must be between 4 and 128 characters", name)
+		}
 	}
 
 	return nil

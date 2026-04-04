@@ -18,16 +18,16 @@ type TunnelRunner interface {
 // TunnelCallbacks holds the callback functions that the manager wires
 // into each tunnel to bridge lifecycle events to Bubble Tea messages.
 type TunnelCallbacks struct {
-	OnConnected    func(subdomain, url, localTarget string)
+	OnConnected    func(subdomain, url, localTarget string, passwordProtected bool)
 	OnDisconnected func(timestamp time.Time)
 	OnReconnecting func(attempt int, backoff time.Duration)
 	OnReconnected  func(subdomain, previousSubdomain, tunnelURL string, subdomainChanged bool)
 	OnRequest      func(method, path string, status int, latency time.Duration)
 }
 
-// TunnelFactory creates a TunnelRunner given the port, name, subdomain, and callbacks.
+// TunnelFactory creates a TunnelRunner given the port, name, subdomain, password, and callbacks.
 // In production this creates a real tunnel.Tunnel; in tests it returns a mock.
-type TunnelFactory func(port int, name string, subdomain string, callbacks TunnelCallbacks) TunnelRunner
+type TunnelFactory func(port int, name string, subdomain string, password string, callbacks TunnelCallbacks) TunnelRunner
 
 // MessageSender abstracts tea.Program.Send() so the manager can bridge
 // tunnel callbacks to the TUI without depending on a real Bubble Tea program.
@@ -45,15 +45,16 @@ type ManagedTunnel struct {
 	Source string
 
 	// mu protects mutable fields written by callbacks from the tunnel goroutine.
-	mu            sync.RWMutex
-	Subdomain     string
-	LastSubdomain string
-	PublicURL     string
-	State         TunnelState
-	Error         string
-	ConnectedAt   time.Time
-	Stats         *RequestStats
-	Callbacks     TunnelCallbacks
+	mu                sync.RWMutex
+	Subdomain         string
+	LastSubdomain     string
+	PublicURL         string
+	State             TunnelState
+	Error             string
+	ConnectedAt       time.Time
+	PasswordProtected bool
+	Stats             *RequestStats
+	Callbacks         TunnelCallbacks
 
 	runner TunnelRunner
 	cancel context.CancelFunc
@@ -101,6 +102,7 @@ func newManagedTunnel(
 	port int,
 	name string,
 	subdomain string,
+	password string,
 	factory TunnelFactory,
 	sender MessageSender,
 ) *ManagedTunnel {
@@ -113,18 +115,20 @@ func newManagedTunnel(
 	}
 
 	callbacks := TunnelCallbacks{
-		OnConnected: func(sub, tunnelURL, localTarget string) {
+		OnConnected: func(sub, tunnelURL, localTarget string, passwordProtected bool) {
 			managed.mu.Lock()
 			managed.Subdomain = sub
 			managed.PublicURL = tunnelURL
 			managed.State = StateConnected
 			managed.ConnectedAt = time.Now()
+			managed.PasswordProtected = passwordProtected
 			managed.mu.Unlock()
 			if sender != nil {
 				sender.Send(TunnelConnectedMsg{
-					Port:      port,
-					Subdomain: sub,
-					PublicURL: tunnelURL,
+					Port:              port,
+					Subdomain:         sub,
+					PublicURL:         tunnelURL,
+					PasswordProtected: passwordProtected,
 				})
 			}
 		},
@@ -176,7 +180,7 @@ func newManagedTunnel(
 	}
 
 	managed.Callbacks = callbacks
-	managed.runner = factory(port, name, subdomain, callbacks)
+	managed.runner = factory(port, name, subdomain, password, callbacks)
 
 	return managed
 }

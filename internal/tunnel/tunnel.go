@@ -28,7 +28,7 @@ type ReconnectInfo struct {
 
 type Callbacks struct {
 	OnConnecting    func()
-	OnConnected     func(subdomain, url, localTarget string)
+	OnConnected     func(subdomain, url, localTarget string, passwordProtected bool)
 	OnRequest       func(method, path string, status int, latency time.Duration)
 	OnReconnecting  func(attempt int, backoff time.Duration)
 	OnReconnectWait func(attempt int, remaining time.Duration)
@@ -51,6 +51,9 @@ type Tunnel struct {
 	tunnelURL      string
 	tunnelID       string
 	reconnectToken string
+
+	password          string
+	passwordProtected bool // set from tunnel_assigned frame
 
 	maxReconnectAttempts int
 	reconnecting         bool
@@ -75,6 +78,18 @@ func (t *Tunnel) SetMaxReconnectAttempts(maxAttempts int) {
 		maxAttempts = 0
 	}
 	t.maxReconnectAttempts = maxAttempts
+}
+
+// SetPassword sets the password that will be sent as an X-Tunnel-Password header
+// when connecting to the server.
+func (t *Tunnel) SetPassword(pw string) {
+	t.password = pw
+}
+
+// PasswordProtected returns true if the server confirmed that the tunnel is
+// password-protected (from the tunnel_assigned frame).
+func (t *Tunnel) PasswordProtected() bool {
+	return t.passwordProtected
 }
 
 // Run is the main lifecycle: connect, read loop, reconnect on failure.
@@ -117,6 +132,12 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 			"Authorization": []string{"Bearer " + t.authToken},
 		}
 	}
+	if t.password != "" {
+		if opts.HTTPHeader == nil {
+			opts.HTTPHeader = http.Header{}
+		}
+		opts.HTTPHeader.Set("X-Tunnel-Password", t.password)
+	}
 
 	conn, httpResp, err := websocket.Dial(ctx, dialURL, opts)
 	if err != nil {
@@ -157,10 +178,11 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 	t.tunnelURL = assigned.URL
 	t.tunnelID = assigned.TunnelID
 	t.reconnectToken = assigned.ReconnectToken
+	t.passwordProtected = assigned.PasswordProtected
 
 	// Only fire OnConnected for the initial connection, not during reconnects.
 	if !t.reconnecting && t.callbacks.OnConnected != nil {
-		t.callbacks.OnConnected(assigned.Subdomain, assigned.URL, t.localTarget)
+		t.callbacks.OnConnected(assigned.Subdomain, assigned.URL, t.localTarget, t.passwordProtected)
 	}
 
 	return nil
