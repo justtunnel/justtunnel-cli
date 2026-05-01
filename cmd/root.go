@@ -23,6 +23,7 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/display"
 	"github.com/justtunnel/justtunnel-cli/internal/tui"
 	"github.com/justtunnel/justtunnel-cli/internal/tunnel"
+	"github.com/justtunnel/justtunnel-cli/internal/version"
 )
 
 var (
@@ -39,8 +40,8 @@ var rootCmd = &cobra.Command{
 	Use:   "justtunnel [port]",
 	Short: "Expose a local HTTP server to the internet",
 	Long:  "justtunnel creates a public URL that tunnels traffic to a local port via a persistent WebSocket connection.",
-	Args: cobra.RangeArgs(0, 1),
-	RunE: runTunnel,
+	Args:  cobra.RangeArgs(0, 1),
+	RunE:  runTunnel,
 }
 
 func init() {
@@ -54,6 +55,18 @@ func init() {
 	rootCmd.SilenceErrors = true
 	rootCmd.SilenceUsage = true
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
+
+	// Wire `--version` flag and a custom template that matches the
+	// existing `justtunnel version` subcommand format (3 lines).
+	rootCmd.Version = version.Version
+	rootCmd.SetVersionTemplate("justtunnel " + version.Version +
+		"\n  commit: " + version.Commit +
+		"\n  built:  " + version.Date + "\n")
+
+	// Surface the version in `--help` output by appending it to the long
+	// description. Cobra's default help template prints Long verbatim, so
+	// this puts the version near the top of the output.
+	rootCmd.Long = rootCmd.Long + "\n\nVersion: " + version.Version
 }
 
 func Execute() error {
