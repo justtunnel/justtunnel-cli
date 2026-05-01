@@ -17,9 +17,14 @@ import (
 
 const maxBodySize = 10 << 20 // 10 MB
 
+// DefaultLocalTimeout is the per-request timeout when proxying to the local
+// target. Was 120s; trimmed to 30s so a slow/dead local target doesn't pin
+// goroutines + memory on the server side for two whole minutes per request.
+const DefaultLocalTimeout = 30 * time.Second
+
 // ProxyRequest forwards a RequestFrame to the local target server and returns
-// the corresponding ResponseFrame.
-func ProxyRequest(ctx context.Context, frame RequestFrame, target string, logger *slog.Logger) (ResponseFrame, error) {
+// the corresponding ResponseFrame. Pass timeout=0 for the package default.
+func ProxyRequest(ctx context.Context, frame RequestFrame, target string, timeout time.Duration, logger *slog.Logger) (ResponseFrame, error) {
 	var bodyReader io.Reader
 	var bodyBytes []byte
 	if frame.Body != "" {
@@ -48,7 +53,10 @@ func ProxyRequest(ctx context.Context, frame RequestFrame, target string, logger
 		display.LogRequestDetail("Request", frame.Headers, bodyBytes)
 	}
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	if timeout <= 0 {
+		timeout = DefaultLocalTimeout
+	}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, syscall.ECONNREFUSED) {

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -37,20 +38,22 @@ type Callbacks struct {
 }
 
 type Tunnel struct {
-	serverURL   string
-	localTarget string
-	authToken   string
-	logger      *slog.Logger
-	callbacks   Callbacks
+	serverURL    string
+	localTarget  string
+	localTimeout time.Duration
+	authToken    string
+	logger       *slog.Logger
+	callbacks    Callbacks
 
 	conn   *websocket.Conn
 	connMu sync.Mutex // protects conn field and WebSocket writes
 	wg     sync.WaitGroup
 
-	subdomain      string
-	tunnelURL      string
-	tunnelID       string
-	reconnectToken string
+	subdomain         string
+	tunnelURL         string
+	tunnelID          string
+	reconnectToken    string
+	reconnectIssuedAt int64
 
 	password          string
 	passwordProtected bool // set from tunnel_assigned frame
@@ -78,6 +81,15 @@ func (t *Tunnel) SetMaxReconnectAttempts(maxAttempts int) {
 		maxAttempts = 0
 	}
 	t.maxReconnectAttempts = maxAttempts
+}
+
+// SetLocalTimeout sets the per-request timeout for proxying to the local
+// target. Pass 0 to use DefaultLocalTimeout.
+func (t *Tunnel) SetLocalTimeout(timeout time.Duration) {
+	if timeout < 0 {
+		timeout = 0
+	}
+	t.localTimeout = timeout
 }
 
 // SetPassword sets the password that will be sent as an X-Tunnel-Password header
@@ -178,6 +190,7 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 	t.tunnelURL = assigned.URL
 	t.tunnelID = assigned.TunnelID
 	t.reconnectToken = assigned.ReconnectToken
+	t.reconnectIssuedAt = assigned.ReconnectIssuedAt
 	t.passwordProtected = assigned.PasswordProtected
 
 	// Only fire OnConnected for the initial connection, not during reconnects.
@@ -226,7 +239,7 @@ func (t *Tunnel) handleRequest(ctx context.Context, frame *RequestFrame) {
 	t.connMu.Unlock()
 
 	start := time.Now()
-	resp, err := ProxyRequest(ctx, *frame, t.localTarget, t.logger)
+	resp, err := ProxyRequest(ctx, *frame, t.localTarget, t.localTimeout, t.logger)
 	latency := time.Since(start)
 
 	if err != nil {
@@ -293,6 +306,9 @@ func (t *Tunnel) buildReconnectURL() string {
 	query.Set("subdomain", t.subdomain)
 	query.Set("tunnel_id", t.tunnelID)
 	query.Set("reconnect_token", t.reconnectToken)
+	if t.reconnectIssuedAt > 0 {
+		query.Set("reconnect_issued_at", strconv.FormatInt(t.reconnectIssuedAt, 10))
+	}
 	parsed.RawQuery = query.Encode()
 	return parsed.String()
 }

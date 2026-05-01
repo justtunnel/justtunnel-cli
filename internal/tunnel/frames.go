@@ -11,6 +11,7 @@ type TunnelAssigned struct {
 	Subdomain         string `json:"subdomain"`
 	URL               string `json:"url"`
 	ReconnectToken    string `json:"reconnect_token,omitempty"`
+	ReconnectIssuedAt int64  `json:"reconnect_issued_at,omitempty"`
 	PasswordProtected bool   `json:"password_protected,omitempty"`
 }
 

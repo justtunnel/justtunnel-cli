@@ -32,6 +32,7 @@ var (
 	password             string
 	maxReconnectAttempts int
 	tunnelConfigFile     string
+	localTimeout         time.Duration
 )
 
 var rootCmd = &cobra.Command{
@@ -49,6 +50,7 @@ func init() {
 	rootCmd.Flags().IntVar(&maxReconnectAttempts, "max-reconnect-attempts", 50, "maximum number of reconnection attempts (0 = unlimited)")
 	rootCmd.Flags().StringVar(&tunnelConfigFile, "config-file", "", "YAML config file with tunnel definitions")
 	rootCmd.Flags().StringVar(&password, "password", "", "password-protect the tunnel (4-128 chars)")
+	rootCmd.Flags().DurationVar(&localTimeout, "local-timeout", tunnel.DefaultLocalTimeout, "per-request timeout when proxying to the local target (e.g. 30s, 1m)")
 	rootCmd.SilenceErrors = true
 	rootCmd.SilenceUsage = true
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
@@ -296,6 +298,10 @@ func newTunnelFactory(serverURL, authToken string, logger *slog.Logger, cmd *cob
 			tun.SetMaxReconnectAttempts(maxReconnectAttempts)
 		}
 
+		if cmd.Flags().Changed("local-timeout") {
+			tun.SetLocalTimeout(localTimeout)
+		}
+
 		return tun
 	}
 }
@@ -372,6 +378,10 @@ func runNonTTY(port int, cfg *config.Config, serverURL string, logger *slog.Logg
 		tun.SetMaxReconnectAttempts(maxReconnectAttempts)
 	} else if cfg.MaxReconnectAttempts != nil {
 		tun.SetMaxReconnectAttempts(*cfg.MaxReconnectAttempts)
+	}
+
+	if cmd.Flags().Changed("local-timeout") {
+		tun.SetLocalTimeout(localTimeout)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
