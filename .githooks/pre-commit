@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Pre-commit safety check.
+# Blocks accidental commits of DB dumps, raw secrets, and oversized blobs.
+# Runs against the staged set (git diff --cached --diff-filter=A).
+# Bypass with `git commit --no-verify` only when you understand the risk.
+
+set -euo pipefail
+
+added=$(git diff --cached --name-only --diff-filter=A)
+[[ -z "$added" ]] && exit 0
+
+fail() {
+    printf '\n\033[31mpre-commit reject:\033[0m %s\n' "$1" >&2
+    printf 'See .githooks/pre-commit. Bypass with --no-verify if intentional.\n\n' >&2
+    exit 1
+}
+
+# 1. Known-bad paths (DB dump dirs, vendor leaks, etc.)
+if echo "$added" | grep -qE '(^|/)(jt-backup|mongodump|dbdump|dump|backup)/'; then
+    fail "DB-dump-style path in commit. Should be gitignored."
+fi
+
+# 2. Known-bad extensions (raw DB / dump files)
+if echo "$added" | grep -qE '\.(bson|dump|sqlite3?|pgdump|mysqldump)$'; then
+    fail "Raw DB file in commit. Use a fixture or seed script."
+fi
+
+# 3. Secret-bearing filenames (defense in depth — .env should be gitignored)
+if echo "$added" | grep -E '(^|/)\.env($|\..+$)' | grep -vE '\.env\.example$' | grep -q .; then
+    fail ".env file in commit. Should be gitignored."
+fi
+if echo "$added" | grep -qE '(credentials|service-account|secret)\.json$'; then
+    fail "Likely-credentials file in commit. Verify or rename."
+fi
+
+# 4. Size guard — anything > 1 MB demands explicit confirmation
+limit=$((1024 * 1024))
+while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    size=$(git cat-file -s ":$path" 2>/dev/null || echo 0)
+    if (( size > limit )); then
+        fail "$path is $((size/1024)) KB (limit 1024 KB). Confirm intent or use Git LFS."
+    fi
+done <<< "$added"
+
+exit 0
