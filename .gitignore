@@ -26,3 +26,6 @@ coverage.out
 *.dll
 *.so
 *.dylib
+
+# Local mongodump output — never commit DB snapshots
+jt-backup/
