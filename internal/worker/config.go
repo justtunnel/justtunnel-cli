@@ -103,19 +103,25 @@ func Read(name string) (*Config, error) {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		// Preserve os.ErrNotExist semantics for the caller.
-		return nil, err
+		// Wrap so callers get a consistent "worker:" prefix while preserving
+		// os.ErrNotExist semantics via %w.
+		return nil, fmt.Errorf("worker: read config %q: %w", name, err)
 	}
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("worker: parse %s: %w", path, err)
 	}
+	if cfg.Name != name {
+		return nil, fmt.Errorf("worker: config %q has mismatched name field %q", name, cfg.Name)
+	}
 	return &cfg, nil
 }
 
-// Write persists cfg atomically. The on-disk representation is identical
-// for identical inputs, so re-writing the same Config is a no-op as far as
-// downstream observers are concerned (idempotent re-init).
+// Write persists cfg atomically. "Idempotent" here means semantic
+// last-writer-wins with identical content: re-writing the same Config
+// produces a byte-identical file, but the implementation still performs
+// the temp-file create + fsync + rename dance on every call. It is not
+// a zero-filesystem-ops no-op.
 func Write(cfg *Config) error {
 	if cfg == nil {
 		return errors.New("worker: nil config")
@@ -145,6 +151,15 @@ func Write(cfg *Config) error {
 		}
 	}()
 
+	// Tighten perms IMMEDIATELY, before writing the worker-id-bearing
+	// payload. os.CreateTemp opens with 0o600 & ~umask, which under a zero
+	// umask (Docker, some CI) leaves the file world-readable for the
+	// window between create and the post-write chmod.
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("worker: chmod temp file: %w", err)
+	}
+
 	if _, err := tmp.Write(payload); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("worker: write temp file: %w", err)
@@ -156,7 +171,8 @@ func Write(cfg *Config) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("worker: close temp file: %w", err)
 	}
-	// Tighten perms before rename so the final file is never world-readable.
+	// Defense-in-depth re-chmod in case anything between create and
+	// rename loosened perms (it shouldn't, but cheap insurance).
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return fmt.Errorf("worker: chmod temp file: %w", err)
 	}
@@ -167,9 +183,11 @@ func Write(cfg *Config) error {
 	return nil
 }
 
-// List enumerates every worker config in the directory. Non-JSON files and
-// the temp files generated during atomic writes are skipped. Results are
-// sorted by name for deterministic output.
+// List enumerates every worker config in the directory. Non-JSON files
+// are skipped. Corrupt files and files whose embedded Name disagrees with
+// their on-disk filename are skipped with a stderr warning so a single
+// bad file can't break `worker list`. Results are sorted by name for
+// deterministic output.
 func List() ([]Config, error) {
 	dir, err := WorkerDir()
 	if err != nil {
@@ -184,20 +202,25 @@ func List() ([]Config, error) {
 		if entry.IsDir() {
 			continue
 		}
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".tmp") {
+		fileName := entry.Name()
+		if !strings.HasSuffix(fileName, ".json") {
 			continue
 		}
-		path := filepath.Join(dir, name)
+		path := filepath.Join(dir, fileName)
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("worker: read %s: %w", path, err)
+			fmt.Fprintf(os.Stderr, "worker: skip %s: read failed: %v\n", path, err)
+			continue
 		}
 		var cfg Config
 		if err := json.Unmarshal(data, &cfg); err != nil {
-			// One bad file shouldn't poison the whole list; surface it
-			// loudly instead of silently dropping so users can fix it.
-			return nil, fmt.Errorf("worker: parse %s: %w", path, err)
+			fmt.Fprintf(os.Stderr, "worker: skip %s: parse failed: %v\n", path, err)
+			continue
+		}
+		expectedName := strings.TrimSuffix(fileName, ".json")
+		if cfg.Name != expectedName {
+			fmt.Fprintf(os.Stderr, "worker: skip %s: name field %q does not match filename\n", path, cfg.Name)
+			continue
 		}
 		configs = append(configs, cfg)
 	}

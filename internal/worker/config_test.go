@@ -1,9 +1,11 @@
 package worker
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -54,19 +56,24 @@ func TestWriteRead_RoundTrip(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("JUSTTUNNEL_HOME", home)
 
-	cfg := newTestConfig("alice")
-	if err := Write(cfg); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	names := []string{"alice", strings.Repeat("a", 63)}
+	for _, name := range names {
+		t.Run("name="+name, func(t *testing.T) {
+			cfg := newTestConfig(name)
+			if err := Write(cfg); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
 
-	got, err := Read("alice")
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	if got.WorkerID != cfg.WorkerID || got.Name != cfg.Name || got.Context != cfg.Context ||
-		got.Subdomain != cfg.Subdomain || got.ServiceBackend != cfg.ServiceBackend ||
-		got.ServiceUnitPath != cfg.ServiceUnitPath || !got.CreatedAt.Equal(cfg.CreatedAt) {
-		t.Fatalf("round-trip mismatch: got %+v want %+v", got, cfg)
+			got, err := Read(name)
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if got.WorkerID != cfg.WorkerID || got.Name != cfg.Name || got.Context != cfg.Context ||
+				got.Subdomain != cfg.Subdomain || got.ServiceBackend != cfg.ServiceBackend ||
+				got.ServiceUnitPath != cfg.ServiceUnitPath || !got.CreatedAt.Equal(cfg.CreatedAt) {
+				t.Fatalf("round-trip mismatch: got %+v want %+v", got, cfg)
+			}
+		})
 	}
 }
 
@@ -279,16 +286,26 @@ func TestConcurrentWrites_NoCorruption(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("JUSTTUNNEL_HOME", home)
 
-	cfg := newTestConfig("alice")
+	// Each goroutine writes a distinct payload (same Name so they all
+	// race for the same file). After the dust settles the on-disk file
+	// must be byte-identical to one of the writers (no torn writes).
+	candidates := make([]*Config, 20)
+	for idx := range candidates {
+		cfg := newTestConfig("alice")
+		cfg.WorkerID = "wkr_writer_" + strings.Repeat("x", idx+1)
+		cfg.Subdomain = "alice--writer-" + strings.Repeat("x", idx+1)
+		candidates[idx] = cfg
+	}
+
 	var waitGroup sync.WaitGroup
-	for idx := 0; idx < 20; idx++ {
+	for _, cfg := range candidates {
 		waitGroup.Add(1)
-		go func() {
+		go func(cfg *Config) {
 			defer waitGroup.Done()
 			if err := Write(cfg); err != nil {
 				t.Errorf("concurrent Write: %v", err)
 			}
-		}()
+		}(cfg)
 	}
 	waitGroup.Wait()
 
@@ -296,7 +313,98 @@ func TestConcurrentWrites_NoCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read after concurrent writes: %v", err)
 	}
-	if got.WorkerID != cfg.WorkerID {
-		t.Fatalf("WorkerID corrupted: %q", got.WorkerID)
+	matched := false
+	for _, candidate := range candidates {
+		if reflect.DeepEqual(got, candidate) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		t.Fatalf("post-race config did not match any writer; got %+v", got)
+	}
+}
+
+func TestRead_NameMismatchErrors(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("JUSTTUNNEL_HOME", home)
+
+	// Write a file at alice.json whose Name field says "bob".
+	dir, err := WorkerDir()
+	if err != nil {
+		t.Fatalf("WorkerDir: %v", err)
+	}
+	cfg := newTestConfig("bob")
+	payload, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "alice.json"), payload, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, err = Read("alice")
+	if err == nil {
+		t.Fatalf("Read should error on name mismatch")
+	}
+	if !strings.Contains(err.Error(), "mismatched name") {
+		t.Fatalf("err = %v, want to mention mismatched name", err)
+	}
+}
+
+func TestList_SkipsCorruptFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("JUSTTUNNEL_HOME", home)
+
+	if err := Write(newTestConfig("alice")); err != nil {
+		t.Fatalf("Write alice: %v", err)
+	}
+	if err := Write(newTestConfig("carol")); err != nil {
+		t.Fatalf("Write carol: %v", err)
+	}
+	dir, _ := WorkerDir()
+	if err := os.WriteFile(filepath.Join(dir, "bob.json"), []byte("{not valid json"), 0o600); err != nil {
+		t.Fatalf("write corrupt: %v", err)
+	}
+
+	got, err := List()
+	if err != nil {
+		t.Fatalf("List should not fail on corrupt file: %v", err)
+	}
+	gotNames := make([]string, len(got))
+	for idx, cfg := range got {
+		gotNames[idx] = cfg.Name
+	}
+	sort.Strings(gotNames)
+	want := []string{"alice", "carol"}
+	if !reflect.DeepEqual(gotNames, want) {
+		t.Fatalf("List names = %v, want %v", gotNames, want)
+	}
+}
+
+func TestList_SkipsNameMismatch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("JUSTTUNNEL_HOME", home)
+
+	if err := Write(newTestConfig("alice")); err != nil {
+		t.Fatalf("Write alice: %v", err)
+	}
+	dir, _ := WorkerDir()
+	// File named bob.json but with Name="impostor" inside.
+	mismatched := newTestConfig("impostor")
+	payload, err := json.MarshalIndent(mismatched, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bob.json"), payload, 0o600); err != nil {
+		t.Fatalf("write mismatched: %v", err)
+	}
+
+	got, err := List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "alice" {
+		t.Fatalf("List = %+v, want only alice", got)
 	}
 }
