@@ -45,7 +45,8 @@ var workerCmd = &cobra.Command{
 	Use:   "worker",
 	Short: "Manage worker tunnels (team contexts only)",
 	Long: "Manage long-lived worker tunnels owned by a team.\n" +
-		"Worker commands require a team context — switch with `justtunnel context use team:<slug>`.",
+		"Worker commands require a team context — switch with `justtunnel context use team:<slug>`.\n\n" +
+		"On Windows, see docs/windows-recipe.md for the Task Scheduler recipe.",
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return cmd.Help()

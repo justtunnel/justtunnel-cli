@@ -78,6 +78,12 @@ justtunnel 3000 --log-level debug        # verbose logging
 | `--max-reconnect-attempts` | — | `50` | Max reconnection attempts before giving up (0 = unlimited) |
 | `--config` | — | `~/.config/justtunnel/config.yaml` | Auth config file path |
 
+### `justtunnel worker`
+
+Manage long-lived worker tunnels owned by a team. Requires a team context — switch with `justtunnel context use team:<slug>`.
+
+Windows users: see [docs/windows-recipe.md](docs/windows-recipe.md) for foreground and Task Scheduler patterns.
+
 ### `justtunnel auth <key>`
 
 Save your API key locally. Validates the key against the server first.
