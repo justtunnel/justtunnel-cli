@@ -68,6 +68,18 @@ func resolveTeamID(cfg *config.Config) (string, string, error) {
 	if slug == "" {
 		return "", "", display.InputError("team context has empty slug")
 	}
+	// Re-validate the resolved context before we use the slug to construct
+	// REST URLs. ResolveContext can return values that came from the
+	// --context flag or a hand-edited config file; without this check a
+	// malformed slug like "foo:bar" or "UPPER" would land verbatim in the
+	// path. Use ValidateContext on the full "team:<slug>" form so the
+	// regex/charset rules stay in one place.
+	if err := config.ValidateContext(active); err != nil {
+		return "", "", display.InputError(fmt.Sprintf(
+			"invalid team context %q: %v — switch with `justtunnel context use team:<slug>`",
+			active, err,
+		))
+	}
 	return slug, active, nil
 }
 
@@ -111,7 +123,11 @@ func httpDo(method, url, authToken string, body io.Reader) (int, []byte, error) 
 		return 0, nil, fmt.Errorf("request: %w", err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// Cap response body at 64 KiB. The CLI only consumes small JSON
+	// envelopes (worker create/list/delete); a hostile or buggy server
+	// shipping a multi-megabyte body should not be able to inflate CLI
+	// memory.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
 		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
 	}
@@ -138,6 +154,9 @@ func extractServerError(body []byte) string {
 // postWorker calls POST /api/teams/{teamID}/workers and returns the parsed
 // worker. Non-2xx responses surface as errors with the server's message.
 func postWorker(baseURL, authToken, teamID, name string) (*workerAPI, error) {
+	// json.Marshal on a map[string]string with a literal key cannot fail
+	// (no unsupported types possible). Explicit `_ =` documents the
+	// intentional discard.
 	body, _ := json.Marshal(map[string]string{"name": name})
 	url := baseURL + "/api/teams/" + teamID + "/workers"
 	status, raw, err := httpDo(http.MethodPost, url, authToken, bytes.NewReader(body))

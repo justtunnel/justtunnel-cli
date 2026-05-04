@@ -61,48 +61,94 @@ func runWorkerList(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// mergeWorkers unions the two sources by name. Server entries take
-// precedence for status/id/subdomain when both sides exist; the local-only
-// case still surfaces what we know locally so the user has something to
-// reference. Output is sorted by name for deterministic display.
+// mergeWorkers unions the two sources. Server entries are keyed by
+// WorkerID (the server's source of truth) so a name collision in the
+// server response surfaces as two distinct rows tagged with a
+// "[duplicate-name]" marker rather than silently overwriting. Local
+// entries are matched against server entries first by WorkerID, then by
+// name as a fallback for local-only configs that have no server-assigned
+// ID yet. Output is sorted by name for deterministic display.
 func mergeWorkers(server []workerAPI, local []worker.Config, ctxName string) []workerRow {
-	byName := make(map[string]*workerRow)
-
+	// Detect server-side name collisions in a first pass so we can mark
+	// every offending row, not just the second one.
+	nameCounts := make(map[string]int, len(server))
 	for _, srv := range server {
+		nameCounts[srv.Name]++
+	}
+
+	byID := make(map[string]*workerRow, len(server))
+	rows := make([]*workerRow, 0, len(server)+len(local))
+	for _, srv := range server {
+		displayName := srv.Name
+		if nameCounts[srv.Name] > 1 {
+			displayName = srv.Name + " [duplicate-name]"
+		}
 		row := &workerRow{
-			Name:      srv.Name,
+			Name:      displayName,
 			WorkerID:  srv.ID,
 			Subdomain: srv.Subdomain,
 			Status:    srv.Status,
 			Presence:  "server-only",
 		}
-		byName[srv.Name] = row
+		// Only the first server entry for a given ID gets indexed. IDs
+		// should be unique server-side; if they aren't, we still render
+		// every row but only one wins the "synced" upgrade for a local
+		// match (deterministic by iteration order).
+		if _, exists := byID[srv.ID]; !exists && srv.ID != "" {
+			byID[srv.ID] = row
+		}
+		rows = append(rows, row)
 	}
 
+	// Track local rows already attached to a server row so name-fallback
+	// matching doesn't double-count.
+	matched := make(map[string]bool, len(local))
 	for _, loc := range local {
 		// Local configs not bound to this context are noise — skip.
 		if loc.Context != ctxName {
 			continue
 		}
-		if existing, ok := byName[loc.Name]; ok {
-			existing.Presence = "synced"
-			continue
+		// Prefer ID match: this is robust against server-side renames
+		// and is the dedup key the server itself uses.
+		if loc.WorkerID != "" {
+			if existing, ok := byID[loc.WorkerID]; ok {
+				existing.Presence = "synced"
+				matched[loc.Name] = true
+				continue
+			}
 		}
-		byName[loc.Name] = &workerRow{
+		// Fall back to name match for local entries with no WorkerID
+		// (legacy state, or local configs created before a server-side
+		// create succeeded). This intentionally does NOT cross
+		// duplicate-name server rows; a local config matching a name
+		// collision is ambiguous and we leave it as local-only.
+		if loc.WorkerID == "" && nameCounts[loc.Name] == 1 {
+			for _, row := range rows {
+				if row.Name == loc.Name {
+					row.Presence = "synced"
+					matched[loc.Name] = true
+					break
+				}
+			}
+			if matched[loc.Name] {
+				continue
+			}
+		}
+		rows = append(rows, &workerRow{
 			Name:      loc.Name,
 			WorkerID:  loc.WorkerID,
 			Subdomain: loc.Subdomain,
 			Status:    "",
 			Presence:  "local-only",
-		}
+		})
 	}
 
-	rows := make([]workerRow, 0, len(byName))
-	for _, row := range byName {
-		rows = append(rows, *row)
+	out := make([]workerRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, *row)
 	}
-	sort.Slice(rows, func(left, right int) bool { return rows[left].Name < rows[right].Name })
-	return rows
+	sort.Slice(out, func(left, right int) bool { return out[left].Name < out[right].Name })
+	return out
 }
 
 func writeWorkerTable(out io.Writer, rows []workerRow) {
