@@ -15,7 +15,11 @@ const TeamContextPrefix = "team:"
 // ValidateContext returns nil if name is a syntactically valid context name.
 // Valid forms:
 //   - "personal"
-//   - "team:<slug>" where <slug> is non-empty and contains only [a-z0-9-]
+//   - "team:<id-or-slug>" where the trailing value is non-empty and contains
+//     only [A-Za-z0-9-]. The CLI accepts both the team's slug ("dev-team")
+//     and the team's ULID-shaped _id ("01KQTJBVA6REFPMKT8MPKX8Z9N") because
+//     the server route currently keys workers by the ULID, not the slug
+//     (see justtunnel-cli#43).
 //
 // It does NOT validate that the user actually has access to the named context.
 func ValidateContext(name string) error {
@@ -23,18 +27,19 @@ func ValidateContext(name string) error {
 		return nil
 	}
 	if !strings.HasPrefix(name, TeamContextPrefix) {
-		return fmt.Errorf("invalid context %q: must be %q or %q<slug>", name, PersonalContext, TeamContextPrefix)
+		return fmt.Errorf("invalid context %q: must be %q or %q<id-or-slug>", name, PersonalContext, TeamContextPrefix)
 	}
-	slug := strings.TrimPrefix(name, TeamContextPrefix)
-	if slug == "" {
-		return fmt.Errorf("invalid context %q: team slug is empty", name)
+	identifier := strings.TrimPrefix(name, TeamContextPrefix)
+	if identifier == "" {
+		return fmt.Errorf("invalid context %q: team identifier is empty", name)
 	}
-	for _, character := range slug {
+	for _, character := range identifier {
 		isLower := character >= 'a' && character <= 'z'
+		isUpper := character >= 'A' && character <= 'Z'
 		isDigit := character >= '0' && character <= '9'
 		isDash := character == '-'
-		if !isLower && !isDigit && !isDash {
-			return fmt.Errorf("invalid context %q: slug may only contain lowercase letters, digits, and dashes", name)
+		if !isLower && !isUpper && !isDigit && !isDash {
+			return fmt.Errorf("invalid context %q: team identifier may only contain letters, digits, and dashes", name)
 		}
 	}
 	return nil

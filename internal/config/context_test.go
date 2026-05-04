@@ -17,10 +17,12 @@ func TestValidateContext(t *testing.T) {
 		{"personal is valid", "personal", false},
 		{"team with slug is valid", "team:acme", false},
 		{"team with digits and dashes", "team:acme-corp-2", false},
-		{"team with empty slug", "team:", true},
-		{"team with uppercase slug", "team:Acme", true},
-		{"team with underscore slug", "team:acme_corp", true},
+		{"team with ULID id is valid", "team:01KQTJBVA6REFPMKT8MPKX8Z9N", false},
+		{"team with mixed case identifier is valid", "team:Acme", false},
+		{"team with empty identifier", "team:", true},
+		{"team with underscore", "team:acme_corp", true},
 		{"team with space", "team:acme corp", true},
+		{"team with dot", "team:acme.corp", true},
 		{"random string", "foobar", true},
 		{"empty string", "", true},
 		{"just colon", ":", true},
@@ -117,8 +119,8 @@ func TestSetCurrentContextRejectsInvalid(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid context, got nil")
 	}
-	if !strings.Contains(err.Error(), "team slug is empty") {
-		t.Errorf("error should mention empty slug, got: %v", err)
+	if !strings.Contains(err.Error(), "team identifier is empty") {
+		t.Errorf("error should mention empty identifier, got: %v", err)
 	}
 	if cfg.CurrentContext != "" {
 		t.Errorf("invalid set should not mutate cfg, got %q", cfg.CurrentContext)

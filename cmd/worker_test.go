@@ -618,8 +618,9 @@ func TestResolveTeamIDRejectsMalformedSlugs(t *testing.T) {
 		name    string
 		context string
 	}{
-		{"colon in slug", "team:foo:bar"},
-		{"uppercase slug", "team:UPPER"},
+		{"colon in identifier", "team:foo:bar"},
+		{"underscore in identifier", "team:foo_bar"},
+		{"space in identifier", "team:foo bar"},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {

@@ -94,9 +94,9 @@ func TestContextUseRejectsInvalid(t *testing.T) {
 		name  string
 		input string
 	}{
-		{"empty team slug", "team:"},
+		{"empty team identifier", "team:"},
 		{"bad name", "garbage"},
-		{"uppercase slug", "team:Acme"},
+		{"underscore in identifier", "team:acme_corp"},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
