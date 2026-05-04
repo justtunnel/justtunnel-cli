@@ -25,6 +25,10 @@ type workerAPI struct {
 	Subdomain string `json:"subdomain,omitempty"`
 	Status    string `json:"status,omitempty"`
 	CreatedAt string `json:"created_at,omitempty"`
+	// LastSeenAt is RFC3339; the server may not yet emit it (see
+	// server/internal/db/workers.go #43 follow-up). When absent the CLI
+	// renders "-" so missing telemetry doesn't look like an error.
+	LastSeenAt string `json:"last_seen_at,omitempty"`
 }
 
 // workerListResponse matches GET /api/teams/{teamID}/workers.
