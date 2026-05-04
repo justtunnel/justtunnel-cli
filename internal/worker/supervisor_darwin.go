@@ -2,31 +2,65 @@
 
 package worker
 
-import "context"
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"strconv"
 
-// DarwinSupervisor probes launchd via `launchctl print user/<UID>/<label>`.
-// For #32 this is a stub: it returns ServiceBackend="launchd" and
-// Detail="probe not yet implemented" so `worker status` renders without
-// crashing on macOS.
+	"github.com/justtunnel/justtunnel-cli/internal/worker/launchctl"
+)
+
+// DarwinSupervisor probes launchd via `launchctl print gui/<UID>/<label>`.
 //
-// TODO(#34): replace this stub with a real `launchctl print
-// user/<UID>/dev.justtunnel.worker.<name>` invocation. Parse the output
-// for `state = running` (Running=true) and treat exit code 113
-// ("Could not find specified service") as ManagedByUs=false. The label
-// prefix `dev.justtunnel.worker.` is the convention chosen for this
-// project; mirror it in the systemd unit name on Linux.
+// The launchctl shell-out lives here (build-tagged darwin), but ALL output
+// parsing is delegated to launchctl.ParsePrint, which is pure and
+// build-tag-free. This split keeps the parser unit-testable on every OS
+// while keeping the syscall localized to the platform that needs it.
+//
+// We import internal/worker/launchctl (not internal/worker/installer) on
+// purpose: installer depends on this package via worker.Read /
+// worker.LogFilePath, so importing installer here would create a cycle.
 type DarwinSupervisor struct{}
 
 // NewSupervisorForOS returns a Supervisor appropriate for the build OS.
 // On darwin it returns a DarwinSupervisor.
 func NewSupervisorForOS() Supervisor { return &DarwinSupervisor{} }
 
-// Probe returns a stub result. See the package-level TODO(#34).
+// Probe shells out to launchctl and classifies the result. The label
+// convention `dev.justtunnel.worker.<name>` is owned by the launchctl
+// package; both the installer and this probe reach for the same constant
+// to guarantee they can't drift.
 func (s *DarwinSupervisor) Probe(ctx context.Context, workerName string) (ProbeResult, error) {
-	return ProbeResult{
-		ServiceBackend: "launchd",
-		ManagedByUs:    false,
-		Running:        false,
-		Detail:         "probe not yet implemented",
-	}, nil
+	label := launchctl.Label(workerName)
+	target := "gui/" + strconv.Itoa(os.Geteuid()) + "/" + label
+
+	cmd := exec.CommandContext(ctx, "launchctl", "print", target)
+	output, err := cmd.CombinedOutput()
+
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			// Process couldn't be started at all (e.g. launchctl not
+			// found). Surface as a probe error rather than silently
+			// claiming "not loaded".
+			return ProbeResult{ServiceBackend: "launchd"}, err
+		}
+	}
+
+	state, detail := launchctl.ParsePrint(string(output), exitCode)
+	switch state {
+	case launchctl.ProbeStateRunning:
+		return ProbeResult{ServiceBackend: "launchd", ManagedByUs: true, Running: true, Detail: detail}, nil
+	case launchctl.ProbeStateWaiting:
+		return ProbeResult{ServiceBackend: "launchd", ManagedByUs: true, Running: false, Detail: detail}, nil
+	case launchctl.ProbeStateNotLoaded:
+		return ProbeResult{ServiceBackend: "launchd", ManagedByUs: false, Running: false}, nil
+	default:
+		return ProbeResult{ServiceBackend: "launchd", ManagedByUs: true, Running: false, Detail: detail}, nil
+	}
 }
