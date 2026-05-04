@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -311,15 +313,19 @@ func (fce *fakeCloseError) CloseCode() int { return fce.code }
 // newTestRunner builds a Runner wired to a fake dialer with deterministic,
 // near-zero backoff so reconnect tests run in milliseconds.
 func newTestRunner(dialer Dialer) *Runner {
-	return &Runner{
-		WorkerName: "build",
-		WorkerID:   "wkr_123",
-		Subdomain:  "build--acme",
-		ServerURL:  "wss://api.example.com/ws",
-		Logger:     newDiscardLogger(),
-		Dialer:     dialer,
-		backoff:    func(attempt int) time.Duration { return time.Millisecond },
-	}
+	return NewRunner(
+		RunnerIdentity{
+			WorkerName: "build",
+			WorkerID:   "wkr_123",
+			Subdomain:  "build--acme",
+			ServerURL:  "wss://api.example.com/ws",
+		},
+		RunnerDeps{
+			Logger: newDiscardLogger(),
+			Dialer: dialer,
+		},
+		WithBackoff(func(attempt int) time.Duration { return time.Millisecond }),
+	)
 }
 
 // TestRunner_AuthFailureIsTerminal verifies that a Dialer returning an
@@ -490,12 +496,168 @@ func TestRunner_SecondCancelDuringTeardown(t *testing.T) {
 	}
 }
 
+// TestRunner_StableDisconnectReconnectsImmediately exercises B1: a
+// connection that survived the stable threshold should NOT pay a backoff
+// penalty when it disconnects — the next reconnect attempt should be
+// effectively immediate. Previous code reset the disconnect counter to 0
+// then post-incremented, paying Backoff(1) ≈ 1s on every stable
+// disconnect.
+//
+// Strategy: synthetic clock controlled via a counter. clock() returns
+// stableDur*2 on the SECOND call (which is the post-disconnect check at
+// `clock().Sub(attachedAt)`). The first call (attachedAt capture) returns
+// 0 — so the elapsed time is stableDur*2, comfortably past the threshold.
+func TestRunner_StableDisconnectReconnectsImmediately(t *testing.T) {
+	dialTimes := make(chan time.Time, 4)
+	const stable = 50 * time.Millisecond
+
+	var calls int32
+	base := time.Unix(1700000000, 0)
+	clock := func() time.Time {
+		// Call 1 (attachedAt for dial #1)        → +0
+		// Call 2 (post-disconnect for dial #1)   → +stable*2 (stable!)
+		// Call 3+ (anything later, doesn't matter for assertion).
+		index := atomic.AddInt32(&calls, 1)
+		if index == 1 {
+			return base
+		}
+		return base.Add(stable * 4)
+	}
+
+	dialer := &recordingDialer{
+		dialTimes: dialTimes,
+		script: []dialResult{
+			{closeErr: &fakeCloseError{code: 1006, reason: "abnormal"}},
+			{blockUntilCancel: true},
+		},
+	}
+	runner := NewRunner(
+		RunnerIdentity{
+			WorkerName: "build",
+			WorkerID:   "wkr_stable",
+			Subdomain:  "build--acme",
+			ServerURL:  "wss://api.example.com/ws",
+		},
+		RunnerDeps{Logger: newDiscardLogger(), Dialer: dialer},
+		// 1s backoff — if the runner pays a backoff penalty, the gap is
+		// bigger than 100ms and the assertion fails.
+		WithBackoff(func(attempt int) time.Duration { return time.Second }),
+		WithClock(clock),
+		WithStableConnDuration(stable),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+
+	var firstDial, secondDial time.Time
+	select {
+	case firstDial = <-dialTimes:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first dial did not happen within 2s")
+	}
+	select {
+	case secondDial = <-dialTimes:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second dial did not happen within 2s")
+	}
+
+	gap := secondDial.Sub(firstDial)
+	if gap > 100*time.Millisecond {
+		t.Fatalf("stable disconnect gap = %s; want <100ms (no backoff after stable connection)", gap)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit within 2s of cancel")
+	}
+}
+
+// TestBackoff_JitterRespectsCap exercises B5: even when jitter rounds
+// upward, the returned duration MUST NOT exceed the 60s hard cap.
+func TestBackoff_JitterRespectsCap(t *testing.T) {
+	for sample := 0; sample < 1000; sample++ {
+		got := Backoff(100)
+		if got > 60*time.Second {
+			t.Fatalf("Backoff(100) = %s; exceeds 60s cap (sample %d)", got, sample)
+		}
+		if got < 0 {
+			t.Fatalf("Backoff(100) = %s; negative duration (sample %d)", got, sample)
+		}
+	}
+}
+
+// TestBuildDialURL_PlaintextWarning exercises B4: a ws:// scheme triggers
+// a one-line stderr warning so the operator notices the Bearer token is
+// going over the wire unencrypted.
+func TestBuildDialURL_PlaintextWarning(t *testing.T) {
+	prevWarn := plaintextWarnOut
+	t.Cleanup(func() { plaintextWarnOut = prevWarn })
+
+	captured := &threadSafeBuffer{}
+	plaintextWarnOut = captured
+
+	if _, err := BuildDialURL("ws://localhost:8080/ws", "wkr_x", "build", "build--acme"); err != nil {
+		t.Fatalf("BuildDialURL: %v", err)
+	}
+	if got := captured.String(); !strings.Contains(got, "plaintext ws://") {
+		t.Errorf("expected plaintext warning, got: %q", got)
+	}
+	if got := captured.String(); !strings.Contains(got, "unencrypted") {
+		t.Errorf("expected mention of unencrypted token, got: %q", got)
+	}
+
+	// wss:// must NOT warn — the warning is plaintext-only.
+	captured.Reset()
+	if _, err := BuildDialURL("wss://api.example.com/ws", "wkr_x", "build", "build--acme"); err != nil {
+		t.Fatalf("BuildDialURL: %v", err)
+	}
+	if got := captured.String(); got != "" {
+		t.Errorf("wss:// must not warn, got: %q", got)
+	}
+}
+
+// threadSafeBuffer is a tiny mutex-guarded writer used by tests that
+// capture stderr-like writes from concurrent callers without racing.
+type threadSafeBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (b *threadSafeBuffer) Write(payload []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, payload...)
+	return len(payload), nil
+}
+
+func (b *threadSafeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
+}
+
+func (b *threadSafeBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = nil
+}
+
 // recordingDialer is a fakeDialer variant that timestamps each Dial call
 // so flap-backoff tests can measure the wall-clock gap between attempts.
+//
+// onDial fires before each dial returns; afterDial fires after the
+// fakeConn is constructed. Both receive the zero-based dial index so
+// tests can advance synthetic clocks at precise points in the loop.
 type recordingDialer struct {
 	script    []dialResult
 	attempts  int32
 	dialTimes chan<- time.Time
+	onDial    func(idx int)
+	afterDial func(idx int)
 }
 
 func (rd *recordingDialer) Dial(ctx context.Context, dialURL string) (workerConn, error) {
@@ -504,12 +666,26 @@ func (rd *recordingDialer) Dial(ctx context.Context, dialURL string) (workerConn
 	case rd.dialTimes <- time.Now():
 	default:
 	}
+	if rd.onDial != nil {
+		rd.onDial(idx)
+	}
 	if idx >= len(rd.script) {
-		return &fakeConn{result: dialResult{blockUntilCancel: true}}, nil
+		conn := &fakeConn{result: dialResult{blockUntilCancel: true}}
+		if rd.afterDial != nil {
+			rd.afterDial(idx)
+		}
+		return conn, nil
 	}
 	step := rd.script[idx]
 	if step.dialErr != nil {
+		if rd.afterDial != nil {
+			rd.afterDial(idx)
+		}
 		return nil, step.dialErr
 	}
-	return &fakeConn{result: step}, nil
+	conn := &fakeConn{result: step}
+	if rd.afterDial != nil {
+		rd.afterDial(idx)
+	}
+	return conn, nil
 }

@@ -92,14 +92,18 @@ func runWorkerStart(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	runner := &worker.Runner{
-		WorkerName: workerCfg.Name,
-		WorkerID:   workerCfg.WorkerID,
-		Subdomain:  subdomain,
-		ServerURL:  cfg.ServerURL,
-		Logger:     logger,
-		Dialer:     worker.NewRealDialer(cfg.AuthToken),
-	}
+	runner := worker.NewRunner(
+		worker.RunnerIdentity{
+			WorkerName: workerCfg.Name,
+			WorkerID:   workerCfg.WorkerID,
+			Subdomain:  subdomain,
+			ServerURL:  cfg.ServerURL,
+		},
+		worker.RunnerDeps{
+			Logger: logger,
+			Dialer: worker.NewRealDialer(cfg.AuthToken),
+		},
+	)
 
 	logger.Info("worker starting",
 		"worker", workerCfg.Name,

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -93,14 +94,11 @@ type Dialer interface {
 // by the backoff schedule.
 const stableConnDuration = 30 * time.Second
 
-// Runner owns the connect-reconnect loop for a single worker. Construct one
-// per `worker start` invocation; Run blocks until ctx is done or a terminal
-// close code arrives.
-//
-// Auth token is intentionally NOT a field: it lives in the Dialer (see
-// NewRealDialer) so there's a single source of truth and we don't risk
-// passing a stale value via two paths.
-type Runner struct {
+// RunnerIdentity carries the immutable per-worker identity fields. Split
+// from RunnerDeps so it's obvious which inputs the operator supplies (a
+// worker has a name, an id, a subdomain) versus which are wiring (logger,
+// dialer, clock).
+type RunnerIdentity struct {
 	WorkerName string
 	WorkerID   string
 	// Subdomain is the derived host-router subdomain (`<name>` for personal,
@@ -108,23 +106,126 @@ type Runner struct {
 	// runner does not need to know context-parsing rules.
 	Subdomain string
 	ServerURL string
-	Logger    *slog.Logger
-	Dialer    Dialer
+}
 
-	// backoff is the wait-between-attempts function. Nil means use the
-	// package-level Backoff (jittered exponential, capped at 60s). Tests
-	// override to a near-zero constant.
+// RunnerDeps groups the runtime collaborators the runner needs. Both fields
+// are required; NewRunner panics if either is nil so misuse is caught at
+// construction rather than producing a confusing nil-deref later.
+type RunnerDeps struct {
+	Logger *slog.Logger
+	Dialer Dialer
+}
+
+// RunnerOption configures optional behavior on a Runner. Used with NewRunner
+// for test knobs (deterministic backoff, fake clock, short stable-conn
+// threshold). Production code never needs these — the defaults are correct.
+type RunnerOption func(*Runner)
+
+// WithBackoff overrides the wait-between-attempts function. Tests pass a
+// near-zero constant so reconnect tests run in milliseconds.
+func WithBackoff(fn func(attempt int) time.Duration) RunnerOption {
+	return func(r *Runner) { r.backoff = fn }
+}
+
+// WithClock overrides the wall-clock used for measuring connection lifetime
+// (flap detection). Tests inject a synthetic clock to drive the stable-conn
+// threshold without waiting 30s of wall time.
+func WithClock(now func() time.Time) RunnerOption {
+	return func(r *Runner) { r.now = now }
+}
+
+// WithStableConnDuration overrides how long a connection must survive before
+// its disconnect resets the flap counter. Tests set a small value to
+// exercise reset behavior without long waits.
+func WithStableConnDuration(duration time.Duration) RunnerOption {
+	return func(r *Runner) { r.stableConnDuration = duration }
+}
+
+// Runner owns the connect-reconnect loop for a single worker. Construct via
+// NewRunner; the zero value is not usable. Run blocks until ctx is done or
+// a terminal close code arrives.
+//
+// Auth token is intentionally NOT a field: it lives in the Dialer (see
+// NewRealDialer) so there's a single source of truth and we don't risk
+// passing a stale value via two paths.
+//
+// Concurrency: a single Runner is owned by exactly one Run call. The
+// per-runner *rand.Rand is NOT safe for concurrent use and the backoff
+// function reads it without locking.
+type Runner struct {
+	// Identity / deps — populated by NewRunner from RunnerIdentity / RunnerDeps.
+	WorkerName string
+	WorkerID   string
+	Subdomain  string
+	ServerURL  string
+	Logger     *slog.Logger
+	Dialer     Dialer
+
+	// backoff is the wait-between-attempts function. Defaults to a
+	// closure over `rng` that calls backoffWithRand. Tests override via
+	// WithBackoff for determinism.
 	backoff func(attempt int) time.Duration
 
 	// now is the clock for measuring connection lifetime to detect flaps.
-	// Nil means time.Now. Tests inject a fake clock to drive the
-	// stable-connection threshold deterministically.
+	// Defaults to time.Now. Tests inject a fake clock via WithClock.
 	now func() time.Time
 
-	// stableConnDuration overrides the package-level constant. Zero means
-	// use the default. Tests set a small value (or zero-equivalent) to
-	// exercise reset behavior without waiting 30s of wall time.
+	// stableConnDuration overrides the package-level constant. Defaults
+	// to stableConnDuration. Tests shrink this via WithStableConnDuration
+	// to exercise reset behavior without waiting wall-clock seconds.
 	stableConnDuration time.Duration
+
+	// rng is the per-runner random source for backoff jitter. NOT safe
+	// for concurrent use — see Concurrency note above. We deliberately
+	// avoid the math/rand global to keep test runs deterministic when
+	// tests seed their own runners.
+	rng *rand.Rand
+}
+
+// NewRunner constructs a Runner with all defaults wired. Identity must be
+// fully populated; deps must have a non-nil Logger and Dialer. Options apply
+// after defaults so a test can override (e.g.) backoff without losing the
+// real clock.
+func NewRunner(identity RunnerIdentity, deps RunnerDeps, options ...RunnerOption) *Runner {
+	if deps.Logger == nil {
+		panic("worker.NewRunner: deps.Logger is required")
+	}
+	if deps.Dialer == nil {
+		panic("worker.NewRunner: deps.Dialer is required")
+	}
+	runner := &Runner{
+		WorkerName:         identity.WorkerName,
+		WorkerID:           identity.WorkerID,
+		Subdomain:          identity.Subdomain,
+		ServerURL:          identity.ServerURL,
+		Logger:             deps.Logger,
+		Dialer:             deps.Dialer,
+		now:                time.Now,
+		stableConnDuration: stableConnDuration,
+		// Seed from current time + worker id hash so concurrent runners
+		// (different workers in the same CLI process — uncommon today,
+		// possible later) do not produce identical jitter sequences.
+		rng: rand.New(rand.NewSource(time.Now().UnixNano() ^ stringHash(identity.WorkerID))),
+	}
+	runner.backoff = func(attempt int) time.Duration {
+		return backoffWithRand(attempt, runner.rng)
+	}
+	for _, opt := range options {
+		opt(runner)
+	}
+	return runner
+}
+
+// stringHash is a tiny, dependency-free non-cryptographic hash used only as
+// a per-worker seed offset for the rng. Quality is irrelevant; we just want
+// distinct seeds for distinct workers.
+func stringHash(input string) int64 {
+	var hash int64 = 1469598103934665603 // FNV offset basis
+	for index := 0; index < len(input); index++ {
+		hash ^= int64(input[index])
+		hash *= 1099511628211 // FNV prime
+	}
+	return hash
 }
 
 // Run drives the connect-read-reconnect loop. It returns:
@@ -135,24 +236,32 @@ type Runner struct {
 // reconnection with no upper bound on attempts — the only way out is
 // context cancellation or a terminal close.
 func (r *Runner) Run(ctx context.Context) error {
+	// NewRunner is the supported construction path and pre-validates
+	// deps; this guard exists for the legacy struct-literal callers in
+	// tests that construct a Runner without Dialer wired.
 	if r.Dialer == nil {
 		return errors.New("worker: runner missing Dialer")
 	}
 	if r.Logger == nil {
 		r.Logger = slog.Default()
 	}
+	if r.now == nil {
+		r.now = time.Now
+	}
+	if r.stableConnDuration == 0 {
+		r.stableConnDuration = stableConnDuration
+	}
+	if r.rng == nil {
+		r.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+	if r.backoff == nil {
+		r.backoff = func(attempt int) time.Duration {
+			return backoffWithRand(attempt, r.rng)
+		}
+	}
 	backoffFunc := r.backoff
-	if backoffFunc == nil {
-		backoffFunc = Backoff
-	}
 	clock := r.now
-	if clock == nil {
-		clock = time.Now
-	}
 	stableThreshold := r.stableConnDuration
-	if stableThreshold == 0 {
-		stableThreshold = stableConnDuration
-	}
 
 	dialURL, err := BuildDialURL(r.ServerURL, r.WorkerID, r.WorkerName, r.Subdomain)
 	if err != nil {
@@ -246,12 +355,23 @@ func (r *Runner) Run(ctx context.Context) error {
 			return &TerminalError{Code: closeCode, Reason: reason}
 		}
 
-		// Flap detection: only reset the disconnect counter if the
-		// connection survived stableThreshold. Otherwise this is part of
-		// a flap cycle — increment so the backoff escalates and we stop
-		// hammering the server.
+		// Flap detection: a connection that survived stableThreshold is
+		// considered "stable" — its disconnect should NOT pay a backoff
+		// penalty, because the server proved it can accept us. Reconnect
+		// immediately. Anything shorter (a flap) increments the
+		// disconnect counter so backoff escalates and we stop hammering
+		// the server.
+		//
+		// B1: previous code reset disconnectAttempt to 0 then immediately
+		// incremented, paying Backoff(1) ≈ 1s after every stable
+		// disconnect. The fix special-cases stable disconnects to skip
+		// backoff entirely; flapping disconnects still escalate.
 		if clock().Sub(attachedAt) >= stableThreshold {
 			disconnectAttempt = 0
+			r.Logger.Info("worker reconnecting after stable disconnect (no backoff)",
+				"worker", r.WorkerName,
+			)
+			continue
 		}
 		disconnectAttempt++
 		wait := backoffFunc(disconnectAttempt)
@@ -282,12 +402,35 @@ func sleepCtx(ctx context.Context, duration time.Duration) error {
 	}
 }
 
+// backoffMu guards the package-level rng used by the convenience Backoff
+// function. Production runners use a per-runner *rand.Rand (see
+// backoffWithRand) and never touch this mutex; only direct callers of
+// Backoff (tests, ad-hoc code) pay the lock cost.
+var (
+	backoffMu  sync.Mutex
+	backoffRng = rand.New(rand.NewSource(time.Now().UnixNano()))
+)
+
 // Backoff computes the wait before the Nth reconnect attempt. The schedule
 // is base*2^(attempt-1) with a hard cap at 60s, then ±25% uniform jitter
 // to spread thundering-herd reconnects across many workers.
 //
-// Pure function — safe to call from tests with no setup.
+// B5: the 60s cap is enforced AFTER jitter so the actual wait NEVER exceeds
+// 60s even when jitter rounds up.
+//
+// Convenience wrapper around backoffWithRand. Production runners pass a
+// per-runner rng (see NewRunner) to avoid the global-mutex cost; this
+// variant exists for direct test calls and external one-off uses.
 func Backoff(attempt int) time.Duration {
+	backoffMu.Lock()
+	defer backoffMu.Unlock()
+	return backoffWithRand(attempt, backoffRng)
+}
+
+// backoffWithRand is the pure (modulo rng) backoff implementation. Cap is
+// applied AFTER jitter so the returned duration is bounded by maxDelay
+// regardless of jitter direction.
+func backoffWithRand(attempt int, rng *rand.Rand) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
@@ -307,9 +450,17 @@ func Backoff(attempt int) time.Duration {
 	}
 	// Uniform jitter in [-25%, +25%]. math/rand is fine here — this is a
 	// reconnect spreader, not a security primitive.
-	jitterFraction := (rand.Float64() - 0.5) * 0.5 // [-0.25, +0.25]
-	jittered := float64(wait) * (1.0 + jitterFraction)
-	return time.Duration(jittered)
+	jitterFraction := (rng.Float64() - 0.5) * 0.5 // [-0.25, +0.25]
+	jittered := time.Duration(float64(wait) * (1.0 + jitterFraction))
+	// Clamp AFTER jitter so the upper bound is honored even when jitter
+	// pushes a 60s wait toward 75s.
+	if jittered > maxDelay {
+		jittered = maxDelay
+	}
+	if jittered < 0 {
+		jittered = 0
+	}
+	return jittered
 }
 
 // DeriveSubdomain returns the host-router subdomain for the given worker
@@ -345,6 +496,12 @@ func DeriveSubdomain(workerName, contextName string) (string, error) {
 // BuildDialURL composes the worker WebSocket handshake URL. The auth token
 // is intentionally NOT included — it goes in an Authorization header so it
 // doesn't leak into proxy logs.
+//
+// B4: when the resolved scheme is plaintext ws://, prints a one-line
+// warning to plaintextWarnOut so an operator who pinned a cleartext server
+// URL realizes the Bearer token is going over the wire unencrypted. The
+// dial still proceeds (a CI lab on a private network is a legitimate use
+// case); we only warn.
 func BuildDialURL(serverURL, workerID, workerName, subdomain string) (string, error) {
 	parsed, err := url.Parse(serverURL)
 	if err != nil {
@@ -353,6 +510,10 @@ func BuildDialURL(serverURL, workerID, workerName, subdomain string) (string, er
 	if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
 		return "", fmt.Errorf("worker: server URL must be ws:// or wss://, got %q", parsed.Scheme)
 	}
+	if parsed.Scheme == "ws" {
+		fmt.Fprintln(plaintextWarnOut,
+			"warning: using plaintext ws:// for worker connection — Bearer token will be sent unencrypted")
+	}
 	query := parsed.Query()
 	query.Set("worker_id", workerID)
 	query.Set("worker_name", workerName)
@@ -360,6 +521,11 @@ func BuildDialURL(serverURL, workerID, workerName, subdomain string) (string, er
 	parsed.RawQuery = query.Encode()
 	return parsed.String(), nil
 }
+
+// plaintextWarnOut is the destination for the BuildDialURL ws:// warning.
+// Defaults to os.Stderr so production operators see it; tests swap it
+// (via assignment in the test file) to capture and assert on the text.
+var plaintextWarnOut io.Writer = os.Stderr
 
 // LogFilePath returns the path to ~/.justtunnel/logs/worker-<name>.log,
 // creating the parent directory with 0700 if missing. The name is validated
