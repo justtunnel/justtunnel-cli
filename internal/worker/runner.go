@@ -519,7 +519,15 @@ func BuildDialURL(serverURL, workerID, workerName, subdomain string) (string, er
 	query := parsed.Query()
 	query.Set("worker_id", workerID)
 	query.Set("worker_name", workerName)
-	query.Set("subdomain", subdomain)
+	// NOTE: do NOT send `subdomain=` for the worker handshake. The server's
+	// WS handler runs `subdomain.Validate` (regex `^[a-z0-9][a-z0-9-]{1,28}[a-z0-9]$`,
+	// 3-30 chars) on any non-empty subdomain query param BEFORE the worker
+	// attach branch. The CLI's locally-derived `<name>--<team-id>` would fail
+	// that validator whenever the team identifier is a ULID (uppercase) or
+	// when the combined length exceeds 30. Worker subdomain is server-side
+	// state on the Worker record (assigned at POST /api/teams/{id}/workers),
+	// so the handshake doesn't need to repeat it. See justtunnel-cli#43.
+	_ = subdomain
 	parsed.RawQuery = query.Encode()
 	return parsed.String(), nil
 }

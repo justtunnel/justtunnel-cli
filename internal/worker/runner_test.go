@@ -290,7 +290,8 @@ func TestBuildDialURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildDialURL returned error: %v", err)
 	}
-	want := "wss://api.example.com/ws?subdomain=build--acme&worker_id=wkr_123&worker_name=build"
+	// subdomain is intentionally NOT in the URL — see BuildDialURL godoc and #43.
+	want := "wss://api.example.com/ws?worker_id=wkr_123&worker_name=build"
 	if got != want {
 		t.Fatalf("BuildDialURL = %q; want %q", got, want)
 	}
