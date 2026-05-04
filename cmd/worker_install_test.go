@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 type fakeServiceInstaller struct {
 	bootstrapCalls   int32
 	unbootstrapCalls int32
+	mu               sync.Mutex
 	gotName          string
 	gotUnbootName    string
 	gotNoLinger      bool
@@ -34,15 +36,36 @@ type fakeServiceInstaller struct {
 
 func (f *fakeServiceInstaller) Bootstrap(_ context.Context, name string, opts installer.SystemdOptions) (installer.SystemdResult, error) {
 	atomic.AddInt32(&f.bootstrapCalls, 1)
+	f.mu.Lock()
 	f.gotName = name
 	f.gotNoLinger = opts.NoLinger
+	f.mu.Unlock()
 	return f.result, f.err
 }
 
 func (f *fakeServiceInstaller) Unbootstrap(_ context.Context, name string) error {
 	atomic.AddInt32(&f.unbootstrapCalls, 1)
+	f.mu.Lock()
 	f.gotUnbootName = name
+	f.mu.Unlock()
 	return f.unbootstrapErr
+}
+
+// readGotUnbootName returns the last name passed to Unbootstrap with
+// proper synchronization so the race detector stays clean when tests
+// assert on it after concurrent access.
+func (f *fakeServiceInstaller) readGotUnbootName() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gotUnbootName
+}
+
+// readGotName returns the last name passed to Bootstrap with proper
+// synchronization (parallel to readGotUnbootName).
+func (f *fakeServiceInstaller) readGotName() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gotName
 }
 
 // withFakeInstaller swaps the package-level newServiceInstaller factory for
@@ -112,8 +135,8 @@ func TestWorkerInstallCleanInstall(t *testing.T) {
 	if atomic.LoadInt32(&fake.bootstrapCalls) != 1 {
 		t.Errorf("Bootstrap calls: got %d, want 1", fake.bootstrapCalls)
 	}
-	if fake.gotName != "alpha" {
-		t.Errorf("Bootstrap name: got %q, want alpha", fake.gotName)
+	if got := fake.readGotName(); got != "alpha" {
+		t.Errorf("Bootstrap name: got %q, want alpha", got)
 	}
 	loaded, readErr := worker.Read("alpha")
 	if readErr != nil {

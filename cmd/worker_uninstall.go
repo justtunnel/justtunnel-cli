@@ -78,8 +78,8 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 		// so we substitute a tailored error rather than passing the
 		// install message through.
 		return display.InputError(fmt.Sprintf(
-			"worker uninstall is not supported on %s; remove the local config manually with `justtunnel worker rm %s`",
-			runtime.GOOS, name,
+			"worker uninstall is not supported on %s; remove the local config with `justtunnel worker rm %s` (and `justtunnel worker rm %s --delete-on-server` to also remove the server record)",
+			runtime.GOOS, name, name,
 		))
 	}
 
@@ -102,66 +102,93 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 	// Track per-step errors so --force can summarize at the end.
 	var stepErrors []error
 
-	// Track whether anything actually changed so we can render the
-	// "already uninstalled" message when re-running on a clean state.
+	// `changed` is true if any step (service uninstall, local delete,
+	// server delete) actually mutated state. We use this to render
+	// "already uninstalled" when re-running on a clean state. Note:
+	// service Unbootstrap is idempotent and reports neither "removed"
+	// nor "was already gone", so it does not flip `changed` on its own;
+	// the local Read+Delete and the server-side delete are the
+	// authoritative mutation signals.
 	changed := false
 
-	// Step 1: Service teardown. Idempotent in both per-OS impls (a
-	// missing service is a successful no-op).
-	unbootErr := svc.Unbootstrap(cmd.Context(), name)
-	if unbootErr != nil {
-		stepErr := &uninstallStepError{step: "service teardown", err: unbootErr}
-		if !workerUninstallForce {
-			return stepErr
+	// Branch on --delete-on-server: when set (and NOT --force), we run
+	// the server-side preflight + DELETE FIRST so a 403 (or other
+	// server-side failure) aborts BEFORE we touch local state. This
+	// preserves the operator's pointer to the worker so they can re-run
+	// with a permitted account. With --force we keep best-effort
+	// behavior — every step runs and errors are collected for a stderr
+	// summary. Without --delete-on-server we run service teardown +
+	// local delete only (server is not in play).
+	if workerUninstallDeleteOnServer && !workerUninstallForce {
+		// Server FIRST so a 403 leaves local state intact.
+		if serverErr := uninstallServerSide(baseURL, authToken, teamID, name, cmd.ErrOrStderr()); serverErr != nil {
+			return &uninstallStepError{step: "server-side delete", err: serverErr}
 		}
-		stepErrors = append(stepErrors, stepErr)
-	}
-	// We can't distinguish "removed" from "was already gone" at the
-	// installer layer (Unbootstrap is idempotent and reports neither),
-	// so we let the on-disk config Read below be the authoritative
-	// "anything to do?" signal.
+		// Server delete (or already-absent) succeeded; mark changed so
+		// "deleted server-side, local was already gone" still reports
+		// success rather than "already uninstalled".
+		changed = true
 
-	// Step 2: Local config removal. Idempotent — Read first so we can
-	// honestly report "nothing to do" when there was nothing to delete.
-	if _, readErr := worker.Read(name); readErr == nil {
-		if delErr := worker.Delete(name); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
-			stepErr := &uninstallStepError{step: "local config removal", err: delErr}
-			if !workerUninstallForce {
-				return stepErr
+		// Now safe to tear down local state.
+		if unbootErr := svc.Unbootstrap(cmd.Context(), name); unbootErr != nil {
+			return &uninstallStepError{
+				step: "service teardown",
+				err:  fmt.Errorf("stop supervisor: %w (retry with --force to continue and clean up local state)", unbootErr),
 			}
-			stepErrors = append(stepErrors, stepErr)
-		} else {
+		}
+		if localChanged, localErr := removeLocalConfig(name); localErr != nil {
+			return &uninstallStepError{step: "local config removal", err: localErr}
+		} else if localChanged {
 			changed = true
 		}
-	} else if !errors.Is(readErr, os.ErrNotExist) {
-		// Read failed with something other than "not found" (e.g.
-		// permission denied, malformed JSON). Try to delete anyway —
-		// the operator's intent is to clean up — and surface the read
-		// error only if delete also fails.
-		if delErr := worker.Delete(name); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
-			stepErr := &uninstallStepError{step: "local config removal", err: fmt.Errorf("read=%v delete=%w", readErr, delErr)}
-			if !workerUninstallForce {
-				return stepErr
-			}
-			stepErrors = append(stepErrors, stepErr)
-		} else {
-			changed = true
-		}
-	}
+	} else {
+		// Two cases land here:
+		//   1. --delete-on-server NOT set → local-only path.
+		//   2. --delete-on-server set AND --force → best-effort: run
+		//      every step, collect errors, exit 0.
+		// In both cases we run service teardown → local delete in
+		// order. Under --force the server step (if requested) runs
+		// last so a server failure can be reported alongside the
+		// local-cleanup outcome.
 
-	// Step 3 (optional): server-side delete.
-	if workerUninstallDeleteOnServer {
-		if deleteErr := uninstallServerSide(baseURL, authToken, teamID, name, cmd.OutOrStdout()); deleteErr != nil {
-			stepErr := &uninstallStepError{step: "server-side delete", err: deleteErr}
+		// Step 1: Service teardown. Idempotent in both per-OS impls (a
+		// missing service is a successful no-op).
+		if unbootErr := svc.Unbootstrap(cmd.Context(), name); unbootErr != nil {
+			stepErr := &uninstallStepError{
+				step: "service teardown",
+				err:  fmt.Errorf("stop supervisor: %w (retry with --force to continue and clean up local state)", unbootErr),
+			}
 			if !workerUninstallForce {
 				return stepErr
 			}
 			stepErrors = append(stepErrors, stepErr)
-		} else {
-			// We deliberately do NOT flip `changed` here on its own;
-			// "deleted server-side but local was already gone" is
-			// still a meaningful change, so consider it a change.
+		}
+
+		// Step 2: Local config removal. Idempotent — Read first so we
+		// can honestly report "nothing to do" when there was nothing
+		// to delete.
+		if localChanged, localErr := removeLocalConfig(name); localErr != nil {
+			stepErr := &uninstallStepError{step: "local config removal", err: localErr}
+			if !workerUninstallForce {
+				return stepErr
+			}
+			stepErrors = append(stepErrors, stepErr)
+		} else if localChanged {
 			changed = true
+		}
+
+		// Step 3 (optional, --force only here since the no-force
+		// server path is handled in the branch above): server-side
+		// delete.
+		if workerUninstallDeleteOnServer {
+			if deleteErr := uninstallServerSide(baseURL, authToken, teamID, name, cmd.ErrOrStderr()); deleteErr != nil {
+				stepErr := &uninstallStepError{step: "server-side delete", err: deleteErr}
+				// We only reach this branch under --force, so collect
+				// rather than return.
+				stepErrors = append(stepErrors, stepErr)
+			} else {
+				changed = true
+			}
 		}
 	}
 
@@ -189,12 +216,37 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// removeLocalConfig encapsulates the Read-then-Delete dance so both
+// branches of runWorkerUninstall can share the same idempotent
+// semantics. Returns (changed=true, nil) if it actually deleted
+// something, (changed=false, nil) if there was nothing to delete, or
+// (false, err) on failure.
+func removeLocalConfig(name string) (bool, error) {
+	if _, readErr := worker.Read(name); readErr == nil {
+		if delErr := worker.Delete(name); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			return false, delErr
+		}
+		return true, nil
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		// Read failed with something other than "not found" (e.g.
+		// permission denied, malformed JSON). Try to delete anyway —
+		// the operator's intent is to clean up — and surface the read
+		// error only if delete also fails.
+		if delErr := worker.Delete(name); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			return false, fmt.Errorf("read=%v delete=%w", readErr, delErr)
+		}
+		return true, nil
+	}
+	// Read returned os.ErrNotExist → nothing to do.
+	return false, nil
+}
+
 // uninstallServerSide mirrors the Mode-2 logic from worker_rm.go: GET the
 // list, find by NAME (not by potentially-stale local ID), and DELETE by
 // the server's authoritative ID. A 404 from DELETE — or a name that's
-// already absent from the list — is treated as already-deleted and
-// returns nil.
-func uninstallServerSide(baseURL, authToken, teamID, name string, _ io.Writer) error {
+// already absent from the list — is treated as already-deleted; in the
+// 404 case we log to stderr so the operator knows what happened.
+func uninstallServerSide(baseURL, authToken, teamID, name string, warnOut io.Writer) error {
 	workers, err := fetchWorkers(baseURL, authToken, teamID)
 	if err != nil {
 		return err
@@ -210,8 +262,17 @@ func uninstallServerSide(baseURL, authToken, teamID, name string, _ io.Writer) e
 		// Server does not know about this worker; treat as already-deleted.
 		return nil
 	}
-	if _, err := deleteWorker(baseURL, authToken, teamID, workerID); err != nil {
+	if warnOut != nil {
+		fmt.Fprintf(warnOut, "deleting server-side worker %q (id %s)\n", name, workerID)
+	}
+	notFound, err := deleteWorker(baseURL, authToken, teamID, workerID)
+	if err != nil {
 		return err
+	}
+	if notFound && warnOut != nil {
+		// Race: GET saw the worker, DELETE returned 404. Surface it so
+		// the operator understands why local cleanup proceeded.
+		fmt.Fprintf(warnOut, "worker %q already deleted server-side; cleaning up locally\n", name)
 	}
 	return nil
 }
@@ -221,6 +282,12 @@ func uninstallServerSide(baseURL, authToken, teamID, name string, _ io.Writer) e
 // "still running" state) are informational only — see the plan note
 // about supervisor teardown timing.
 func probePostUninstall(ctx context.Context, name string, errOut io.Writer) {
+	// If the parent context is already cancelled (e.g. clean Ctrl-C),
+	// skip the probe so we don't print a confusing "probe failed: context
+	// canceled" line after an intentional shutdown.
+	if ctx.Err() != nil {
+		return
+	}
 	supervisor := supervisorFactory()
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()

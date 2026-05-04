@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,21 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/worker"
 )
+
+// runCmdSplit executes a subcommand with separate stdout and stderr
+// buffers so tests can assert on which stream a message landed on.
+// The default runCmd helper merges both streams into one buffer.
+func runCmdSplit(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	stdoutBuf := &bytes.Buffer{}
+	stderrBuf := &bytes.Buffer{}
+	rootCmd.SetOut(stdoutBuf)
+	rootCmd.SetErr(stderrBuf)
+	rootCmd.SetArgs(args)
+	err = rootCmd.Execute()
+	rootCmd.SetArgs(nil)
+	return stdoutBuf.String(), stderrBuf.String(), err
+}
 
 // teamCfgWithToken is a thin re-shape of teamCfg so uninstall tests can
 // share the same auth-token + team-context defaults the install/rm tests
@@ -57,8 +73,8 @@ func TestWorkerUninstallDefaultLocalOnly(t *testing.T) {
 	if got := atomic.LoadInt32(&fake.unbootstrapCalls); got != 1 {
 		t.Errorf("Unbootstrap calls: got %d, want 1", got)
 	}
-	if fake.gotUnbootName != "alpha" {
-		t.Errorf("Unbootstrap name: got %q, want alpha", fake.gotUnbootName)
+	if got := fake.readGotUnbootName(); got != "alpha" {
+		t.Errorf("Unbootstrap name: got %q, want alpha", got)
 	}
 	if got := atomic.LoadInt32(&httpCalls); got != 0 {
 		t.Errorf("HTTP must NOT be called without --delete-on-server, got %d", got)
@@ -203,9 +219,9 @@ func TestWorkerUninstallDeleteOnServer404ProceedsLocally(t *testing.T) {
 }
 
 // TestWorkerUninstallDeleteOnServer403LeavesLocal: a 403 from the
-// server-side DELETE must abort the command and leave local config in
-// place (mirrors worker_rm.go's behavior — operator can re-run with a
-// permitted account).
+// server-side DELETE must abort the command BEFORE any local mutation,
+// so operators can retry with a permitted account without having lost
+// the local pointer to the worker.
 func TestWorkerUninstallDeleteOnServer403LeavesLocal(t *testing.T) {
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method == http.MethodGet {
@@ -235,13 +251,68 @@ func TestWorkerUninstallDeleteOnServer403LeavesLocal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on 403 without --force")
 	}
-	// Steps 1+2 ran before the failed step 3, so local config IS gone
-	// here (this matches the "best-effort" intent: stop the service and
-	// reclaim the slot locally even when the server refuses the cleanup).
-	// What we lock in is that the COMMAND fails so the operator notices.
 	if !strings.Contains(strings.ToLower(err.Error()), "server-side") &&
 		!strings.Contains(err.Error(), "403") {
 		t.Errorf("expected error to surface server-side failure, got: %v", err)
+	}
+	// Local config MUST remain so the operator can re-run with a
+	// permitted account.
+	if _, readErr := worker.Read("alpha"); readErr != nil {
+		t.Errorf("local config must remain after 403, got err=%v", readErr)
+	}
+	// Service teardown must NOT have run either — server delete is
+	// the gate for any local mutation under --delete-on-server.
+	if got := atomic.LoadInt32(&fake.unbootstrapCalls); got != 0 {
+		t.Errorf("Unbootstrap must NOT run before successful server delete, got %d calls", got)
+	}
+}
+
+// TestWorkerUninstallDeleteOnServer404OnDelete: when GET returns the
+// worker but DELETE races with another deletion and returns 404, the
+// command must treat it as already-deleted and proceed with local
+// cleanup (exit 0).
+func TestWorkerUninstallDeleteOnServer404OnDelete(t *testing.T) {
+	var deleteCount int32
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[{"id":"wkr_1","name":"alpha","team_id":"team-acme"}]}`))
+		case http.MethodDelete:
+			atomic.AddInt32(&deleteCount, 1)
+			writer.WriteHeader(http.StatusNotFound)
+			writer.Write([]byte(`{"error":"not found"}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, uninstallTeamCfg(stub.URL))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_1", Name: "alpha", Context: "team:team-acme",
+		Subdomain: "alpha--acme", CreatedAt: time.Now().UTC(), ServiceBackend: "launchd",
+	}); err != nil {
+		t.Fatalf("seed local: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+	useFakeSupervisor(t, newFakeSupervisor())
+
+	_, err := runCmd(t, "worker", "uninstall", "alpha", "--delete-on-server")
+	if err != nil {
+		t.Fatalf("404 on DELETE must not fail the command, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&deleteCount); got != 1 {
+		t.Errorf("DELETE should have been attempted once, got %d", got)
+	}
+	if got := atomic.LoadInt32(&fake.unbootstrapCalls); got != 1 {
+		t.Errorf("local cleanup should still run after 404, Unbootstrap calls: got %d, want 1", got)
+	}
+	if _, readErr := worker.Read("alpha"); !errors.Is(readErr, os.ErrNotExist) {
+		t.Errorf("local config should be deleted after 404 on server, got err=%v", readErr)
 	}
 }
 
@@ -267,18 +338,29 @@ func TestWorkerUninstallForceContinuesPastUnbootstrapFailure(t *testing.T) {
 	withFakeInstaller(t, fake)
 	useFakeSupervisor(t, newFakeSupervisor())
 
-	out, err := runCmd(t, "worker", "uninstall", "alpha", "--force")
+	stdout, stderr, err := runCmdSplit(t, "worker", "uninstall", "alpha", "--force")
 	if err != nil {
 		t.Fatalf("--force should not return an error, got: %v", err)
 	}
 	if _, readErr := worker.Read("alpha"); !errors.Is(readErr, os.ErrNotExist) {
 		t.Errorf("local cleanup should still run under --force, got err=%v", readErr)
 	}
-	if !strings.Contains(out, "launchctl wedged") {
-		t.Errorf("--force should surface the original error in stderr, got: %s", out)
+	// The original error and step label belong on stderr only.
+	if !strings.Contains(stderr, "launchctl wedged") {
+		t.Errorf("--force should surface the original error on stderr, got stderr: %s", stderr)
 	}
-	if !strings.Contains(out, "service teardown") {
-		t.Errorf("--force summary should label the failing step, got: %s", out)
+	if !strings.Contains(stderr, "service teardown") {
+		t.Errorf("--force summary should label the failing step on stderr, got stderr: %s", stderr)
+	}
+	if strings.Contains(stdout, "launchctl wedged") || strings.Contains(stdout, "service teardown") {
+		t.Errorf("error summary must NOT leak onto stdout, got stdout: %s", stdout)
+	}
+	// The success line belongs on stdout only.
+	if !strings.Contains(stdout, "Uninstalled") {
+		t.Errorf("success line should appear on stdout, got stdout: %s", stdout)
+	}
+	if strings.Contains(stderr, "Uninstalled") {
+		t.Errorf("success line must NOT leak onto stderr, got stderr: %s", stderr)
 	}
 }
 
