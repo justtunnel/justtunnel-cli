@@ -25,10 +25,13 @@ import (
 // an installer in hand. The launchd adapter ignores the linger fields in
 // opts and returns a zero SystemdResult — they are systemd-only concerns.
 //
-// Issue #37 (uninstall) should mirror this exact signature for a parallel
-// Unbootstrap method so cmd/worker_uninstall.go can reuse the dispatcher.
+// Unbootstrap is the inverse used by `worker uninstall` (#37): stop the
+// service and remove the on-disk service definition. Both per-OS impls
+// treat a missing service as a successful no-op so callers can run
+// uninstall unconditionally during teardown.
 type serviceInstaller interface {
 	Bootstrap(ctx context.Context, name string, opts installer.SystemdOptions) (installer.SystemdResult, error)
+	Unbootstrap(ctx context.Context, name string) error
 }
 
 // newServiceInstaller is the per-OS factory for serviceInstaller. It is a
@@ -51,6 +54,10 @@ func (adapter *launchdAdapter) Bootstrap(ctx context.Context, name string, _ ins
 	return installer.SystemdResult{}, nil
 }
 
+func (adapter *launchdAdapter) Unbootstrap(ctx context.Context, name string) error {
+	return adapter.inner.Unbootstrap(ctx, name)
+}
+
 // systemdAdapter wraps installer.SystemdInstaller so its existing signature
 // already matches serviceInstaller; the wrapper exists only for symmetry
 // with launchdAdapter and to keep the factory's switch tidy.
@@ -60,6 +67,10 @@ type systemdAdapter struct {
 
 func (adapter *systemdAdapter) Bootstrap(ctx context.Context, name string, opts installer.SystemdOptions) (installer.SystemdResult, error) {
 	return adapter.inner.Bootstrap(ctx, name, opts)
+}
+
+func (adapter *systemdAdapter) Unbootstrap(ctx context.Context, name string) error {
+	return adapter.inner.Unbootstrap(ctx, name)
 }
 
 // defaultNewServiceInstaller dispatches by GOOS. windows (and any other

@@ -29,6 +29,8 @@ import (
 //   - workerRmDeleteOnServer (worker_rm.go)
 //   - workerInstallNoLinger  (worker_install.go)
 //   - workerInstallNonInteractive (worker_install.go)
+//   - workerUninstallDeleteOnServer (worker_uninstall.go)
+//   - workerUninstallForce (worker_uninstall.go)
 func resetWorkerState(t *testing.T, cfg *config.Config) string {
 	t.Helper()
 	path := resetContextState(t, cfg)
@@ -37,10 +39,14 @@ func resetWorkerState(t *testing.T, cfg *config.Config) string {
 	workerRmDeleteOnServer = false
 	workerInstallNoLinger = false
 	workerInstallNonInteractive = false
+	workerUninstallDeleteOnServer = false
+	workerUninstallForce = false
 	t.Cleanup(func() {
 		workerRmDeleteOnServer = false
 		workerInstallNoLinger = false
 		workerInstallNonInteractive = false
+		workerUninstallDeleteOnServer = false
+		workerUninstallForce = false
 	})
 	return path
 }

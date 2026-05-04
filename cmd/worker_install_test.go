@@ -22,11 +22,14 @@ import (
 // touching launchctl/systemctl. The serviceInstaller seam in
 // worker_install.go is what we mock here.
 type fakeServiceInstaller struct {
-	bootstrapCalls int32
-	gotName        string
-	gotNoLinger    bool
-	err            error
-	result         installer.SystemdResult
+	bootstrapCalls   int32
+	unbootstrapCalls int32
+	gotName          string
+	gotUnbootName    string
+	gotNoLinger      bool
+	err              error
+	unbootstrapErr   error
+	result           installer.SystemdResult
 }
 
 func (f *fakeServiceInstaller) Bootstrap(_ context.Context, name string, opts installer.SystemdOptions) (installer.SystemdResult, error) {
@@ -34,6 +37,12 @@ func (f *fakeServiceInstaller) Bootstrap(_ context.Context, name string, opts in
 	f.gotName = name
 	f.gotNoLinger = opts.NoLinger
 	return f.result, f.err
+}
+
+func (f *fakeServiceInstaller) Unbootstrap(_ context.Context, name string) error {
+	atomic.AddInt32(&f.unbootstrapCalls, 1)
+	f.gotUnbootName = name
+	return f.unbootstrapErr
 }
 
 // withFakeInstaller swaps the package-level newServiceInstaller factory for
