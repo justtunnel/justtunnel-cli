@@ -129,7 +129,7 @@ func httpDo(ctx context.Context, method, url, authToken string, body io.Reader) 
 		return 0, nil, fmt.Errorf("build request: %w", err)
 	}
 	req = req.WithContext(ctx)
-	req.Header.Set("Authorization", "Bearer "+authToken)
+	req.Header.Set("Authorization", config.AuthHeaderPrefix+authToken)
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

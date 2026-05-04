@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"nhooyr.io/websocket"
+
+	"github.com/justtunnel/justtunnel-cli/internal/config"
 )
 
 // TerminalError is returned by Runner.Run when the server closes the
@@ -573,7 +575,7 @@ func (rd *realDialer) Dial(ctx context.Context, dialURL string) (workerConn, err
 	opts := &websocket.DialOptions{}
 	if rd.authToken != "" {
 		opts.HTTPHeader = http.Header{
-			"Authorization": []string{"Bearer " + rd.authToken},
+			"Authorization": []string{config.AuthHeaderPrefix + rd.authToken},
 		}
 	}
 	conn, httpResp, err := websocket.Dial(ctx, dialURL, opts)

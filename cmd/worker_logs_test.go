@@ -441,3 +441,47 @@ func TestWorkerLogsFollowExitsPromptlyUnderHighWriteThroughput(t *testing.T) {
 	writerWG.Wait()
 	drainWG.Wait()
 }
+
+// TestPrintTail_RingBufferReturnsLastN exercises E6: with more lines in
+// the file than the requested tail size, the printer must return exactly
+// the LAST N lines in original order (not first, not reversed). The
+// circular-index ring is correct iff this holds even when the ring
+// wrapped multiple times.
+func TestPrintTail_RingBufferReturnsLastN(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/logfile"
+	var content strings.Builder
+	for index := 1; index <= 50; index++ {
+		fmt.Fprintf(&content, "line%d\n", index)
+	}
+	if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	captured := &strings.Builder{}
+	if err := printTail(captured, path, 5); err != nil {
+		t.Fatalf("printTail: %v", err)
+	}
+	want := "line46\nline47\nline48\nline49\nline50\n"
+	if got := captured.String(); got != want {
+		t.Fatalf("printTail returned wrong lines\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestPrintTail_FewerLinesThanCapacity verifies the partially-filled
+// ring case (fewer total lines than the requested tail size). Order
+// must still be preserved.
+func TestPrintTail_FewerLinesThanCapacity(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/logfile"
+	if err := os.WriteFile(path, []byte("a\nb\nc\n"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	captured := &strings.Builder{}
+	if err := printTail(captured, path, 100); err != nil {
+		t.Fatalf("printTail: %v", err)
+	}
+	if got := captured.String(); got != "a\nb\nc\n" {
+		t.Fatalf("printTail short-file: got %q want %q", got, "a\nb\nc\n")
+	}
+}

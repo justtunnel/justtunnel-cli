@@ -22,6 +22,11 @@ const (
 	defaultTailLines        = 1000
 	followPollInterval      = 250 * time.Millisecond
 	followReadChunk         = 32 * 1024
+	// E2: hard cap on --lines so a typo (`-n 100000000`) doesn't try to
+	// preallocate gigabytes of `[][]byte` slots. 100k lines covers any
+	// realistic operator scroll-back; anything larger should use --all
+	// or stream the file directly.
+	maxTailLines = 100_000
 )
 
 var (
@@ -94,7 +99,16 @@ func runWorkerLogs(cmd *cobra.Command, args []string) error {
 				name, len(historical))
 			return nil
 		}
-		return printTail(out, activePath, workerLogsLines)
+		// E2: clamp --lines so a runaway value doesn't preallocate a
+		// huge ring buffer. Warn on stderr so the user sees it.
+		effectiveLines := workerLogsLines
+		if effectiveLines > maxTailLines {
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"warning: --lines capped at %d (requested %d)\n",
+				maxTailLines, effectiveLines)
+			effectiveLines = maxTailLines
+		}
+		return printTail(out, activePath, effectiveLines)
 	}
 }
 
@@ -129,6 +143,12 @@ func streamFile(out io.Writer, path string) error {
 
 // printTail prints the last `lines` lines of path. Uses a streaming ring
 // buffer so it works on arbitrarily large files without loading them all.
+//
+// E6: the ring is a circular index (writeIndex mod cap) so each line
+// insertion is O(1) instead of the previous O(N) copy-then-overwrite.
+// Once the buffer is full, the oldest position is overwritten in place
+// and the read order is reconstructed at flush time by walking from
+// writeIndex (the oldest) to writeIndex+cap-1 (the newest).
 func printTail(out io.Writer, path string, lines int) error {
 	if lines <= 0 {
 		return nil
@@ -142,26 +162,34 @@ func printTail(out io.Writer, path string, lines int) error {
 	}
 	defer file.Close()
 
-	ring := make([][]byte, 0, lines)
+	ring := make([][]byte, lines)
+	writeIndex := 0
+	count := 0
 	scanner := bufio.NewScanner(file)
 	// 1 MiB max line; log lines can be slog text records with stack traces.
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
 	for scanner.Scan() {
 		// scanner.Bytes() is reused on next Scan; copy before storing.
 		line := append([]byte(nil), scanner.Bytes()...)
-		if len(ring) < lines {
-			ring = append(ring, line)
-			continue
+		ring[writeIndex] = line
+		writeIndex = (writeIndex + 1) % lines
+		if count < lines {
+			count++
 		}
-		// Slide window: drop oldest, append newest. Pre-allocated cap means
-		// no reslice cost beyond the copy.
-		copy(ring, ring[1:])
-		ring[lines-1] = line
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("scan %s: %w", path, err)
 	}
-	for _, line := range ring {
+	// Determine the read start position. While the buffer is still
+	// filling (count < lines), the oldest entry is at index 0. Once
+	// it's full, the oldest is at writeIndex (the slot about to be
+	// overwritten next).
+	startIndex := 0
+	if count == lines {
+		startIndex = writeIndex
+	}
+	for offset := 0; offset < count; offset++ {
+		line := ring[(startIndex+offset)%lines]
 		if _, err := out.Write(line); err != nil {
 			return err
 		}

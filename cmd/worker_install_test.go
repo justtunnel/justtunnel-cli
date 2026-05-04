@@ -532,7 +532,8 @@ func TestWorkerInstallDarwinWarnsOnNoLingerFlags(t *testing.T) {
 // Sanity check the OS-dispatch factory at runtime for the host platform —
 // keeps the production wiring covered without exercising real launchctl.
 func TestNewServiceInstallerForCurrentOS(t *testing.T) {
-	got, err := defaultNewServiceInstaller(runtime.GOOS)
+	// E4: factory now lives in installer package (installer.New).
+	got, err := installer.New(runtime.GOOS)
 	switch runtime.GOOS {
 	case "darwin", "linux":
 		if err != nil {

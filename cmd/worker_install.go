@@ -18,77 +18,32 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/worker/installer"
 )
 
-// serviceInstaller is the abstraction over the per-OS supervisor installers
-// (launchd on darwin, systemd-user on linux). The interface intentionally
-// uses installer.SystemdOptions / installer.SystemdResult as the contract
-// even on darwin so the cmd layer doesn't have to branch on OS once it has
-// an installer in hand. The launchd adapter ignores the linger fields in
-// opts and returns a zero SystemdResult — they are systemd-only concerns.
-//
-// Unbootstrap is the inverse used by `worker uninstall` (#37): stop the
-// service and remove the on-disk service definition. Both per-OS impls
-// treat a missing service as a successful no-op so callers can run
-// uninstall unconditionally during teardown.
-type serviceInstaller interface {
-	Bootstrap(ctx context.Context, name string, opts installer.SystemdOptions) (installer.SystemdResult, error)
-	Unbootstrap(ctx context.Context, name string) error
-}
+// serviceInstaller is the cmd-layer alias for installer.ServiceInstaller.
+// E4: the interface, adapters, and factory now live in the installer
+// package (internal/worker/installer/dispatch.go); the cmd package only
+// keeps a swappable factory variable so tests can inject fakes.
+type serviceInstaller = installer.ServiceInstaller
 
-// newServiceInstaller is the per-OS factory for serviceInstaller. It is a
-// package-level variable so tests can swap in a fake without exercising the
-// real launchctl/systemctl shell-outs. Production callers leave it pointing
-// at defaultNewServiceInstaller.
-var newServiceInstaller = defaultNewServiceInstaller
-
-// launchdAdapter wraps installer.LaunchdInstaller so the launchd path
-// satisfies the serviceInstaller interface (which carries SystemdOptions /
-// SystemdResult so cmd code never branches on OS after dispatch).
-type launchdAdapter struct {
-	inner *installer.LaunchdInstaller
-}
-
-func (adapter *launchdAdapter) Bootstrap(ctx context.Context, name string, _ installer.SystemdOptions) (installer.SystemdResult, error) {
-	if err := adapter.inner.Bootstrap(ctx, name); err != nil {
-		return installer.SystemdResult{}, err
+// newServiceInstaller is the per-OS factory used by runWorkerInstall /
+// runWorkerUninstall. It is a package-level variable so tests can swap
+// in a fake without exercising the real launchctl/systemctl shell-outs.
+// Production callers leave it pointing at the installer package's New().
+var newServiceInstaller = func(goos string) (serviceInstaller, error) {
+	svc, err := installer.New(goos)
+	if err != nil {
+		// Wrap with display.InputError so cobra renders it as a user-
+		// facing input error rather than an internal failure.
+		return nil, display.InputError(err.Error())
 	}
-	return installer.SystemdResult{}, nil
+	return svc, nil
 }
 
-func (adapter *launchdAdapter) Unbootstrap(ctx context.Context, name string) error {
-	return adapter.inner.Unbootstrap(ctx, name)
-}
-
-// systemdAdapter wraps installer.SystemdInstaller so its existing signature
-// already matches serviceInstaller; the wrapper exists only for symmetry
-// with launchdAdapter and to keep the factory's switch tidy.
-type systemdAdapter struct {
-	inner *installer.SystemdInstaller
-}
-
-func (adapter *systemdAdapter) Bootstrap(ctx context.Context, name string, opts installer.SystemdOptions) (installer.SystemdResult, error) {
-	return adapter.inner.Bootstrap(ctx, name, opts)
-}
-
-func (adapter *systemdAdapter) Unbootstrap(ctx context.Context, name string) error {
-	return adapter.inner.Unbootstrap(ctx, name)
-}
-
-// defaultNewServiceInstaller dispatches by GOOS. windows (and any other
-// platform) returns the canonical "not supported" error.
-func defaultNewServiceInstaller(goos string) (serviceInstaller, error) {
-	switch goos {
-	case "darwin":
-		return &launchdAdapter{inner: installer.NewLaunchdInstaller()}, nil
-	case "linux":
-		return &systemdAdapter{inner: installer.NewSystemdInstaller()}, nil
-	default:
-		return nil, unsupportedOSError(goos)
-	}
-}
-
-// unsupportedOSError is the canonical "this platform has no supervisor
-// adapter" error. Centralized so the test suite and the production
-// dispatcher emit byte-identical messages.
+// unsupportedOSError formats the canonical "this platform has no
+// supervisor adapter" error. Used by tests that pin the install command
+// onto the unsupported-OS path independent of runtime.GOOS, and by
+// production callers via newServiceInstaller's wrap of installer.New.
+// Kept here (not in installer.New) so the message stays identical to
+// the historical text the cmd-layer tests assert on.
 func unsupportedOSError(goos string) error {
 	return display.InputError(fmt.Sprintf(
 		"worker install is not supported on %s; use `worker start <name>` to run in foreground (see docs/windows-recipe.md for Windows alternatives)",
@@ -291,6 +246,16 @@ func ensureWorkerRegistered(ctx context.Context, baseURL, authToken, teamID, ctx
 		// overwrite local. Reuse worker_create's create+rollback
 		// pattern: if local Write fails after server POST, DELETE
 		// the just-created server record.
+		//
+		// E3 / TOCTOU: there is a race window between this list and
+		// the create POST below. A concurrent install in another
+		// shell could create the same worker server-side between our
+		// list and our POST, producing a 409 conflict on POST or two
+		// server records under the same name (depending on server-
+		// side dedup). This mirrors the documented race in worker_rm.go;
+		// for v1 the typical operator pattern is single-user / single-
+		// shell, so we accept the window. Revisit if/when multi-admin
+		// concurrent install becomes a supported workflow.
 		//
 		// NOTE: we deliberately do NOT attempt to delete a stale
 		// server-side worker that may have a different ID. Without

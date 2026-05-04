@@ -146,10 +146,24 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 		//   1. --delete-on-server NOT set → local-only path.
 		//   2. --delete-on-server set AND --force → best-effort: run
 		//      every step, collect errors, exit 0.
-		// In both cases we run service teardown → local delete in
-		// order. Under --force the server step (if requested) runs
-		// last so a server failure can be reported alongside the
-		// local-cleanup outcome.
+		// E1: under --force + --delete-on-server we still attempt the
+		// server delete FIRST so the operator's local pointer is
+		// preserved on a server-side failure (e.g. 403 from a stale
+		// account). On server failure we log and continue with local
+		// cleanup — that's the documented intent of --force ("clean
+		// up local state even if remote refuses").
+
+		// Step 0 (--force + --delete-on-server only): server-side
+		// delete first. Failures are collected; processing continues.
+		if workerUninstallDeleteOnServer && workerUninstallForce {
+			if deleteErr := uninstallServerSide(cmd.Context(), baseURL, authToken, teamID, name, cmd.ErrOrStderr()); deleteErr != nil {
+				stepErrors = append(stepErrors, &uninstallStepError{
+					step: "server-side delete", err: deleteErr,
+				})
+			} else {
+				changed = true
+			}
+		}
 
 		// Step 1: Service teardown. Idempotent in both per-OS impls (a
 		// missing service is a successful no-op).
@@ -175,20 +189,6 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 			stepErrors = append(stepErrors, stepErr)
 		} else if localChanged {
 			changed = true
-		}
-
-		// Step 3 (optional, --force only here since the no-force
-		// server path is handled in the branch above): server-side
-		// delete.
-		if workerUninstallDeleteOnServer {
-			if deleteErr := uninstallServerSide(cmd.Context(), baseURL, authToken, teamID, name, cmd.ErrOrStderr()); deleteErr != nil {
-				stepErr := &uninstallStepError{step: "server-side delete", err: deleteErr}
-				// We only reach this branch under --force, so collect
-				// rather than return.
-				stepErrors = append(stepErrors, stepErr)
-			} else {
-				changed = true
-			}
 		}
 	}
 

@@ -198,7 +198,7 @@ func fetchMembershipsHTTP(client *http.Client, baseURL, authToken string) ([]mem
 	if err != nil {
 		return nil, false, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+authToken)
+	req.Header.Set("Authorization", config.AuthHeaderPrefix+authToken)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)

@@ -70,12 +70,10 @@ func (s *LinuxSupervisor) Probe(ctx context.Context, workerName string) (ProbeRe
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
-			// stderr is available on *exec.ExitError when Output() is
-			// used. We deliberately do NOT pass it to ParseIsActive —
-			// the parser only knows the canonical state vocabulary
-			// (active/inactive/failed/unknown). Stderr is preserved
-			// here for future error context if we ever surface it.
-			_ = exitErr.Stderr
+			// E8: stderr is available on *exec.ExitError when Output()
+			// is used. The parser intentionally only sees stdout (the
+			// canonical state vocabulary lives there); if we ever want
+			// to surface stderr, we'll add it at that time.
 		} else {
 			// Process couldn't be started at all (e.g. systemctl not
 			// found). Surface as a probe error rather than silently

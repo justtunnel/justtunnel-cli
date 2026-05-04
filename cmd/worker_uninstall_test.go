@@ -500,3 +500,89 @@ func TestWorkerUninstallProbeWarnsWhenStillRunning(t *testing.T) {
 		t.Errorf("expected stderr warning about residual state, got: %s", out)
 	}
 }
+
+// TestWorkerUninstallForceWith403ContinuesLocalCleanup exercises E1: under
+// --force --delete-on-server, a server 403 is logged but local cleanup
+// (service teardown + local config delete) continues. The local pointer
+// is cleaned up; the operator can still re-attempt the server delete
+// later from a permitted account.
+func TestWorkerUninstallForceWith403ContinuesLocalCleanup(t *testing.T) {
+	var deleteCalls int32
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme"}]}`))
+		case http.MethodDelete:
+			atomic.AddInt32(&deleteCalls, 1)
+			writer.WriteHeader(http.StatusForbidden)
+			writer.Write([]byte(`{"error":"insufficient permissions"}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, uninstallTeamCfg(stub.URL))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_1", Name: "alpha", Context: "team:team-acme",
+		Subdomain: "alpha--acme", CreatedAt: time.Now().UTC(), ServiceBackend: "launchd",
+	}); err != nil {
+		t.Fatalf("seed local: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+
+	supervisor := newFakeSupervisor()
+	useFakeSupervisor(t, supervisor)
+
+	stdout, stderr, err := runCmdSplit(t, "worker", "uninstall", "alpha",
+		"--delete-on-server", "--force")
+	if err != nil {
+		t.Fatalf("--force should not surface a non-zero exit on server failure: %v", err)
+	}
+	// Server-side DELETE must have been attempted FIRST.
+	if got := atomic.LoadInt32(&deleteCalls); got != 1 {
+		t.Errorf("expected exactly one DELETE attempt, got %d", got)
+	}
+	// Local state must be cleaned up despite server failure.
+	if _, readErr := worker.Read("alpha"); readErr == nil {
+		t.Errorf("--force must remove local config even on server failure")
+	}
+	// 403 surfaces in the --force step-error summary.
+	if !strings.Contains(stderr, "insufficient permissions") &&
+		!strings.Contains(stderr, "403") {
+		t.Errorf("expected 403 / permission error in stderr, got: %s", stderr)
+	}
+	if !strings.Contains(stdout, "Uninstalled worker") {
+		t.Errorf("expected uninstall success line in stdout, got: %s", stdout)
+	}
+}
+
+// TestWorkerLogsLinesCappedWithWarning exercises E2: a runaway --lines
+// value clamps to maxTailLines and prints a warning to stderr.
+func TestWorkerLogsLinesCappedWithWarning(t *testing.T) {
+	resetWorkerLogsState(t)
+	tmpHome := t.TempDir()
+	t.Setenv("JUSTTUNNEL_HOME", tmpHome)
+	logsDir := tmpHome + "/logs"
+	if err := os.MkdirAll(logsDir, 0o700); err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	if err := os.WriteFile(logsDir+"/worker-alpha.log", []byte("line\n"), 0o600); err != nil {
+		t.Fatalf("seed log: %v", err)
+	}
+
+	stdout, stderr, err := runCmdSplit(t, "worker", "logs", "alpha", "-n", "999999999")
+	if err != nil {
+		t.Fatalf("logs: %v", err)
+	}
+	if !strings.Contains(stderr, "capped") {
+		t.Errorf("expected stderr cap warning, got: %s", stderr)
+	}
+	if !strings.Contains(stdout, "line") {
+		t.Errorf("expected log content in stdout, got: %s", stdout)
+	}
+}
