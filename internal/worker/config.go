@@ -53,6 +53,35 @@ func ValidateName(name string) error {
 	return nil
 }
 
+// ValidateDerivedSubdomain rejects worker-name + team-slug combinations
+// whose joined form (`<name>--<slug>`) would exceed the 63-octet DNS
+// label limit (RFC 1035 §2.3.4). We pre-validate locally so an operator
+// who picks "long-name" + "long-team-slug" gets an immediate, actionable
+// error instead of a confusing 400 from the server (or worse, a silent
+// truncation by some upstream DNS provider).
+//
+// C6: called from `worker create` and `worker install` BEFORE any HTTP
+// round-trip so we don't waste the round-trip just to surface a name
+// length issue. Personal context (no slug) skips this check — the bare
+// name is already capped at 63 chars by ValidateName's regex.
+func ValidateDerivedSubdomain(name, slug string) error {
+	if slug == "" {
+		// Personal context — DeriveSubdomain returns the bare name,
+		// which is already <=63 chars by ValidateName's regex.
+		return nil
+	}
+	const maxLabel = 63
+	// Joined form is `<name>--<slug>` per DeriveSubdomain.
+	totalLen := len(name) + len("--") + len(slug)
+	if totalLen > maxLabel {
+		return fmt.Errorf(
+			"worker: derived subdomain %q (%d chars) exceeds DNS label limit of %d — pick a shorter worker name or team slug",
+			name+"--"+slug, totalLen, maxLabel,
+		)
+	}
+	return nil
+}
+
 // validateName is the package-local alias retained so existing call sites
 // (Read, Write, runner, logfile) keep their short names. New cross-package
 // callers should use ValidateName.

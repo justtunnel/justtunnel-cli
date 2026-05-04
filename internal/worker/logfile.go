@@ -92,9 +92,14 @@ func (w *RotatingWriter) historicalPath(date time.Time) string {
 // openActive opens (or creates) the active file with append-only 0600 perms.
 // The caller is responsible for holding the mutex (or being in the
 // constructor where no other reference exists yet).
+//
+// C4: extraOpenFlags adds O_NOFOLLOW on Unix (zero on Windows) so the
+// open refuses to follow a symlink at the active-log path. Without this,
+// a symlink planted in ~/.justtunnel/logs could redirect worker log
+// output to an attacker-chosen file. See logfile_unix.go for context.
 func (w *RotatingWriter) openActive(at time.Time) error {
 	path := w.activePath()
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|extraOpenFlags, 0o600)
 	if err != nil {
 		return fmt.Errorf("worker: open log file %s: %w", path, err)
 	}

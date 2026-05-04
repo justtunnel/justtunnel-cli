@@ -146,6 +146,12 @@ func runWorkerInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// C6: pre-validate the derived subdomain length so a 64+ char
+	// `<name>--<slug>` never reaches the server. teamID is the slug.
+	if err := worker.ValidateDerivedSubdomain(name, teamID); err != nil {
+		return err
+	}
+
 	// Reconcile local + server state. The four idempotency modes are
 	// collapsed into a single ensureWorkerRegistered call; it returns the
 	// authoritative worker record (whichever side already had it) and a
@@ -462,6 +468,11 @@ func workerURL(serverURL, subdomain string) (string, error) {
 	}
 	parsed.Path = ""
 	parsed.RawQuery = ""
+	// C1: strip userinfo (e.g. wss://user:pass@host) so the rendered
+	// worker URL never carries credentials. The CLI prints this URL to
+	// stdout; embedding userinfo in operator-visible output would leak
+	// the secret into terminal scrollback and CI logs.
+	parsed.User = nil
 
 	host := parsed.Host
 	// Only transform when host has the literal "api." prefix AND port is

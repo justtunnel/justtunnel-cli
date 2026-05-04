@@ -87,6 +87,7 @@ func TestRenderPlist_Golden(t *testing.T) {
   </array>
   <key>KeepAlive</key>        <true/>
   <key>RunAtLoad</key>        <true/>
+  <key>ThrottleInterval</key> <integer>60</integer>
   <key>StandardOutPath</key>  <string>/Users/me/.justtunnel/logs/worker-alpha.log</string>
   <key>StandardErrorPath</key><string>/Users/me/.justtunnel/logs/worker-alpha.log</string>
 </dict>
@@ -108,6 +109,10 @@ func TestRenderPlist_RejectsBadInputs(t *testing.T) {
 		{"xml in binary path", "ok", "/bin/x<evil>", "/tmp/x.log", "binary path"},
 		{"xml in log path", "ok", "/bin/x", "/tmp/x&y.log", "log path"},
 		{"empty binary path", "ok", "", "/tmp/x.log", "empty binary path"},
+		// C2: parity with validateUnitPath — newline / CR / NUL must be rejected.
+		{"newline in binary path", "ok", "/bin/x\nevil", "/tmp/x.log", "newline or NUL"},
+		{"cr in log path", "ok", "/bin/x", "/tmp/x\rinjected", "newline or NUL"},
+		{"nul in binary path", "ok", "/bin/x\x00", "/tmp/x.log", "newline or NUL"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.label, func(subTest *testing.T) {

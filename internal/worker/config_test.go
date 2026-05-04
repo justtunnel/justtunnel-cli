@@ -408,3 +408,52 @@ func TestList_SkipsNameMismatch(t *testing.T) {
 		t.Fatalf("List = %+v, want only alice", got)
 	}
 }
+
+// TestValidateDerivedSubdomain exercises C6: the joined `<name>--<slug>`
+// form must not exceed the 63-octet DNS label limit. Personal contexts
+// (empty slug) skip the check because the bare name is already capped.
+func TestValidateDerivedSubdomain(t *testing.T) {
+	cases := []struct {
+		label   string
+		name    string
+		slug    string
+		wantErr bool
+	}{
+		{"personal short-circuits", "any-name-here", "", false},
+		{"empty slug allowed", "build", "", false},
+		{"comfortably under cap", "build", "acme", false},
+		{
+			label:   "exactly at cap (63 chars)",
+			name:    strings.Repeat("a", 30),
+			slug:    strings.Repeat("b", 31), // 30 + 2 + 31 = 63
+			wantErr: false,
+		},
+		{
+			label:   "one over cap (64 chars)",
+			name:    strings.Repeat("a", 30),
+			slug:    strings.Repeat("b", 32), // 30 + 2 + 32 = 64
+			wantErr: true,
+		},
+		{
+			label:   "wildly over cap",
+			name:    strings.Repeat("a", 60),
+			slug:    strings.Repeat("b", 60),
+			wantErr: true,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.label, func(subTest *testing.T) {
+			err := ValidateDerivedSubdomain(testCase.name, testCase.slug)
+			if testCase.wantErr && err == nil {
+				subTest.Fatalf("want error for %q + %q (joined len %d), got nil",
+					testCase.name, testCase.slug, len(testCase.name)+2+len(testCase.slug))
+			}
+			if !testCase.wantErr && err != nil {
+				subTest.Fatalf("want no error, got %v", err)
+			}
+			if testCase.wantErr && !strings.Contains(err.Error(), "DNS label") {
+				subTest.Fatalf("error %q should mention DNS label", err)
+			}
+		})
+	}
+}

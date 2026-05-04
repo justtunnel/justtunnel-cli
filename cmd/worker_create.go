@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/justtunnel/justtunnel-cli/internal/worker"
 )
 
 var workerCreateCmd = &cobra.Command{
@@ -28,6 +30,13 @@ func runWorkerCreate(cmd *cobra.Command, args []string) error {
 
 	cfg, teamID, ctxName, baseURL, err := loadWorkerEnv()
 	if err != nil {
+		return err
+	}
+
+	// C6: pre-validate the derived subdomain length so a 64+ char
+	// `<name>--<slug>` never reaches the server. teamID is the slug
+	// (resolveTeamID returns it as such).
+	if err := worker.ValidateDerivedSubdomain(name, teamID); err != nil {
 		return err
 	}
 

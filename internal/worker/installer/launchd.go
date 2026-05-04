@@ -92,6 +92,7 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
   </array>
   <key>KeepAlive</key>        <true/>
   <key>RunAtLoad</key>        <true/>
+  <key>ThrottleInterval</key> <integer>60</integer>
   <key>StandardOutPath</key>  <string>{{.LogPath}}</string>
   <key>StandardErrorPath</key><string>{{.LogPath}}</string>
 </dict>
@@ -404,13 +405,23 @@ func resolveExecutable() (string, error) {
 	return resolved, nil
 }
 
-// validatePlistPath rejects paths containing XML metacharacters. Real
-// macOS paths cannot contain <, >, or & in any commonly-installed location;
-// rejecting them defends against an attacker who controls $HOME or some
-// other input flowing into the plist.
+// validatePlistPath rejects paths containing XML metacharacters AND
+// line/NUL characters. Real macOS paths cannot contain <, >, or & in any
+// commonly-installed location, and an embedded newline / NUL is almost
+// certainly an injection attempt rather than a real path. Rejecting them
+// defends against an attacker who controls $HOME or some other input
+// flowing into the plist.
+//
+// C2: the newline/CR/NUL check brings this validator to parity with
+// validateUnitPath in systemd.go — both supervisor manifests are
+// line-oriented or text-format files where embedded control characters
+// could split the document into adjacent stanzas.
 func validatePlistPath(label, path string) error {
 	if path == "" {
 		return fmt.Errorf("installer: empty %s", label)
+	}
+	if strings.ContainsAny(path, "\n\r\x00") {
+		return fmt.Errorf("installer: %s %q contains newline or NUL", label, path)
 	}
 	if strings.ContainsAny(path, "<>&\"") {
 		return fmt.Errorf("installer: %s %q contains XML metacharacters", label, path)
@@ -420,6 +431,13 @@ func validatePlistPath(label, path string) error {
 
 // writeFileAtomic writes data to path via temp-file + rename. The temp file
 // is created in the same directory so rename is atomic on the same fs.
+//
+// C3: chmod runs IMMEDIATELY after CreateTemp, BEFORE writing the payload.
+// os.CreateTemp opens with 0o600 & ~umask, which under a zero umask
+// (Docker, some CI) leaves the file world-readable for the window between
+// create and the post-write chmod. Tightening perms first means the
+// payload bytes are never visible to other UIDs even momentarily. This
+// mirrors the pattern in internal/worker/config.go's Write.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
@@ -433,6 +451,11 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 			_ = os.Remove(tmpName)
 		}
 	}()
+	// Tighten perms BEFORE writing the payload — see C3 note above.
+	if err := os.Chmod(tmpName, mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("installer: chmod temp file: %w", err)
+	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("installer: write temp file: %w", err)
@@ -444,6 +467,8 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("installer: close temp file: %w", err)
 	}
+	// Defense-in-depth re-chmod in case anything between create and
+	// rename loosened perms (it shouldn't, but cheap insurance).
 	if err := os.Chmod(tmpName, mode); err != nil {
 		return fmt.Errorf("installer: chmod temp file: %w", err)
 	}

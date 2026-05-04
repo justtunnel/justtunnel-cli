@@ -787,6 +787,33 @@ func TestWorkerInstallMode3PrefersDerivedSubdomain(t *testing.T) {
 	}
 }
 
+// TestWorkerURLStripsUserinfo exercises C1: any userinfo (user:pass@) in
+// the configured ServerURL must be removed before the URL is rendered to
+// stdout. Without this, an operator who pinned credentials in the URL
+// would leak them into terminal scrollback / CI logs.
+func TestWorkerURLStripsUserinfo(t *testing.T) {
+	got, err := workerURL("wss://user:pass@api.justtunnel.dev/ws", "build--acme")
+	if err != nil {
+		t.Fatalf("workerURL: %v", err)
+	}
+	if strings.Contains(got, "user") || strings.Contains(got, "pass") {
+		t.Errorf("workerURL leaked userinfo, got: %q", got)
+	}
+	want := "https://build--acme.justtunnel.dev"
+	if got != want {
+		t.Errorf("workerURL = %q, want %q", got, want)
+	}
+
+	// Path-form fallback (custom domain): same expectation.
+	got2, err := workerURL("wss://user:pass@tunnels.example.com/ws", "alpha--team")
+	if err != nil {
+		t.Fatalf("workerURL: %v", err)
+	}
+	if strings.Contains(got2, "user") || strings.Contains(got2, "pass") {
+		t.Errorf("workerURL leaked userinfo on fallback path, got: %q", got2)
+	}
+}
+
 // TestWorkerURLEmptySubdomain locks in the empty-subdomain guard. A
 // caller that forgets to pass a subdomain should get a deterministic
 // error instead of a malformed URL with a leading dot.
