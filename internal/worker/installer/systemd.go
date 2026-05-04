@@ -186,10 +186,12 @@ type SystemdResult struct {
 	// already enabled before Bootstrap ran.
 	LingerEnabled bool
 
-	// NoLingerWarningPrinted is true when the caller should print
+	// ShouldPrintLingerDeniedNotice is true when the caller should print
 	// LingerDeniedNotice — i.e. linger was NOT enabled (either via
 	// --no-linger or via deny at the prompt) AND was not already on.
-	NoLingerWarningPrinted bool
+	// Renamed from NoLingerWarningPrinted (which misleadingly suggested
+	// the installer itself printed the notice — it never does).
+	ShouldPrintLingerDeniedNotice bool
 }
 
 // unitTemplate is the systemd-user unit. Keep the indentation stable —
@@ -335,14 +337,14 @@ func (s *SystemdInstaller) Bootstrap(ctx context.Context, workerName string, opt
 	// system-wide change; failure to enable linger does NOT roll back
 	// the unit install — the worker just becomes session-bound.
 	if opts.NoLinger {
-		return SystemdResult{LingerEnabled: false, NoLingerWarningPrinted: true}, nil
+		return SystemdResult{LingerEnabled: false, ShouldPrintLingerDeniedNotice: true}, nil
 	}
 
 	username, userErr := s.currentUser()
 	if userErr != nil {
 		// We can't enable linger without a username. Fall through to
 		// the deny-path notice rather than failing the whole install.
-		return SystemdResult{LingerEnabled: false, NoLingerWarningPrinted: true},
+		return SystemdResult{LingerEnabled: false, ShouldPrintLingerDeniedNotice: true},
 			fmt.Errorf("installer: resolve current user (worker installed but linger NOT configured): %w", userErr)
 	}
 
@@ -361,17 +363,17 @@ func (s *SystemdInstaller) Bootstrap(ctx context.Context, workerName string, opt
 
 	consent, promptErr := s.Prompter.Prompt(ctx)
 	if promptErr != nil {
-		return SystemdResult{LingerEnabled: false, NoLingerWarningPrinted: true},
+		return SystemdResult{LingerEnabled: false, ShouldPrintLingerDeniedNotice: true},
 			fmt.Errorf("installer: linger prompt failed (worker installed but linger NOT configured): %w", promptErr)
 	}
 	if !consent {
-		return SystemdResult{LingerEnabled: false, NoLingerWarningPrinted: true}, nil
+		return SystemdResult{LingerEnabled: false, ShouldPrintLingerDeniedNotice: true}, nil
 	}
 
 	if err := s.runLoginctl(ctx, "enable-linger", username); err != nil {
 		// Most common failure: permissions. Worker is still installed
 		// and enabled; we just couldn't make it session-independent.
-		return SystemdResult{LingerEnabled: false, NoLingerWarningPrinted: true},
+		return SystemdResult{LingerEnabled: false, ShouldPrintLingerDeniedNotice: true},
 			fmt.Errorf("installer: loginctl enable-linger %s failed (worker is installed but session-bound; see `man loginctl`): %w", username, err)
 	}
 	return SystemdResult{LingerEnabled: true}, nil

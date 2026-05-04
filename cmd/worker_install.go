@@ -183,9 +183,38 @@ func runWorkerInstall(cmd *cobra.Command, args []string) error {
 	// prompt. The systemd installer treats NoLinger=true as
 	// session-bound (worker dies on logout) — same semantics either way.
 	opts := installer.SystemdOptions{NoLinger: workerInstallNoLinger || workerInstallNonInteractive}
-	if _, err := svc.Bootstrap(cmd.Context(), name, opts); err != nil {
+	bootstrapResult, err := svc.Bootstrap(cmd.Context(), name, opts)
+	if err != nil {
 		return fmt.Errorf("install: bootstrap supervisor for %q failed; retry with `justtunnel worker install %s` or `justtunnel worker uninstall %s` to roll back: %w",
 			name, name, name, err)
+	}
+
+	// A3: ensure ServiceBackend reflects the supervisor that just took
+	// ownership. If the local config was written earlier with "none" (e.g.
+	// from `worker create` followed by `worker install`), persist the
+	// authoritative backend so `worker status` / `worker list` render
+	// correctly. Best-effort: a write failure here is non-fatal because
+	// the supervisor is already installed and the user-visible install
+	// step succeeded.
+	expectedBackend := serviceBackendForOS(runtime.GOOS)
+	if record.ServiceBackend != expectedBackend {
+		updated := *record
+		updated.ServiceBackend = expectedBackend
+		if writeErr := worker.Write(&updated); writeErr != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"warning: could not update local ServiceBackend to %q: %v\n",
+				expectedBackend, writeErr)
+		} else {
+			record = &updated
+		}
+	}
+
+	// A1: spec §6.4 — when linger was NOT enabled (--no-linger, deny at
+	// prompt, or a non-fatal failure to enable), print the verbatim
+	// "linger denied" notice to stdout so the operator sees how to enable
+	// persistence later.
+	if bootstrapResult.ShouldPrintLingerDeniedNotice {
+		fmt.Fprint(cmd.OutOrStdout(), installer.LingerDeniedNotice(name))
 	}
 
 	urlStr, urlErr := workerURL(cfg.ServerURL, record.Subdomain)
@@ -277,9 +306,15 @@ func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, wa
 }
 
 // createServerSideAndPersist POSTs the worker, writes local config, and on
-// local-write failure rolls back the server-side create. Mirrors the helper
-// shape used by runWorkerCreate; could be DRY'd further in a follow-up by
-// extracting a single shared helper between both call sites.
+// local-write failure rolls back the server-side create. Used by both
+// `worker create` (which writes ServiceBackend="none" — bare-create, no
+// supervisor yet) and `worker install` Mode 2/4 (which leaves "none" so the
+// caller can later overwrite with the platform supervisor name once
+// Bootstrap succeeds — see runWorkerInstall for the post-install update).
+//
+// We deliberately persist "none" here rather than serviceBackendForOS so a
+// crash AFTER write but BEFORE Bootstrap leaves the state truthful: there
+// is no supervisor managing this worker yet.
 func createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name string, warnOut io.Writer) (*worker.Config, error) {
 	created, err := postWorker(baseURL, authToken, teamID, name)
 	if err != nil {
@@ -297,19 +332,32 @@ func createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name string
 		)
 		createdAt = time.Now().UTC()
 	}
+	subdomain := created.Subdomain
+	if derived, derr := worker.DeriveSubdomain(created.Name, ctxName); derr == nil {
+		if created.Subdomain != "" && created.Subdomain != derived {
+			fmt.Fprintf(warnOut,
+				"warning: server-reported subdomain %q for %q disagrees with locally-derived %q; using local value\n",
+				created.Subdomain, created.Name, derived,
+			)
+		}
+		subdomain = derived
+	}
 	cfg := &worker.Config{
 		WorkerID:       created.ID,
 		Name:           created.Name,
 		Context:        ctxName,
-		Subdomain:      created.Subdomain,
+		Subdomain:      subdomain,
 		CreatedAt:      createdAt,
-		ServiceBackend: serviceBackendForOS(runtime.GOOS),
+		ServiceBackend: "none",
 	}
 	if writeErr := worker.Write(cfg); writeErr != nil {
 		_, deleteErr := deleteWorker(baseURL, authToken, teamID, created.ID)
 		if deleteErr != nil {
 			return nil, fmt.Errorf(
-				"local config write failed AND server-side rollback failed (worker %q id=%s leaked); run `justtunnel worker rm %s --delete-on-server` to clean up: write=%v rollback=%v",
+				"WARNING: server-side worker %q (id %s) created but local config write failed AND rollback also failed.\n"+
+					"Run `justtunnel worker rm %s --delete-on-server` to clean up before retrying create.\n"+
+					"  local write error: %v\n"+
+					"  rollback error:    %v",
 				created.Name, created.ID, created.Name, writeErr, deleteErr,
 			)
 		}
@@ -320,6 +368,15 @@ func createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name string
 
 // workerAPIToConfig copies the server's view of a worker into the on-disk
 // schema. Used by the "hydrate local from server" idempotency branch.
+//
+// A4: subdomain verification. If the server's reported subdomain disagrees
+// with the locally-derived value (DeriveSubdomain(name, ctxName)), warn on
+// stderr AND prefer the locally-derived value in the persisted config. The
+// CLI considers the local derivation authoritative because subdomain shape
+// is owned by the worker package's documented rules (`<name>` for personal,
+// `<name>--<slug>` for team) — a server that reports a different value is
+// either rolling out a new format or is buggy, and either way we'd rather
+// match what the runner will dial.
 func workerAPIToConfig(api *workerAPI, ctxName string, warnOut io.Writer) *worker.Config {
 	createdAt, parseErr := time.Parse(time.RFC3339, api.CreatedAt)
 	if parseErr != nil {
@@ -331,11 +388,21 @@ func workerAPIToConfig(api *workerAPI, ctxName string, warnOut io.Writer) *worke
 		}
 		createdAt = time.Now().UTC()
 	}
+	subdomain := api.Subdomain
+	if derived, derr := worker.DeriveSubdomain(api.Name, ctxName); derr == nil {
+		if api.Subdomain != "" && api.Subdomain != derived && warnOut != nil {
+			fmt.Fprintf(warnOut,
+				"warning: server-reported subdomain %q for %q disagrees with locally-derived %q; using local value\n",
+				api.Subdomain, api.Name, derived,
+			)
+		}
+		subdomain = derived
+	}
 	return &worker.Config{
 		WorkerID:       api.ID,
 		Name:           api.Name,
 		Context:        ctxName,
-		Subdomain:      api.Subdomain,
+		Subdomain:      subdomain,
 		CreatedAt:      createdAt,
 		ServiceBackend: serviceBackendForOS(runtime.GOOS),
 	}

@@ -610,6 +610,183 @@ func TestWorkerURLForConfigured(t *testing.T) {
 	}
 }
 
+// TestWorkerInstallPrintsLingerDeniedNoticeWhenFlagged exercises A1:
+// when the fake installer reports ShouldPrintLingerDeniedNotice=true,
+// the cmd layer must emit the verbatim spec §6.4 notice text to stdout
+// (substituting the worker name into the format directive).
+func TestWorkerInstallPrintsLingerDeniedNoticeWhenFlagged(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[]}`))
+		case http.MethodPost:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusCreated)
+			writer.Write([]byte(`{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme","created_at":"2026-05-04T12:00:00Z"}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stub.URL) + "/ws",
+		CurrentContext: "team:team-acme",
+	})
+
+	fake := &fakeServiceInstaller{
+		result: installer.SystemdResult{ShouldPrintLingerDeniedNotice: true},
+	}
+	withFakeInstaller(t, fake)
+
+	out, err := runCmd(t, "worker", "install", "alpha", "--no-linger")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	wantNotice := installer.LingerDeniedNotice("alpha")
+	if !strings.Contains(out, wantNotice) {
+		t.Errorf("expected linger-denied notice in stdout.\nwant substring:\n%s\n\ngot:\n%s",
+			wantNotice, out)
+	}
+}
+
+// TestWorkerInstallDoesNotPrintLingerDeniedNoticeWhenNotFlagged is the
+// negative half of A1: when ShouldPrintLingerDeniedNotice=false (linger
+// already on, or consent accepted), the notice MUST NOT appear.
+func TestWorkerInstallDoesNotPrintLingerDeniedNoticeWhenNotFlagged(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[]}`))
+		case http.MethodPost:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusCreated)
+			writer.Write([]byte(`{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme","created_at":"2026-05-04T12:00:00Z"}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stub.URL) + "/ws",
+		CurrentContext: "team:team-acme",
+	})
+
+	fake := &fakeServiceInstaller{
+		result: installer.SystemdResult{LingerEnabled: true},
+	}
+	withFakeInstaller(t, fake)
+
+	out, err := runCmd(t, "worker", "install", "alpha")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if strings.Contains(out, "loginctl enable-linger") {
+		t.Errorf("notice should NOT appear when linger is enabled, got: %s", out)
+	}
+}
+
+// TestWorkerInstallUpdatesServiceBackendFromNone exercises A3: a worker
+// that was created via `worker create` (ServiceBackend="none") should have
+// its ServiceBackend field rewritten to the platform supervisor name after
+// `worker install` succeeds, so `worker status` / `worker list` render
+// correctly.
+func TestWorkerInstallUpdatesServiceBackendFromNone(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme","created_at":"2026-05-04T12:00:00Z"}]}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stub.URL) + "/ws",
+		CurrentContext: "team:team-acme",
+	})
+
+	// Seed the local config the way `worker create` would: ServiceBackend="none".
+	if err := worker.Write(&worker.Config{
+		WorkerID:       "wkr_1",
+		Name:           "alpha",
+		Context:        "team:team-acme",
+		Subdomain:      "alpha--acme",
+		CreatedAt:      time.Now().UTC(),
+		ServiceBackend: "none",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+
+	if _, err := runCmd(t, "worker", "install", "alpha"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	loaded, err := worker.Read("alpha")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	want := serviceBackendForOS(runtime.GOOS)
+	if loaded.ServiceBackend != want {
+		t.Errorf("ServiceBackend: got %q, want %q (platform supervisor after install)",
+			loaded.ServiceBackend, want)
+	}
+}
+
+// TestWorkerInstallMode3PrefersDerivedSubdomain exercises A4: when the
+// server returns a subdomain that disagrees with the locally-derived
+// `<name>--<slug>` shape, the hydrate path must persist the local value
+// AND warn on stderr. Without this, a buggy or in-flight server change
+// could land a wrong subdomain in local config that the runner then dials.
+func TestWorkerInstallMode3PrefersDerivedSubdomain(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			// Server reports a single-dash subdomain — disagrees with the
+			// canonical `<name>--<slug>` shape DeriveSubdomain produces.
+			writer.Write([]byte(`{"workers":[{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha-team-acme","created_at":"2026-05-04T12:00:00Z"}]}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stub.URL) + "/ws",
+		CurrentContext: "team:team-acme",
+	})
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+
+	out, err := runCmd(t, "worker", "install", "alpha")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	loaded, err := worker.Read("alpha")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if loaded.Subdomain != "alpha--team-acme" {
+		t.Errorf("Subdomain: got %q, want alpha--team-acme (locally-derived)", loaded.Subdomain)
+	}
+	if !strings.Contains(out, "disagrees with locally-derived") {
+		t.Errorf("expected stderr warning about subdomain disagreement; got: %s", out)
+	}
+}
+
 // TestWorkerURLEmptySubdomain locks in the empty-subdomain guard. A
 // caller that forgets to pass a subdomain should get a deterministic
 // error instead of a malformed URL with a leading dot.

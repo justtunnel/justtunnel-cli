@@ -110,8 +110,12 @@ func TestWorkerCreateHappyPath(t *testing.T) {
 	if loaded.Context != "team:team-alpha" {
 		t.Errorf("local Context: got %q, want team:team-alpha", loaded.Context)
 	}
-	if loaded.Subdomain != "alice-team-alpha" {
-		t.Errorf("local Subdomain: got %q", loaded.Subdomain)
+	// A4: locally-derived subdomain (`<name>--<slug>`) is authoritative
+	// over the server's value. The stub returns "alice-team-alpha" (one
+	// dash) deliberately to exercise the disagreement path; the local
+	// derivation `alice--team-alpha` (two dashes) is what we persist.
+	if loaded.Subdomain != "alice--team-alpha" {
+		t.Errorf("local Subdomain: got %q, want alice--team-alpha (locally-derived)", loaded.Subdomain)
 	}
 	if loaded.ServiceBackend != "none" {
 		t.Errorf("local ServiceBackend: got %q, want none", loaded.ServiceBackend)

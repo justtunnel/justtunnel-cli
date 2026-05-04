@@ -156,8 +156,8 @@ func TestBootstrap_NoLinger_SkipsLingerCommands(t *testing.T) {
 	if result.LingerEnabled {
 		t.Fatal("LingerEnabled should be false with NoLinger=true")
 	}
-	if !result.NoLingerWarningPrinted {
-		t.Fatal("NoLingerWarningPrinted should be true with NoLinger=true")
+	if !result.ShouldPrintLingerDeniedNotice {
+		t.Fatal("ShouldPrintLingerDeniedNotice should be true with NoLinger=true")
 	}
 	if prompter.calls != 0 {
 		t.Fatalf("prompter should not be called with NoLinger=true; calls=%d", prompter.calls)
@@ -212,8 +212,8 @@ func TestBootstrap_LingerAlreadyEnabled_SkipsPrompt(t *testing.T) {
 	if !result.LingerEnabled {
 		t.Fatal("LingerEnabled should be true when linger was already on")
 	}
-	if result.NoLingerWarningPrinted {
-		t.Fatal("NoLingerWarningPrinted should be false when linger was already on")
+	if result.ShouldPrintLingerDeniedNotice {
+		t.Fatal("ShouldPrintLingerDeniedNotice should be false when linger was already on")
 	}
 	if prompter.calls != 0 {
 		t.Fatalf("prompter should not be called when linger already on; calls=%d", prompter.calls)
@@ -253,8 +253,8 @@ func TestBootstrap_LingerNotEnabled_AcceptsPrompt(t *testing.T) {
 	if !result.LingerEnabled {
 		t.Fatal("LingerEnabled should be true after consent")
 	}
-	if result.NoLingerWarningPrinted {
-		t.Fatal("NoLingerWarningPrinted should be false after consent")
+	if result.ShouldPrintLingerDeniedNotice {
+		t.Fatal("ShouldPrintLingerDeniedNotice should be false after consent")
 	}
 	if prompter.calls != 1 {
 		t.Fatalf("prompter should be called once; calls=%d", prompter.calls)
@@ -287,8 +287,8 @@ func TestBootstrap_LingerNotEnabled_DeniesPrompt(t *testing.T) {
 	if result.LingerEnabled {
 		t.Fatal("LingerEnabled should be false after deny")
 	}
-	if !result.NoLingerWarningPrinted {
-		t.Fatal("NoLingerWarningPrinted should be true after deny")
+	if !result.ShouldPrintLingerDeniedNotice {
+		t.Fatal("ShouldPrintLingerDeniedNotice should be true after deny")
 	}
 	if prompter.calls != 1 {
 		t.Fatalf("prompter should be called once; calls=%d", prompter.calls)
@@ -329,8 +329,8 @@ func TestBootstrap_EnableLingerFails_InstallStillSucceeds(t *testing.T) {
 	if result.LingerEnabled {
 		t.Fatal("LingerEnabled should be false on enable-linger failure")
 	}
-	if !result.NoLingerWarningPrinted {
-		t.Fatal("NoLingerWarningPrinted should be true on enable-linger failure")
+	if !result.ShouldPrintLingerDeniedNotice {
+		t.Fatal("ShouldPrintLingerDeniedNotice should be true on enable-linger failure")
 	}
 }
 
@@ -684,8 +684,8 @@ func TestBootstrap_Idempotent_LingerAlreadyEnabledOnRerun(t *testing.T) {
 	if !result.LingerEnabled {
 		t.Fatal("run 2: LingerEnabled should be true (already on)")
 	}
-	if result.NoLingerWarningPrinted {
-		t.Fatal("run 2: NoLingerWarningPrinted should be false")
+	if result.ShouldPrintLingerDeniedNotice {
+		t.Fatal("run 2: ShouldPrintLingerDeniedNotice should be false")
 	}
 	if prompter.calls != 1 {
 		t.Fatalf("run 2: prompter must NOT be called when linger already on; total calls=%d", prompter.calls)
