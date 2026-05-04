@@ -37,8 +37,9 @@ type workerListResponse struct {
 }
 
 // httpTimeout matches the 10s timeout used by other subcommands so behavior
-// is consistent against an unresponsive server.
-const httpTimeout = 10 * time.Second
+// is consistent against an unresponsive server. Declared as a var (not const)
+// so tests can shrink it to keep timeout cases fast.
+var httpTimeout = 10 * time.Second
 
 var workerCmd = &cobra.Command{
 	Use:   "worker",

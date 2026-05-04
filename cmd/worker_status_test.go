@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -64,7 +65,9 @@ func seedLocalWorker(t *testing.T, cfg worker.Config) {
 func stubWorkersServer(body string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/workers") {
+			writer.Header().Set("Content-Type", "application/json")
 			writer.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(writer, `{"error":"test stub: unhandled %s %s"}`, request.Method, request.URL.Path)
 			return
 		}
 		writer.Header().Set("Content-Type", "application/json")
@@ -306,6 +309,126 @@ func TestWorkerStatusOtherContextLocalIgnored(t *testing.T) {
 	}
 	if strings.Contains(out, "elsewhere") {
 		t.Errorf("local config from other context leaked into status: %s", out)
+	}
+}
+
+func TestWorkerStatusDuplicateNamesPreservesAllRows(t *testing.T) {
+	stub := stubWorkersServer(`{"workers":[
+		{"id":"wkr_1","name":"build","team_id":"team-alpha","status":"online","last_seen_at":"2026-05-04T12:34:56Z"},
+		{"id":"wkr_2","name":"build","team_id":"team-alpha","status":"offline","last_seen_at":"2026-05-04T13:00:00Z"}
+	]}`)
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+	useFakeSupervisor(t, newFakeSupervisor())
+
+	out, err := runCmd(t, "worker", "status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	// Both rows must be visible with their own status data.
+	if !strings.Contains(out, "online") {
+		t.Errorf("expected first duplicate's status (online) in output:\n%s", out)
+	}
+	if !strings.Contains(out, "offline") {
+		t.Errorf("expected second duplicate's status (offline) in output:\n%s", out)
+	}
+	// Both rows carry a DUP marker so the operator sees the collision.
+	if strings.Count(out, "DUP-") < 2 {
+		t.Errorf("expected DUP markers on both rows, got:\n%s", out)
+	}
+	if !strings.Contains(out, "DUP-1/2") || !strings.Contains(out, "DUP-2/2") {
+		t.Errorf("expected DUP-1/2 and DUP-2/2 markers, got:\n%s", out)
+	}
+	// Both timestamps preserved.
+	if !strings.Contains(out, "2026-05-04 12:34:56Z") || !strings.Contains(out, "2026-05-04 13:00:00Z") {
+		t.Errorf("expected both last-seen timestamps preserved, got:\n%s", out)
+	}
+}
+
+func TestWorkerStatusServerTimeout(t *testing.T) {
+	// Block the response indefinitely until the test ends. The handler
+	// uses request context to unblock cleanly when the client cancels.
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	defer stub.Close()
+
+	prev := httpTimeout
+	httpTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { httpTimeout = prev })
+
+	resetWorkerState(t, teamCfg(stub.URL))
+	useFakeSupervisor(t, newFakeSupervisor())
+
+	_, err := runCmd(t, "worker", "status")
+	if err == nil {
+		t.Fatalf("expected timeout error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "deadline exceeded") && !strings.Contains(msg, "Client.Timeout") && !strings.Contains(msg, "context deadline") {
+		t.Errorf("expected timeout-flavored error, got: %v", err)
+	}
+}
+
+func TestWorkerStatusLocalOnlyDistinguishedFromMissing(t *testing.T) {
+	// Two local workers, no server entries. One has ServiceBackend=""
+	// (foreground / local-only), the other has a real backend (server
+	// entry has gone missing).
+	stub := stubWorkersServer(`{"workers":[]}`)
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+	seedLocalWorker(t, worker.Config{
+		Name:           "foreground",
+		Context:        "team:team-alpha",
+		ServiceBackend: "",
+	})
+	seedLocalWorker(t, worker.Config{
+		Name:           "orphan",
+		Context:        "team:team-alpha",
+		ServiceBackend: "launchd",
+	})
+	fake := newFakeSupervisor()
+	fake.results["orphan"] = worker.ProbeResult{ServiceBackend: "launchd", ManagedByUs: true, Running: false}
+	useFakeSupervisor(t, fake)
+
+	out, err := runCmd(t, "worker", "status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	foregroundLine := findLine(t, out, "foreground")
+	if !strings.Contains(foregroundLine, "<local-only>") {
+		t.Errorf("expected <local-only> for foreground worker, got: %q", foregroundLine)
+	}
+	orphanLine := findLine(t, out, "orphan")
+	if !strings.Contains(orphanLine, "<missing>") {
+		t.Errorf("expected <missing> for orphan worker, got: %q", orphanLine)
+	}
+}
+
+func TestWorkerStatusSendsAuthHeader(t *testing.T) {
+	var sawAuth atomic.Value
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		sawAuth.Store(request.Header.Get("Authorization"))
+		if !strings.HasSuffix(request.URL.Path, "/workers") {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Write([]byte(`{"workers":[]}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+	useFakeSupervisor(t, newFakeSupervisor())
+
+	if _, err := runCmd(t, "worker", "status"); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	got, _ := sawAuth.Load().(string)
+	if got != "Bearer justtunnel_test_token" {
+		t.Errorf("expected Authorization=Bearer justtunnel_test_token, got %q", got)
 	}
 }
 

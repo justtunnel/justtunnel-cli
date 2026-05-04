@@ -49,6 +49,11 @@ type statusRow struct {
 	LastSeenAt string // formatted UTC or "-"
 }
 
+// duplicateMarker is appended to Server cells when the server returns more
+// than one entry with the same name. Kept short to avoid inflating tabwriter
+// column widths.
+const duplicateMarker = " DUP"
+
 func runWorkerStatus(cmd *cobra.Command, args []string) error {
 	cfg, teamID, ctxName, baseURL, err := loadWorkerEnv()
 	if err != nil {
@@ -106,70 +111,102 @@ func buildStatusRows(
 		ctx = context.Background()
 	}
 
-	rowsByName := make(map[string]*statusRow)
+	// Count duplicates first so each duplicate row can carry its own
+	// "DUP-N/M" suffix without reaching back into a shared row.
 	nameCounts := make(map[string]int, len(server))
 	for _, srv := range server {
 		nameCounts[srv.Name]++
 	}
 
+	// uniqueRows holds the single row per non-duplicated name so local
+	// configs can attach to it. Duplicate rows are written directly to
+	// `allRows` and never mutated again, preserving each entry's own
+	// status data so the operator can see the divergence.
+	uniqueRows := make(map[string]*statusRow)
+	allRows := make([]*statusRow, 0, len(server)+len(local))
+	dupSeen := make(map[string]int, len(server))
+
 	for _, srv := range server {
-		row := rowsByName[srv.Name]
-		if row == nil {
-			row = &statusRow{Name: srv.Name}
-			rowsByName[srv.Name] = row
-		}
 		serverCell := srv.Status
 		if serverCell == "" {
 			serverCell = "unknown"
 		}
 		if nameCounts[srv.Name] > 1 {
-			serverCell += " <duplicate>"
+			dupSeen[srv.Name]++
+			serverCell = fmt.Sprintf("%s%s-%d/%d", serverCell, duplicateMarker, dupSeen[srv.Name], nameCounts[srv.Name])
+			row := &statusRow{
+				Name:       srv.Name,
+				Server:     serverCell,
+				LastSeenAt: formatLastSeen(srv.LastSeenAt),
+			}
+			allRows = append(allRows, row)
+			continue
 		}
-		row.Server = serverCell
-		row.LastSeenAt = formatLastSeen(srv.LastSeenAt)
+		row := &statusRow{
+			Name:       srv.Name,
+			Server:     serverCell,
+			LastSeenAt: formatLastSeen(srv.LastSeenAt),
+		}
+		uniqueRows[srv.Name] = row
+		allRows = append(allRows, row)
 	}
 
-	// Pre-collect every name we need to probe so the probe loop below
-	// is the single place that talks to the supervisor (cheaper to
-	// reason about, easier to add caching later).
+	// Attach local configs. For names with duplicate server entries we
+	// cannot pick which row "owns" the local probe, so we leave the
+	// duplicate rows' Local cells as the default "none" — the operator
+	// is expected to resolve the duplication first via the server side.
 	for _, loc := range local {
 		if loc.Context != ctxName {
 			continue
 		}
-		row := rowsByName[loc.Name]
-		if row == nil {
-			row = &statusRow{
-				Name:       loc.Name,
-				Server:     "<missing>",
-				LastSeenAt: "-",
-			}
-			rowsByName[loc.Name] = row
+		if existing, ok := uniqueRows[loc.Name]; ok {
+			existing.Local = describeLocal(ctx, supervisor, loc)
+			continue
 		}
-		row.Local = describeLocal(ctx, supervisor, loc)
+		// Local config exists with no matching server entry. Distinguish
+		// between an explicitly local-only worker (ServiceBackend empty —
+		// foreground via `worker start`) and one whose server entry has
+		// gone missing.
+		serverCell := "<missing>"
+		if loc.ServiceBackend == "" {
+			serverCell = "<local-only>"
+		}
+		row := &statusRow{
+			Name:       loc.Name,
+			Server:     serverCell,
+			Local:      describeLocal(ctx, supervisor, loc),
+			LastSeenAt: "-",
+		}
+		uniqueRows[loc.Name] = row
+		allRows = append(allRows, row)
 	}
 
 	// Server-only rows still need a Local cell. Without a local config
 	// we cannot probe (we don't know which name the supervisor would
 	// have used), so report "none".
-	for _, row := range rowsByName {
+	for _, row := range allRows {
 		if row.Local == "" {
 			row.Local = "none"
 		}
 		if row.Server == "" {
-			// Safety net: a row that exists only because of local
-			// (no server entry) was already given Server="<missing>"
-			// above; this branch only fires for the impossible case
-			// where the server slice contained a worker with an
-			// empty name. Mark explicitly.
+			// Safety net: a row with no server status falls back to
+			// "<unknown>" rather than rendering as a blank cell.
 			row.Server = "<unknown>"
 		}
 	}
 
-	out := make([]statusRow, 0, len(rowsByName))
-	for _, row := range rowsByName {
+	out := make([]statusRow, 0, len(allRows))
+	for _, row := range allRows {
 		out = append(out, *row)
 	}
-	sort.Slice(out, func(left, right int) bool { return out[left].Name < out[right].Name })
+	sort.SliceStable(out, func(left, right int) bool {
+		if out[left].Name != out[right].Name {
+			return out[left].Name < out[right].Name
+		}
+		// Preserve insertion order for duplicates by sorting on Server
+		// suffix (DUP-1/N before DUP-2/N).
+		return out[left].Server < out[right].Server
+	})
 	return out
 }
 
@@ -192,16 +229,45 @@ func describeLocal(ctx context.Context, supervisor worker.Supervisor, loc worker
 	if backend == "" {
 		backend = loc.ServiceBackend
 	}
+	// Build the local cell from the boolean state first, then optionally
+	// append Detail when it adds signal. Ordering matters: a running probe
+	// that also carries a Detail string ("started 12s ago") must still
+	// render as ":running"; previously the Detail branch shadowed both
+	// :running and :stopped.
+	var state string
 	switch {
 	case result.Running:
-		return backend + ":running"
-	case result.Detail != "":
-		return backend + ":" + result.Detail
+		state = "running"
 	case result.ManagedByUs:
-		return backend + ":stopped"
+		state = "stopped"
 	default:
-		return backend + ":not loaded"
+		state = "not loaded"
 	}
+	cell := backend + ":" + state
+	// Skip detail strings that are pure noise (the stub probe in #32 emits
+	// "probe not yet implemented" — keep that one for the existing
+	// stub-renders test, but suppress on real states).
+	if result.Detail != "" && shouldShowDetail(result.Detail, result.Running, result.ManagedByUs) {
+		cell += " (" + result.Detail + ")"
+	} else if result.Detail != "" && !result.Running && !result.ManagedByUs {
+		// Stub case: no Running, no ManagedByUs — surface Detail directly
+		// so "launchd:probe not yet implemented" stays visible until the
+		// real probes land.
+		cell = backend + ":" + result.Detail
+	}
+	return cell
+}
+
+// shouldShowDetail returns true when the supervisor's Detail string adds
+// information on top of the resolved running/stopped state. Used to suppress
+// "probe not yet implemented" noise on rows that already report a real state.
+func shouldShowDetail(detail string, running, managed bool) bool {
+	if detail == "probe not yet implemented" {
+		return false
+	}
+	// Only annotate concrete states (running/stopped). Pure stub rows take
+	// the alternative branch in describeLocal.
+	return running || managed
 }
 
 // formatLastSeen normalizes the server's RFC3339 timestamp to UTC for
