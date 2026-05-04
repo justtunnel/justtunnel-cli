@@ -382,24 +382,13 @@ func LogFilePath(workerName string) (string, error) {
 	return filepath.Join(dir, "worker-"+workerName+".log"), nil
 }
 
-// OpenLogFile opens (or creates) the worker's log file in append mode with
-// 0600 permissions. The caller owns the returned file and must Close it.
-func OpenLogFile(workerName string) (*os.File, error) {
-	path, err := LogFilePath(workerName)
-	if err != nil {
-		return nil, err
-	}
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("worker: open log file %s: %w", path, err)
-	}
-	// Defense-in-depth: tighten perms in case the file pre-existed with a
-	// looser mode (e.g. created by a buggy earlier version).
-	if err := os.Chmod(path, 0o600); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("worker: chmod log file %s: %w", path, err)
-	}
-	return file, nil
+// OpenLogFile opens the worker's log file as a date-rotating writer. The
+// returned writer is mutex-guarded and rotates on date boundaries — see
+// RotatingWriter for the full contract. The caller owns the writer and must
+// Close it. Production callers pass a nil clock; tests construct
+// NewRotatingWriter directly with a synthetic clock.
+func OpenLogFile(workerName string) (*RotatingWriter, error) {
+	return NewRotatingWriter(workerName, nil)
 }
 
 // realDialer is the production Dialer using nhooyr.io/websocket. The
