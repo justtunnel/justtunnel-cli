@@ -17,19 +17,31 @@ import (
 
 // resetWorkerState wires the CLI into a per-test temp config + temp
 // JUSTTUNNEL_HOME so worker.Read/Write/List/Delete operate against an
-// isolated directory. It also zeroes worker-command package-level flag
-// state (workerRmDeleteOnServer) and installs a t.Cleanup to zero it
-// again on test exit, mirroring resetContextState's pattern. Without
-// this, a test that ran with --delete-on-server would leak the `true`
+// isolated directory. It also zeroes ALL worker-command package-level
+// flag state and installs a t.Cleanup to zero them again on test exit,
+// mirroring resetContextState's pattern. Without this, a test that ran
+// with e.g. --delete-on-server or --no-linger would leak the `true`
 // value into the next test's cobra Execute() call. Returns the config
 // path.
+//
+// When adding a new package-level cobra flag var to any worker_*.go,
+// add it here too. Current flags reset:
+//   - workerRmDeleteOnServer (worker_rm.go)
+//   - workerInstallNoLinger  (worker_install.go)
+//   - workerInstallNonInteractive (worker_install.go)
 func resetWorkerState(t *testing.T, cfg *config.Config) string {
 	t.Helper()
 	path := resetContextState(t, cfg)
 	tmpHome := t.TempDir()
 	t.Setenv("JUSTTUNNEL_HOME", tmpHome)
 	workerRmDeleteOnServer = false
-	t.Cleanup(func() { workerRmDeleteOnServer = false })
+	workerInstallNoLinger = false
+	workerInstallNonInteractive = false
+	t.Cleanup(func() {
+		workerRmDeleteOnServer = false
+		workerInstallNoLinger = false
+		workerInstallNonInteractive = false
+	})
 	return path
 }
 

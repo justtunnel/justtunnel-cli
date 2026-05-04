@@ -259,6 +259,7 @@ func TestWorkerInstallReinstallServerPresentLocalMissing(t *testing.T) {
 }
 
 func TestWorkerInstallBootstrapFailureSurfacesError(t *testing.T) {
+	var deleteCalls int32
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.Method {
 		case http.MethodGet:
@@ -268,6 +269,9 @@ func TestWorkerInstallBootstrapFailureSurfacesError(t *testing.T) {
 			writer.Header().Set("Content-Type", "application/json")
 			writer.WriteHeader(http.StatusCreated)
 			writer.Write([]byte(`{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme","created_at":"2026-05-04T12:00:00Z"}`))
+		case http.MethodDelete:
+			atomic.AddInt32(&deleteCalls, 1)
+			writer.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(writer, request)
 		}
@@ -293,6 +297,13 @@ func TestWorkerInstallBootstrapFailureSurfacesError(t *testing.T) {
 	// Server worker + local config remain — operator can re-run install.
 	if _, readErr := worker.Read("alpha"); readErr != nil {
 		t.Errorf("local config should remain after Bootstrap failure, got err=%v", readErr)
+	}
+	// Plan: "leave server worker in place" on Bootstrap failure. Lock
+	// in zero compensating DELETE calls — auto-rolling back the server
+	// record on a local-platform problem would make retry strictly
+	// worse (operator has to re-create instead of re-running install).
+	if got := atomic.LoadInt32(&deleteCalls); got != 0 {
+		t.Errorf("Bootstrap failure must NOT trigger server-side DELETE; got %d", got)
 	}
 }
 
@@ -356,11 +367,21 @@ func TestWorkerInstallUnsupportedOS(t *testing.T) {
 }
 
 func TestWorkerInstallNoLingerFlagPropagates(t *testing.T) {
+	// Mode 4 setup (clean install: empty server list, no local config)
+	// so we exercise the path that actually builds `opts` from the flag
+	// and threads it through to Bootstrap. Earlier the test used a
+	// preseeded server record, which masked any regression in the opts-
+	// build path because Mode 1/3 short-circuit before opts construction
+	// was relevant to the test's intent.
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.Method {
 		case http.MethodGet:
 			writer.Header().Set("Content-Type", "application/json")
-			writer.Write([]byte(`{"workers":[{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme"}]}`))
+			writer.Write([]byte(`{"workers":[]}`))
+		case http.MethodPost:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusCreated)
+			writer.Write([]byte(`{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme","created_at":"2026-05-04T12:00:00Z"}`))
 		default:
 			http.NotFound(writer, request)
 		}
@@ -382,8 +403,98 @@ func TestWorkerInstallNoLingerFlagPropagates(t *testing.T) {
 	if !fake.gotNoLinger {
 		t.Errorf("--no-linger should propagate to opts.NoLinger=true")
 	}
-	// Reset for next test invocation in suite.
-	workerInstallNoLinger = false
+}
+
+// TestWorkerInstallNonInteractiveFlagPropagates exercises the
+// --non-interactive flag in isolation (no --no-linger). On linux the
+// flag is the non-aliased name for the same NoLinger semantic — either
+// flag set OR'd should produce NoLinger=true.
+func TestWorkerInstallNonInteractiveFlagPropagates(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[]}`))
+		case http.MethodPost:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusCreated)
+			writer.Write([]byte(`{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme","created_at":"2026-05-04T12:00:00Z"}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stub.URL) + "/ws",
+		CurrentContext: "team:team-acme",
+	})
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+
+	if _, err := runCmd(t, "worker", "install", "alpha", "--non-interactive"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if !fake.gotNoLinger {
+		t.Errorf("--non-interactive (alone) should propagate to opts.NoLinger=true")
+	}
+}
+
+// TestWorkerInstallDarwinWarnsOnNoLingerFlags asserts that on macOS the
+// linger-related flags emit a stderr warning rather than silently
+// vanishing. The Bootstrap call is still issued (the launchd adapter
+// ignores NoLinger), but scripted callers parsing stderr can detect
+// the misuse.
+func TestWorkerInstallDarwinWarnsOnNoLingerFlags(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin-only behavior; runtime.GOOS is " + runtime.GOOS)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[]}`))
+		case http.MethodPost:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusCreated)
+			writer.Write([]byte(`{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme","created_at":"2026-05-04T12:00:00Z"}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	cases := []struct {
+		name     string
+		flag     string
+		wantText string
+	}{
+		{"no-linger on darwin", "--no-linger", "--no-linger has no effect on macOS"},
+		{"non-interactive on darwin", "--non-interactive", "--non-interactive has no effect on macOS"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			resetWorkerState(t, &config.Config{
+				AuthToken:      "tok",
+				ServerURL:      httpToWS(stub.URL) + "/ws",
+				CurrentContext: "team:team-acme",
+			})
+			fake := &fakeServiceInstaller{}
+			withFakeInstaller(t, fake)
+
+			out, err := runCmd(t, "worker", "install", "alpha", testCase.flag)
+			if err != nil {
+				t.Fatalf("install: %v", err)
+			}
+			// runCmd returns combined stdout+stderr — assert the warning
+			// is present without being strict about exact byte position.
+			if !strings.Contains(out, testCase.wantText) {
+				t.Errorf("expected darwin warning %q in output, got: %s", testCase.wantText, out)
+			}
+		})
+	}
 }
 
 // Sanity check the OS-dispatch factory at runtime for the host platform —
@@ -436,6 +547,23 @@ func TestWorkerURLForConfigured(t *testing.T) {
 			subdomain: "alpha--team",
 			want:      "https://tunnels.example.com/alpha--team",
 		},
+		{
+			// Dev/staging splits sometimes pin api.* on a non-default
+			// port. We deliberately do NOT strip "api." in that case
+			// because rewriting `api.example.com:8443` to
+			// `<sub>.example.com:8443` would silently change the
+			// host's intent. Fall back to /<subdomain>.
+			name:      "api host with explicit port falls back to path form",
+			serverURL: "https://api.example.com:8443/ws",
+			subdomain: "build--acme",
+			want:      "https://api.example.com:8443/build--acme",
+		},
+		{
+			name:      "api host with explicit port wss scheme",
+			serverURL: "wss://api.example.com:8443/ws",
+			subdomain: "build--acme",
+			want:      "https://api.example.com:8443/build--acme",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -447,5 +575,18 @@ func TestWorkerURLForConfigured(t *testing.T) {
 				t.Errorf("workerURL(%q, %q) = %q, want %q", tc.serverURL, tc.subdomain, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestWorkerURLEmptySubdomain locks in the empty-subdomain guard. A
+// caller that forgets to pass a subdomain should get a deterministic
+// error instead of a malformed URL with a leading dot.
+func TestWorkerURLEmptySubdomain(t *testing.T) {
+	got, err := workerURL("wss://api.justtunnel.dev/ws", "")
+	if err == nil {
+		t.Fatalf("expected error for empty subdomain, got %q", got)
+	}
+	if !strings.Contains(err.Error(), "empty subdomain") {
+		t.Errorf("error should mention empty subdomain, got: %v", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"runtime"
@@ -89,6 +90,14 @@ func unsupportedOSError(goos string) error {
 // reset in tests via t.Cleanup.
 var workerInstallNoLinger bool
 
+// workerInstallNonInteractive is the --non-interactive flag. On linux it
+// has the same effect as --no-linger (skip the user-linger consent
+// prompt; worker becomes session-bound). On darwin it has no effect
+// (launchd-user agents survive logout natively); we emit a stderr
+// warning when the flag is set on darwin to avoid silently misleading
+// scripted callers. Either flag set OR'd produces NoLinger=true.
+var workerInstallNonInteractive bool
+
 var workerInstallCmd = &cobra.Command{
 	Use:   "install <name>",
 	Short: "Install a worker as a managed background service (one-liner)",
@@ -103,6 +112,8 @@ var workerInstallCmd = &cobra.Command{
 func init() {
 	workerInstallCmd.Flags().BoolVar(&workerInstallNoLinger, "no-linger", false,
 		"(linux) skip the systemd user-linger consent prompt; worker becomes session-bound")
+	workerInstallCmd.Flags().BoolVar(&workerInstallNonInteractive, "non-interactive", false,
+		"never prompt; on linux equivalent to --no-linger; on macOS has no effect")
 	workerCmd.AddCommand(workerInstallCmd)
 }
 
@@ -133,6 +144,21 @@ func runWorkerInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// On macOS, --no-linger and --non-interactive are no-ops because
+	// launchd-user agents already survive logout natively. We surface a
+	// stderr warning rather than silently ignoring the flag so scripted
+	// callers can see the misuse without breaking stdout-keyed parsers.
+	if runtime.GOOS == "darwin" {
+		if workerInstallNoLinger {
+			fmt.Fprintln(cmd.ErrOrStderr(),
+				"warning: --no-linger has no effect on macOS (launchd-user agents survive logout natively)")
+		}
+		if workerInstallNonInteractive {
+			fmt.Fprintln(cmd.ErrOrStderr(),
+				"warning: --non-interactive has no effect on macOS (launchd-user agents survive logout natively)")
+		}
+	}
+
 	// Bootstrap the supervisor. On Bootstrap failure we deliberately do
 	// NOT roll back the server-side worker — the operator can re-run
 	// `worker install` (idempotent) once they've fixed the underlying
@@ -140,7 +166,12 @@ func runWorkerInstall(cmd *cobra.Command, args []string) error {
 	// rolling back here would make the failure mode worse for the common
 	// case where the issue is local (e.g. launchctl already in a wedged
 	// state) and a retry would succeed.
-	opts := installer.SystemdOptions{NoLinger: workerInstallNoLinger}
+	//
+	// NoLinger is the OR of --no-linger and --non-interactive: either
+	// flag means the operator opted out of the user-linger consent
+	// prompt. The systemd installer treats NoLinger=true as
+	// session-bound (worker dies on logout) — same semantics either way.
+	opts := installer.SystemdOptions{NoLinger: workerInstallNoLinger || workerInstallNonInteractive}
 	if _, err := svc.Bootstrap(cmd.Context(), name, opts); err != nil {
 		return fmt.Errorf("install: bootstrap supervisor for %q failed; retry with `justtunnel worker install %s` or `justtunnel worker uninstall %s` to roll back: %w",
 			name, name, name, err)
@@ -172,7 +203,7 @@ func runWorkerInstall(cmd *cobra.Command, args []string) error {
 //
 // Returns the worker record that should be used for the success summary
 // (the one that genuinely lives on disk after this call returns).
-func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, warnOut interface{ Write([]byte) (int, error) }) (*worker.Config, error) {
+func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, warnOut io.Writer) (*worker.Config, error) {
 	localCfg, localErr := worker.Read(name)
 	hasLocal := localErr == nil
 	if localErr != nil && !errors.Is(localErr, os.ErrNotExist) {
@@ -205,11 +236,24 @@ func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, wa
 		// overwrite local. Reuse worker_create's create+rollback
 		// pattern: if local Write fails after server POST, DELETE
 		// the just-created server record.
-		return createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name)
+		//
+		// NOTE: we deliberately do NOT attempt to delete a stale
+		// server-side worker that may have a different ID. Without
+		// auth-time identity verification, attempting cleanup risks
+		// deleting an unrelated worker (e.g. one a teammate created
+		// under a colliding name in a separate session). The orphan
+		// record (if any) will be reaped server-side via the
+		// retention/quarantine reaper. This is an intentional
+		// trade-off: leak-prefer over potential cross-user damage.
+		fmt.Fprintf(warnOut,
+			"note: local config exists for %q but server has no record; re-creating on server\n", name)
+		return createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name, warnOut)
 
 	case !hasLocal && serverRecord != nil:
 		// Mode 3: hydrate local from server. No POST needed.
-		hydrated := workerAPIToConfig(serverRecord, ctxName)
+		fmt.Fprintf(warnOut,
+			"note: hydrating local config for %q from existing server record\n", name)
+		hydrated := workerAPIToConfig(serverRecord, ctxName, warnOut)
 		if writeErr := worker.Write(hydrated); writeErr != nil {
 			return nil, fmt.Errorf("hydrate local config from server: %w", writeErr)
 		}
@@ -217,7 +261,7 @@ func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, wa
 
 	default:
 		// Mode 4: clean install.
-		return createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name)
+		return createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name, warnOut)
 	}
 }
 
@@ -225,13 +269,21 @@ func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, wa
 // local-write failure rolls back the server-side create. Mirrors the helper
 // shape used by runWorkerCreate; could be DRY'd further in a follow-up by
 // extracting a single shared helper between both call sites.
-func createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name string) (*worker.Config, error) {
+func createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name string, warnOut io.Writer) (*worker.Config, error) {
 	created, err := postWorker(baseURL, authToken, teamID, name)
 	if err != nil {
 		return nil, err
 	}
 	createdAt, parseErr := time.Parse(time.RFC3339, created.CreatedAt)
 	if parseErr != nil {
+		// Mirror worker_create.go: surface server-side timestamp
+		// regressions on stderr instead of silently substituting
+		// time.Now(). Local config is a CLI-side convenience, not a
+		// source of truth, so we still proceed.
+		fmt.Fprintf(warnOut,
+			"warning: server returned unparseable created_at %q; using current time\n",
+			created.CreatedAt,
+		)
 		createdAt = time.Now().UTC()
 	}
 	cfg := &worker.Config{
@@ -257,9 +309,15 @@ func createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name string
 
 // workerAPIToConfig copies the server's view of a worker into the on-disk
 // schema. Used by the "hydrate local from server" idempotency branch.
-func workerAPIToConfig(api *workerAPI, ctxName string) *worker.Config {
+func workerAPIToConfig(api *workerAPI, ctxName string, warnOut io.Writer) *worker.Config {
 	createdAt, parseErr := time.Parse(time.RFC3339, api.CreatedAt)
 	if parseErr != nil {
+		if warnOut != nil {
+			fmt.Fprintf(warnOut,
+				"warning: server returned unparseable created_at %q; using current time\n",
+				api.CreatedAt,
+			)
+		}
 		createdAt = time.Now().UTC()
 	}
 	return &worker.Config{
@@ -290,11 +348,21 @@ func serviceBackendForOS(goos string) string {
 // configured server URL. The transformation is:
 //
 //   - Convert ws/wss → http/https.
-//   - If the host begins with "api." AND the URL has no non-root path,
-//     strip the "api." prefix and prepend "<subdomain>.".
+//   - If the host begins with "api." AND the URL carries no port, strip
+//     the "api." prefix and prepend "<subdomain>.".
 //     e.g. wss://api.justtunnel.dev/ws + "build--acme" → https://build--acme.justtunnel.dev
-//   - Otherwise (localhost, custom domain, non-standard host), fall back
-//     to "<server>/<subdomain>" — less polished but always meaningful.
+//   - Otherwise (localhost, custom domain, "api."-prefixed host with an
+//     explicit port like dev/staging splits, or any non-standard host),
+//     fall back to "<server>/<subdomain>" — less polished but always
+//     meaningful and unambiguous.
+//
+// Note: the "api." strip ONLY kicks in when no port is present.
+// Production hosts are bare; "api.example.com:8443" indicates a
+// dev/staging environment where the operator deliberately pinned a
+// port, and rewriting `api.example.com:8443` to
+// `<sub>.example.com:8443` would silently lose that signal. We instead
+// keep the original host and append "/<subdomain>" so the result still
+// resolves something the operator can click through to.
 //
 // This lives in cmd because it's a CLI display concern, not a server URL
 // rule. If the URL shape ever moves into the worker config (e.g. as
