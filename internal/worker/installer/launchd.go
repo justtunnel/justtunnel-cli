@@ -116,14 +116,14 @@ func Label(workerName string) string { return launchctl.Label(workerName) }
 // in explicitly so the function is pure; the only XML-escaping done is via
 // text/template's default escaping (sufficient for path strings, which are
 // the only attacker-influenced fields, and even those are validated upstream
-// by worker.validateName / filesystem-safe path resolution).
+// by worker.ValidateName / filesystem-safe path resolution).
 //
 // To keep the function safe against pathological inputs, paths containing
 // XML metacharacters (<, >, &, ") are rejected — launchd plists are XML
 // and a path with embedded angle brackets is almost certainly an attack
 // rather than a real macOS path.
 func (l *LaunchdInstaller) RenderPlist(workerName, binaryPath, logPath string) ([]byte, error) {
-	if err := validateWorkerName(workerName); err != nil {
+	if err := worker.ValidateName(workerName); err != nil {
 		return nil, err
 	}
 	if err := validatePlistPath("binary path", binaryPath); err != nil {
@@ -149,7 +149,7 @@ func (l *LaunchdInstaller) RenderPlist(workerName, binaryPath, logPath string) (
 // will be written: ~/Library/LaunchAgents/dev.justtunnel.worker.<name>.plist.
 // The LaunchAgents directory is NOT created here; Bootstrap creates it.
 func (l *LaunchdInstaller) PlistPath(workerName string) (string, error) {
-	if err := validateWorkerName(workerName); err != nil {
+	if err := worker.ValidateName(workerName); err != nil {
 		return "", err
 	}
 	homeDir, err := l.homeDir()
@@ -171,7 +171,7 @@ func (l *LaunchdInstaller) PlistPath(workerName string) (string, error) {
 //     bootout-then-retry once (idempotent contract)
 //  7. launchctl enable gui/<uid>/<label>
 func (l *LaunchdInstaller) Bootstrap(ctx context.Context, workerName string) error {
-	if err := validateWorkerName(workerName); err != nil {
+	if err := worker.ValidateName(workerName); err != nil {
 		return err
 	}
 	if _, err := worker.Read(workerName); err != nil {
@@ -205,10 +205,22 @@ func (l *LaunchdInstaller) Bootstrap(ctx context.Context, workerName string) err
 	bootstrapErr := l.runLaunchctl(ctx, "bootstrap", domain, plistPath)
 	if bootstrapErr != nil && isAlreadyLoaded(bootstrapErr) {
 		// Idempotent retry: bootout the existing target then bootstrap
-		// again. We deliberately ignore bootout failure here; if the
-		// state is genuinely broken the second bootstrap will surface it.
-		_ = l.runLaunchctl(ctx, "bootout", domain+"/"+Label(workerName))
+		// again. bootout failure is not fatal (the second bootstrap will
+		// surface a real problem) but we DO preserve it via errors.Join
+		// so a hung/broken state isn't silently swallowed.
+		bootoutErr := l.runLaunchctl(ctx, "bootout", domain+"/"+Label(workerName))
+		// If the caller cancelled while bootout was running, report the
+		// ctx error directly rather than a confusing "bootstrap failed"
+		// wrap — caller intent (cancellation) takes precedence.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		bootstrapErr = l.runLaunchctl(ctx, "bootstrap", domain, plistPath)
+		if bootstrapErr != nil && bootoutErr != nil {
+			// Surface BOTH errors so an operator debugging a stuck
+			// retry sees what bootout said too.
+			bootstrapErr = errors.Join(bootstrapErr, fmt.Errorf("preceding bootout also failed: %w", bootoutErr))
+		}
 	}
 	if bootstrapErr != nil {
 		return fmt.Errorf("installer: launchctl bootstrap: %w", bootstrapErr)
@@ -224,7 +236,7 @@ func (l *LaunchdInstaller) Bootstrap(ctx context.Context, workerName string) err
 // successful no-op so callers can run unbootstrap unconditionally during
 // teardown.
 func (l *LaunchdInstaller) Unbootstrap(ctx context.Context, workerName string) error {
-	if err := validateWorkerName(workerName); err != nil {
+	if err := worker.ValidateName(workerName); err != nil {
 		return err
 	}
 	uid := strconv.Itoa(l.geteuid())
@@ -243,44 +255,74 @@ func (l *LaunchdInstaller) Unbootstrap(ctx context.Context, workerName string) e
 }
 
 // runLaunchctl invokes `launchctl <args...>` via Runner. The combined output
-// is folded into the returned error so callers (and isAlreadyLoaded /
-// isNotLoaded) can pattern-match on launchctl's stderr text.
+// AND exit code are folded into the returned error so the classifiers (
+// isAlreadyLoaded / isNotLoaded) can match on either signal — macOS varies
+// which one carries the diagnostic.
+//
+// The exit code is extracted by unwrapping `*exec.ExitError`. Errors that
+// don't unwrap to one (e.g. process couldn't be started) report ExitCode=-1.
 func (l *LaunchdInstaller) runLaunchctl(ctx context.Context, args ...string) error {
 	out, err := l.Runner.Run(ctx, "launchctl", args...)
 	if err != nil {
+		exitCode := -1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else if coded, ok := err.(interface{ ExitCode() int }); ok {
+			// Test fakes implement ExitCode() without being *exec.ExitError.
+			exitCode = coded.ExitCode()
+		}
 		return &launchctlError{
-			Args:   args,
-			Output: string(out),
-			Err:    err,
+			Args:     args,
+			Output:   string(out),
+			ExitCode: exitCode,
+			Err:      err,
 		}
 	}
 	return nil
 }
 
-// launchctlError carries the combined output so error classifiers (e.g.
-// isAlreadyLoaded) can look at stderr text rather than relying solely on
-// exit codes, which launchctl uses inconsistently across macOS versions.
+// launchctlError carries combined output AND exit code so error classifiers
+// (isAlreadyLoaded / isNotLoaded) can match on whichever signal launchctl
+// surfaces — exit codes vary across macOS releases and wrapper invocations
+// sometimes drop them, while text strings vary across releases too.
 type launchctlError struct {
-	Args   []string
-	Output string
-	Err    error
+	Args     []string
+	Output   string
+	ExitCode int // -1 when the exit code couldn't be extracted.
+	Err      error
 }
 
 func (e *launchctlError) Error() string {
-	return fmt.Sprintf("launchctl %s: %v: %s", strings.Join(e.Args, " "), e.Err, strings.TrimSpace(e.Output))
+	return fmt.Sprintf("launchctl %s: exit %d: %v: %s", strings.Join(e.Args, " "), e.ExitCode, e.Err, strings.TrimSpace(e.Output))
 }
 
 func (e *launchctlError) Unwrap() error { return e.Err }
 
+// exitCodeAlreadyLoaded is the exit code launchctl most commonly emits for
+// "service already loaded" on recent macOS (Monterey+). Documented as best-
+// effort: the textual fallback below covers releases that report differently
+// or that wrap the failure in a different shell.
+const exitCodeAlreadyLoaded = 37
+
+// exitCodeNotLoaded is the launchctl exit code for "Could not find specified
+// service" (i.e. nothing to bootout). Stable on Monterey through Sequoia.
+const exitCodeNotLoaded = 113
+
 // isAlreadyLoaded matches the family of launchctl bootstrap failures meaning
-// "a service with this label is already loaded into the target domain". We
-// match on substrings of the combined output rather than on exit codes
-// because macOS has shipped at least three different exit codes for this
-// condition over the years.
+// "a service with this label is already loaded into the target domain".
+//
+// We check the exit code FIRST (cheapest, most reliable on modern macOS) and
+// fall back to substring matching on the combined output, because launchctl
+// has shipped at least three different exit codes for this condition over
+// the years and some wrapper invocations drop the exit code entirely.
 func isAlreadyLoaded(err error) bool {
 	var launchctlErr *launchctlError
 	if !errors.As(err, &launchctlErr) {
 		return false
+	}
+	if launchctlErr.ExitCode == exitCodeAlreadyLoaded {
+		return true
 	}
 	out := strings.ToLower(launchctlErr.Output)
 	switch {
@@ -295,12 +337,18 @@ func isAlreadyLoaded(err error) bool {
 }
 
 // isNotLoaded matches launchctl bootout's "no such service" / "could not
-// find specified service" failure modes. Same rationale as isAlreadyLoaded
-// for matching on output instead of exit code.
+// find specified service" failure modes.
+//
+// Exit code 113 is the canonical signal on Monterey+; we check it first and
+// fall back to substring matching for releases or wrapper invocations that
+// emit only the textual diagnostic.
 func isNotLoaded(err error) bool {
 	var launchctlErr *launchctlError
 	if !errors.As(err, &launchctlErr) {
 		return false
+	}
+	if launchctlErr.ExitCode == exitCodeNotLoaded {
+		return true
 	}
 	out := strings.ToLower(launchctlErr.Output)
 	switch {
@@ -354,32 +402,6 @@ func resolveExecutable() (string, error) {
 		return binaryPath, nil
 	}
 	return resolved, nil
-}
-
-// validateWorkerName re-applies the worker package's name regex without
-// exporting it. We can't import worker.validateName (unexported), but the
-// pattern is part of the cross-package contract so it's mirrored here.
-// If you change one, change the other (and the server-side validator).
-func validateWorkerName(name string) error {
-	if name == "" {
-		return errors.New("installer: empty worker name")
-	}
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= '0' && r <= '9':
-		case r == '-':
-		default:
-			return fmt.Errorf("installer: invalid worker name %q (lowercase alphanumeric and hyphen only)", name)
-		}
-	}
-	if name[0] == '-' {
-		return fmt.Errorf("installer: invalid worker name %q (must start with [a-z0-9])", name)
-	}
-	if len(name) > 63 {
-		return fmt.Errorf("installer: invalid worker name %q (max 63 chars)", name)
-	}
-	return nil
 }
 
 // validatePlistPath rejects paths containing XML metacharacters. Real

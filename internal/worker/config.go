@@ -41,13 +41,22 @@ var nameRegexp = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 // homeEnvVar lets tests redirect the storage root to a temp directory.
 const homeEnvVar = "JUSTTUNNEL_HOME"
 
-// validateName returns an error if name does not match the strict pattern.
-func validateName(name string) error {
+// ValidateName returns an error if name does not match the strict worker-name
+// pattern (`^[a-z0-9][a-z0-9-]{0,62}$`). Exported so cross-package callers
+// (e.g. internal/worker/installer) share a single source of truth instead of
+// mirroring the regex. If you change the pattern here, also update the
+// server-side validator in justtunnel-server.
+func ValidateName(name string) error {
 	if !nameRegexp.MatchString(name) {
 		return fmt.Errorf("worker: invalid name %q (must match %s)", name, nameRegexp)
 	}
 	return nil
 }
+
+// validateName is the package-local alias retained so existing call sites
+// (Read, Write, runner, logfile) keep their short names. New cross-package
+// callers should use ValidateName.
+func validateName(name string) error { return ValidateName(name) }
 
 // home returns the JustTunnel home directory: $JUSTTUNNEL_HOME if set,
 // otherwise ~/.justtunnel. The directory is NOT created here.

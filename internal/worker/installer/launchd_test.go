@@ -2,6 +2,7 @@ package installer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -102,8 +103,8 @@ func TestRenderPlist_RejectsBadInputs(t *testing.T) {
 		label                              string
 		name, binaryPath, logPath, wantSub string
 	}{
-		{"bad name", "Bad_Name", "/bin/x", "/tmp/x.log", "invalid worker name"},
-		{"empty name", "", "/bin/x", "/tmp/x.log", "empty worker name"},
+		{"bad name", "Bad_Name", "/bin/x", "/tmp/x.log", "invalid name"},
+		{"empty name", "", "/bin/x", "/tmp/x.log", "invalid name"},
 		{"xml in binary path", "ok", "/bin/x<evil>", "/tmp/x.log", "binary path"},
 		{"xml in log path", "ok", "/bin/x", "/tmp/x&y.log", "log path"},
 		{"empty binary path", "ok", "", "/tmp/x.log", "empty binary path"},
@@ -152,7 +153,29 @@ func seedWorkerConfig(t *testing.T, name string) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	payload := []byte(`{"worker_id":"w_abc","name":"` + name + `","context":"personal","subdomain":"foo","created_at":"2026-01-01T00:00:00Z","service_backend":"launchd"}` + "\n")
+	// Build the JSON via encoding/json rather than string concatenation so
+	// any future schema field added to worker.Config gets a typed touchpoint
+	// here (and so a name containing JSON metacharacters can never inject).
+	cfg := struct {
+		WorkerID       string `json:"worker_id"`
+		Name           string `json:"name"`
+		Context        string `json:"context"`
+		Subdomain      string `json:"subdomain"`
+		CreatedAt      string `json:"created_at"`
+		ServiceBackend string `json:"service_backend"`
+	}{
+		WorkerID:       "w_abc",
+		Name:           name,
+		Context:        "personal",
+		Subdomain:      "foo",
+		CreatedAt:      "2026-01-01T00:00:00Z",
+		ServiceBackend: "launchd",
+	}
+	payload, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	payload = append(payload, '\n')
 	if err := os.WriteFile(filepath.Join(dir, name+".json"), payload, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -344,12 +367,15 @@ func (ctxAwareRunner) Run(ctx context.Context, _ string, _ ...string) ([]byte, e
 	return nil, ctx.Err()
 }
 
-// fakeExitError is a stand-in for *exec.ExitError. Only its presence as
-// an error matters; the launchctlError carries the textual output we
-// classify on.
+// fakeExitError is a stand-in for *exec.ExitError. We can't construct a
+// real *exec.ExitError outside of os/exec, so the production code falls
+// back to a duck-typed `interface{ ExitCode() int }` check that this fake
+// satisfies. The launchctlError records both the exit code and the textual
+// output, and the classifiers (isAlreadyLoaded / isNotLoaded) consult both.
 type fakeExitError struct{ Code int }
 
-func (fakeExitError) Error() string { return "exit status" }
+func (fakeExitError) Error() string         { return "exit status" }
+func (exit fakeExitError) ExitCode() int    { return exit.Code }
 
 func equalArgs(left, right []string) bool {
 	if len(left) != len(right) {
@@ -382,6 +408,56 @@ func TestIsAlreadyLoaded_Variants(t *testing.T) {
 	}
 	if isAlreadyLoaded(errors.New("not a launchctl error")) {
 		t.Fatal("non-launchctl error should not match")
+	}
+}
+
+// TestIsAlreadyLoaded_ExitCodeOnly proves the classifier matches purely on
+// exit code 37, with empty output text. This is the path that mattered to
+// the BLOCKER fix: previous code only inspected the textual output, so a
+// macOS release/wrapper that emitted a different message but kept the exit
+// code would have caused Bootstrap to surface a real error instead of
+// retrying via bootout.
+func TestIsAlreadyLoaded_ExitCodeOnly(t *testing.T) {
+	err := &launchctlError{
+		Args:     []string{"bootstrap"},
+		Output:   "", // no diagnostic text at all
+		ExitCode: 37,
+		Err:      errors.New("exit status 37"),
+	}
+	if !isAlreadyLoaded(err) {
+		t.Fatal("isAlreadyLoaded should match exit code 37 even without text")
+	}
+}
+
+// TestIsNotLoaded_ExitCodeOnly is the bootout-side mirror: empty output but
+// exit code 113 must still classify as not-loaded so Unbootstrap stays
+// idempotent.
+func TestIsNotLoaded_ExitCodeOnly(t *testing.T) {
+	err := &launchctlError{
+		Args:     []string{"bootout"},
+		Output:   "",
+		ExitCode: 113,
+		Err:      errors.New("exit status 113"),
+	}
+	if !isNotLoaded(err) {
+		t.Fatal("isNotLoaded should match exit code 113 even without text")
+	}
+}
+
+// TestRunLaunchctl_ExtractsExitCode confirms the production code threads
+// the duck-typed exit code from the runner's error into launchctlError.
+// Without this, the new exit-code-first classification path is unreachable.
+func TestRunLaunchctl_ExtractsExitCode(t *testing.T) {
+	fake := &fakeRunner{}
+	fake.fallback = runResult{Output: []byte(""), Err: &fakeExitError{Code: 113}}
+	installer := &LaunchdInstaller{Runner: fake}
+	err := installer.runLaunchctl(context.Background(), "bootout", "gui/501/dev.justtunnel.worker.alpha")
+	var launchctlErr *launchctlError
+	if !errors.As(err, &launchctlErr) {
+		t.Fatalf("want *launchctlError, got %T: %v", err, err)
+	}
+	if launchctlErr.ExitCode != 113 {
+		t.Fatalf("ExitCode = %d, want 113", launchctlErr.ExitCode)
 	}
 }
 
