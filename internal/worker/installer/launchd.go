@@ -294,8 +294,14 @@ type launchctlError struct {
 	Err      error
 }
 
+// Error renders the launchctl invocation, exit code, inner error, and
+// trimmed output. D5: use e.Err.Error() instead of %v so that wrapping
+// further (errors.As + Unwrap) does not produce a doubled error chain
+// when the outer formatter expands %w into .Error() too. Keeps Unwrap()
+// available for chain traversal.
 func (e *launchctlError) Error() string {
-	return fmt.Sprintf("launchctl %s: exit %d: %v: %s", strings.Join(e.Args, " "), e.ExitCode, e.Err, strings.TrimSpace(e.Output))
+	return fmt.Sprintf("launchctl %s: exit %d: %s: %s",
+		strings.Join(e.Args, " "), e.ExitCode, e.Err.Error(), strings.TrimSpace(e.Output))
 }
 
 func (e *launchctlError) Unwrap() error { return e.Err }

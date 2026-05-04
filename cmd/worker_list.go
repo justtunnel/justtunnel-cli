@@ -38,7 +38,7 @@ func runWorkerList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	serverWorkers, err := fetchWorkers(baseURL, cfg.AuthToken, teamID)
+	serverWorkers, err := fetchWorkers(cmd.Context(), baseURL, cfg.AuthToken, teamID)
 	if err != nil {
 		return err
 	}

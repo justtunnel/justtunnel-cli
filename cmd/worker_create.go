@@ -40,7 +40,7 @@ func runWorkerCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	created, err := createServerSideAndPersist(baseURL, cfg.AuthToken, teamID, ctxName, name, cmd.ErrOrStderr())
+	created, err := createServerSideAndPersist(cmd.Context(), baseURL, cfg.AuthToken, teamID, ctxName, name, cmd.ErrOrStderr())
 	if err != nil {
 		return err
 	}

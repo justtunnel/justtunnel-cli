@@ -53,6 +53,17 @@ func LingerDeniedNotice(workerName string) string {
 	return fmt.Sprintf(LingerDeniedNoticeFormat, workerName)
 }
 
+// ErrLingerOnly is returned by Bootstrap when the unit was successfully
+// installed and enabled but linger configuration failed (e.g. loginctl
+// permission denied, dbus unreachable, current-user lookup failed). The
+// caller should treat this as "install succeeded, with caveat" and print
+// a warning rather than aborting.
+//
+// D3: callers (cmd/worker_install.go) check via errors.Is(err, ErrLingerOnly)
+// to decide between "install failed" (other errors) and "install succeeded
+// but worker is session-bound" (this sentinel).
+var ErrLingerOnly = errors.New("worker installed but linger configuration failed")
+
 // LingerPrompter prints the linger consent text and reads the user's
 // response. Production callers use NewStdLingerPrompter; tests inject a
 // fake so consent flow can be exercised without touching stdin.
@@ -342,10 +353,11 @@ func (s *SystemdInstaller) Bootstrap(ctx context.Context, workerName string, opt
 
 	username, userErr := s.currentUser()
 	if userErr != nil {
-		// We can't enable linger without a username. Fall through to
-		// the deny-path notice rather than failing the whole install.
+		// D3: unit is installed; we just couldn't probe / enable linger.
+		// Wrap with ErrLingerOnly so cmd/worker_install.go can downgrade
+		// this to a warning via errors.Is rather than aborting.
 		return SystemdResult{LingerEnabled: false, ShouldPrintLingerDeniedNotice: true},
-			fmt.Errorf("installer: resolve current user (worker installed but linger NOT configured): %w", userErr)
+			fmt.Errorf("installer: resolve current user: %v: %w", userErr, ErrLingerOnly)
 	}
 
 	alreadyOn, lingerErr := s.lingerEnabled(ctx, username)
@@ -363,18 +375,23 @@ func (s *SystemdInstaller) Bootstrap(ctx context.Context, workerName string, opt
 
 	consent, promptErr := s.Prompter.Prompt(ctx)
 	if promptErr != nil {
+		// D3: unit installed; only the linger prompt failed. Mark with
+		// ErrLingerOnly so cmd downgrades to a warning.
 		return SystemdResult{LingerEnabled: false, ShouldPrintLingerDeniedNotice: true},
-			fmt.Errorf("installer: linger prompt failed (worker installed but linger NOT configured): %w", promptErr)
+			fmt.Errorf("installer: linger prompt failed: %v: %w", promptErr, ErrLingerOnly)
 	}
 	if !consent {
 		return SystemdResult{LingerEnabled: false, ShouldPrintLingerDeniedNotice: true}, nil
 	}
 
 	if err := s.runLoginctl(ctx, "enable-linger", username); err != nil {
-		// Most common failure: permissions. Worker is still installed
-		// and enabled; we just couldn't make it session-independent.
+		// D3: most common failure is permissions. The unit IS installed
+		// and enabled; only `loginctl enable-linger` failed. Wrap with
+		// ErrLingerOnly so cmd/worker_install.go treats this as a
+		// non-fatal warning (worker is session-bound, see `man loginctl`)
+		// rather than an install failure.
 		return SystemdResult{LingerEnabled: false, ShouldPrintLingerDeniedNotice: true},
-			fmt.Errorf("installer: loginctl enable-linger %s failed (worker is installed but session-bound; see `man loginctl`): %w", username, err)
+			fmt.Errorf("installer: loginctl enable-linger %s failed: %v: %w", username, err, ErrLingerOnly)
 	}
 	return SystemdResult{LingerEnabled: true}, nil
 }
@@ -502,8 +519,12 @@ type systemctlError struct {
 	Err      error
 }
 
+// Error mirrors launchctlError.Error in shape. D5: use e.Err.Error()
+// instead of %v to avoid double formatting when the outer caller wraps
+// with %w. Unwrap() remains the canonical chain-traversal path.
 func (e *systemctlError) Error() string {
-	return fmt.Sprintf("%s %s: exit %d: %v: %s", e.Bin, strings.Join(e.Args, " "), e.ExitCode, e.Err, strings.TrimSpace(e.Output))
+	return fmt.Sprintf("%s %s: exit %d: %s: %s",
+		e.Bin, strings.Join(e.Args, " "), e.ExitCode, e.Err.Error(), strings.TrimSpace(e.Output))
 }
 
 func (e *systemctlError) Unwrap() error { return e.Err }

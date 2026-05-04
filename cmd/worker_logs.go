@@ -86,7 +86,7 @@ func runWorkerLogs(cmd *cobra.Command, args []string) error {
 		}
 		ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
-		return followActive(ctx, out, activePath)
+		return followActive(ctx, out, cmd.ErrOrStderr(), activePath)
 	default:
 		if activeMissing {
 			fmt.Fprintf(cmd.ErrOrStderr(),
@@ -179,7 +179,7 @@ func printTail(out io.Writer, path string, lines int) error {
 //
 // We poll instead of using fsnotify to avoid pulling in a third-party dep
 // for a feature whose 250ms latency target is already inode-poll friendly.
-func followActive(ctx context.Context, out io.Writer, path string) error {
+func followActive(ctx context.Context, out, errOut io.Writer, path string) error {
 	file, info, err := openForFollow(path)
 	if err != nil {
 		return err
@@ -228,7 +228,9 @@ func followActive(ctx context.Context, out io.Writer, path string) error {
 				if drainErr := drainInto(ctx, out, file, buffer); drainErr != nil &&
 					!errors.Is(drainErr, context.Canceled) &&
 					!errors.Is(drainErr, context.DeadlineExceeded) {
-					fmt.Fprintf(os.Stderr, "worker logs: drain pre-swap: %v\n", drainErr)
+					// D4: route to cobra's stderr so test harnesses
+					// that capture cmd.ErrOrStderr() see this warning.
+					fmt.Fprintf(errOut, "worker logs: drain pre-swap: %v\n", drainErr)
 				}
 				_ = file.Close()
 			}

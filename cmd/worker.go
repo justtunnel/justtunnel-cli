@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -113,11 +114,21 @@ func loadWorkerEnv() (cfg *config.Config, teamID, ctxName, baseURL string, err e
 // httpDo performs an authenticated request and returns body + status. The
 // caller decides how to interpret status. Body reads are bounded so a
 // hostile server cannot OOM the CLI.
-func httpDo(method, url, authToken string, body io.Reader) (int, []byte, error) {
+//
+// D1: ctx threads through to client.Do via req.WithContext so a SIGINT
+// during a long-running HTTP call (slow server, hung TLS handshake)
+// cancels the in-flight request rather than blocking until httpTimeout.
+// Pass cmd.Context() from cobra handlers; pass context.Background() from
+// non-cobra callers (rare).
+func httpDo(ctx context.Context, method, url, authToken string, body io.Reader) (int, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
 		return 0, nil, fmt.Errorf("build request: %w", err)
 	}
+	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+authToken)
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -159,13 +170,13 @@ func extractServerError(body []byte) string {
 
 // postWorker calls POST /api/teams/{teamID}/workers and returns the parsed
 // worker. Non-2xx responses surface as errors with the server's message.
-func postWorker(baseURL, authToken, teamID, name string) (*workerAPI, error) {
+func postWorker(ctx context.Context, baseURL, authToken, teamID, name string) (*workerAPI, error) {
 	// json.Marshal on a map[string]string with a literal key cannot fail
 	// (no unsupported types possible). Explicit `_ =` documents the
 	// intentional discard.
 	body, _ := json.Marshal(map[string]string{"name": name})
 	url := baseURL + "/api/teams/" + teamID + "/workers"
-	status, raw, err := httpDo(http.MethodPost, url, authToken, bytes.NewReader(body))
+	status, raw, err := httpDo(ctx, http.MethodPost, url, authToken, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -180,9 +191,9 @@ func postWorker(baseURL, authToken, teamID, name string) (*workerAPI, error) {
 }
 
 // fetchWorkers calls GET /api/teams/{teamID}/workers.
-func fetchWorkers(baseURL, authToken, teamID string) ([]workerAPI, error) {
+func fetchWorkers(ctx context.Context, baseURL, authToken, teamID string) ([]workerAPI, error) {
 	url := baseURL + "/api/teams/" + teamID + "/workers"
-	status, raw, err := httpDo(http.MethodGet, url, authToken, nil)
+	status, raw, err := httpDo(ctx, http.MethodGet, url, authToken, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -199,9 +210,9 @@ func fetchWorkers(baseURL, authToken, teamID string) ([]workerAPI, error) {
 // deleteWorker calls DELETE /api/teams/{teamID}/workers/{workerID}.
 // Returns (notFound=true, nil) on 404 so the caller can treat it as
 // already-deleted and continue local cleanup.
-func deleteWorker(baseURL, authToken, teamID, workerID string) (notFound bool, err error) {
+func deleteWorker(ctx context.Context, baseURL, authToken, teamID, workerID string) (notFound bool, err error) {
 	url := baseURL + "/api/teams/" + teamID + "/workers/" + workerID
-	status, raw, err := httpDo(http.MethodDelete, url, authToken, nil)
+	status, raw, err := httpDo(ctx, http.MethodDelete, url, authToken, nil)
 	if err != nil {
 		return false, err
 	}

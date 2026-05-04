@@ -323,8 +323,10 @@ func TestBootstrap_EnableLingerFails_InstallStillSucceeds(t *testing.T) {
 	if !strings.Contains(err.Error(), "loginctl") {
 		t.Fatalf("error %q should mention loginctl", err)
 	}
-	if !strings.Contains(err.Error(), "man loginctl") {
-		t.Fatalf("error %q should hint at man loginctl", err)
+	// D3: enable-linger failures wrap ErrLingerOnly so the cmd layer
+	// can downgrade them to a warning rather than a hard error.
+	if !errors.Is(err, ErrLingerOnly) {
+		t.Fatalf("error %q should wrap ErrLingerOnly", err)
 	}
 	if result.LingerEnabled {
 		t.Fatal("LingerEnabled should be false on enable-linger failure")
@@ -701,6 +703,27 @@ func TestBootstrap_Idempotent_LingerAlreadyEnabledOnRerun(t *testing.T) {
 		if call.Name == "loginctl" && len(call.Args) > 0 && call.Args[0] == "enable-linger" {
 			t.Fatalf("run 2: enable-linger should not be called; got %+v", call)
 		}
+	}
+}
+
+// TestSystemctlError_NoDoubleErrText is the systemctl sibling of
+// TestLaunchctlError_NoDoubleErrText (D5). Same shape, same expectation.
+func TestSystemctlError_NoDoubleErrText(t *testing.T) {
+	inner := errors.New("inner-systemctl-marker")
+	wrapped := &systemctlError{
+		Bin:      "systemctl",
+		Args:     []string{"--user", "enable", "x.service"},
+		Output:   "Failed to enable",
+		ExitCode: 1,
+		Err:      inner,
+	}
+	got := wrapped.Error()
+	count := strings.Count(got, "inner-systemctl-marker")
+	if count != 1 {
+		t.Fatalf("inner error appears %d times in %q; want exactly 1", count, got)
+	}
+	if !errors.Is(wrapped, inner) {
+		t.Fatalf("Unwrap chain broken: %q", got)
 	}
 }
 

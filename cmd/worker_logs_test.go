@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,7 +171,7 @@ func TestWorkerLogsFollowSeesNewWritesAndRotation(t *testing.T) {
 	go func() {
 		defer done.Done()
 		defer pipeWriter.Close()
-		followErr = followActive(ctx, pipeWriter, activePath)
+		followErr = followActive(ctx, pipeWriter, io.Discard, activePath)
 	}()
 
 	// Read from the pipe in another goroutine into a buffer the test inspects.
@@ -419,7 +420,7 @@ func TestWorkerLogsFollowExitsPromptlyUnderHighWriteThroughput(t *testing.T) {
 	followDone := make(chan error, 1)
 	go func() {
 		defer pipeWriter.Close()
-		followDone <- followActive(ctx, pipeWriter, activePath)
+		followDone <- followActive(ctx, pipeWriter, io.Discard, activePath)
 	}()
 
 	// Let the follow goroutine spin up and start draining.

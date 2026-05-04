@@ -156,7 +156,7 @@ func runWorkerInstall(cmd *cobra.Command, args []string) error {
 	// collapsed into a single ensureWorkerRegistered call; it returns the
 	// authoritative worker record (whichever side already had it) and a
 	// flag indicating whether a POST was issued (for the success summary).
-	record, err := ensureWorkerRegistered(baseURL, cfg.AuthToken, teamID, ctxName, name, cmd.ErrOrStderr())
+	record, err := ensureWorkerRegistered(cmd.Context(), baseURL, cfg.AuthToken, teamID, ctxName, name, cmd.ErrOrStderr())
 	if err != nil {
 		return err
 	}
@@ -191,8 +191,17 @@ func runWorkerInstall(cmd *cobra.Command, args []string) error {
 	opts := installer.SystemdOptions{NoLinger: workerInstallNoLinger || workerInstallNonInteractive}
 	bootstrapResult, err := svc.Bootstrap(cmd.Context(), name, opts)
 	if err != nil {
-		return fmt.Errorf("install: bootstrap supervisor for %q failed; retry with `justtunnel worker install %s` or `justtunnel worker uninstall %s` to roll back: %w",
-			name, name, name, err)
+		// D3: ErrLingerOnly means the unit IS installed; only the
+		// system-wide linger configuration failed. Treat as success-with-
+		// warning rather than a hard error so the operator's worker is
+		// still usable in the current session.
+		if errors.Is(err, installer.ErrLingerOnly) {
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"warning: worker installed but linger configuration failed: %v\n", err)
+		} else {
+			return fmt.Errorf("install: bootstrap supervisor for %q failed; retry with `justtunnel worker install %s` or `justtunnel worker uninstall %s` to roll back: %w",
+				name, name, name, err)
+		}
 	}
 
 	// A3: ensure ServiceBackend reflects the supervisor that just took
@@ -249,7 +258,7 @@ func runWorkerInstall(cmd *cobra.Command, args []string) error {
 //
 // Returns the worker record that should be used for the success summary
 // (the one that genuinely lives on disk after this call returns).
-func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, warnOut io.Writer) (*worker.Config, error) {
+func ensureWorkerRegistered(ctx context.Context, baseURL, authToken, teamID, ctxName, name string, warnOut io.Writer) (*worker.Config, error) {
 	localCfg, localErr := worker.Read(name)
 	hasLocal := localErr == nil
 	if localErr != nil && !errors.Is(localErr, os.ErrNotExist) {
@@ -259,7 +268,7 @@ func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, wa
 		return nil, fmt.Errorf("read local worker config: %w", localErr)
 	}
 
-	servers, fetchErr := fetchWorkers(baseURL, authToken, teamID)
+	servers, fetchErr := fetchWorkers(ctx, baseURL, authToken, teamID)
 	if fetchErr != nil {
 		return nil, fmt.Errorf("list workers: %w", fetchErr)
 	}
@@ -293,7 +302,7 @@ func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, wa
 		// trade-off: leak-prefer over potential cross-user damage.
 		fmt.Fprintf(warnOut,
 			"note: local config exists for %q but server has no record; re-creating on server\n", name)
-		return createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name, warnOut)
+		return createServerSideAndPersist(ctx, baseURL, authToken, teamID, ctxName, name, warnOut)
 
 	case !hasLocal && serverRecord != nil:
 		// Mode 3: hydrate local from server. No POST needed.
@@ -307,7 +316,7 @@ func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, wa
 
 	default:
 		// Mode 4: clean install.
-		return createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name, warnOut)
+		return createServerSideAndPersist(ctx, baseURL, authToken, teamID, ctxName, name, warnOut)
 	}
 }
 
@@ -321,8 +330,8 @@ func ensureWorkerRegistered(baseURL, authToken, teamID, ctxName, name string, wa
 // We deliberately persist "none" here rather than serviceBackendForOS so a
 // crash AFTER write but BEFORE Bootstrap leaves the state truthful: there
 // is no supervisor managing this worker yet.
-func createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name string, warnOut io.Writer) (*worker.Config, error) {
-	created, err := postWorker(baseURL, authToken, teamID, name)
+func createServerSideAndPersist(ctx context.Context, baseURL, authToken, teamID, ctxName, name string, warnOut io.Writer) (*worker.Config, error) {
+	created, err := postWorker(ctx, baseURL, authToken, teamID, name)
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +366,7 @@ func createServerSideAndPersist(baseURL, authToken, teamID, ctxName, name string
 		ServiceBackend: "none",
 	}
 	if writeErr := worker.Write(cfg); writeErr != nil {
-		_, deleteErr := deleteWorker(baseURL, authToken, teamID, created.ID)
+		_, deleteErr := deleteWorker(ctx, baseURL, authToken, teamID, created.ID)
 		if deleteErr != nil {
 			return nil, fmt.Errorf(
 				"WARNING: server-side worker %q (id %s) created but local config write failed AND rollback also failed.\n"+

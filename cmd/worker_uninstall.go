@@ -121,7 +121,7 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 	// local delete only (server is not in play).
 	if workerUninstallDeleteOnServer && !workerUninstallForce {
 		// Server FIRST so a 403 leaves local state intact.
-		if serverErr := uninstallServerSide(baseURL, authToken, teamID, name, cmd.ErrOrStderr()); serverErr != nil {
+		if serverErr := uninstallServerSide(cmd.Context(), baseURL, authToken, teamID, name, cmd.ErrOrStderr()); serverErr != nil {
 			return &uninstallStepError{step: "server-side delete", err: serverErr}
 		}
 		// Server delete (or already-absent) succeeded; mark changed so
@@ -181,7 +181,7 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 		// server path is handled in the branch above): server-side
 		// delete.
 		if workerUninstallDeleteOnServer {
-			if deleteErr := uninstallServerSide(baseURL, authToken, teamID, name, cmd.ErrOrStderr()); deleteErr != nil {
+			if deleteErr := uninstallServerSide(cmd.Context(), baseURL, authToken, teamID, name, cmd.ErrOrStderr()); deleteErr != nil {
 				stepErr := &uninstallStepError{step: "server-side delete", err: deleteErr}
 				// We only reach this branch under --force, so collect
 				// rather than return.
@@ -246,8 +246,8 @@ func removeLocalConfig(name string) (bool, error) {
 // the server's authoritative ID. A 404 from DELETE — or a name that's
 // already absent from the list — is treated as already-deleted; in the
 // 404 case we log to stderr so the operator knows what happened.
-func uninstallServerSide(baseURL, authToken, teamID, name string, warnOut io.Writer) error {
-	workers, err := fetchWorkers(baseURL, authToken, teamID)
+func uninstallServerSide(ctx context.Context, baseURL, authToken, teamID, name string, warnOut io.Writer) error {
+	workers, err := fetchWorkers(ctx, baseURL, authToken, teamID)
 	if err != nil {
 		return err
 	}
@@ -265,7 +265,7 @@ func uninstallServerSide(baseURL, authToken, teamID, name string, warnOut io.Wri
 	if warnOut != nil {
 		fmt.Fprintf(warnOut, "deleting server-side worker %q (id %s)\n", name, workerID)
 	}
-	notFound, err := deleteWorker(baseURL, authToken, teamID, workerID)
+	notFound, err := deleteWorker(ctx, baseURL, authToken, teamID, workerID)
 	if err != nil {
 		return err
 	}

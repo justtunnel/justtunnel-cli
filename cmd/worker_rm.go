@@ -84,7 +84,7 @@ func runWorkerRm(cmd *cobra.Command, args []string) error {
 	// limits the worst case to "404 instead of 200" for the deleted-then-
 	// recreated case rather than wrong-target deletion. Acceptable for
 	// v1; revisit if we expose multi-admin team workflows.
-	workers, err := fetchWorkers(baseURL, cfg.AuthToken, teamID)
+	workers, err := fetchWorkers(cmd.Context(), baseURL, cfg.AuthToken, teamID)
 	if err != nil {
 		return err
 	}
@@ -110,7 +110,7 @@ func runWorkerRm(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	notFound, err := deleteWorker(baseURL, cfg.AuthToken, teamID, workerID)
+	notFound, err := deleteWorker(cmd.Context(), baseURL, cfg.AuthToken, teamID, workerID)
 	if err != nil {
 		// Server refused — leave local config in place so the user can retry.
 		return err

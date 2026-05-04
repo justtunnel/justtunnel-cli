@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -43,6 +44,12 @@ type RotatingWriter struct {
 	mu         sync.Mutex         // serializes Write/Close/rotate
 	file       *os.File           // current active file handle; nil after Close
 	openedDate time.Time          // calendar date the active file was opened on
+
+	// WarnOut receives non-fatal diagnostic warnings (e.g. close errors
+	// during rotation). When nil, os.Stderr is used. D2: making this
+	// injectable lets a worker process surface rotation hiccups via its
+	// own logger / stream without modifying the writer.
+	WarnOut io.Writer
 }
 
 // NewRotatingWriter opens (or creates) the active log file for workerName
@@ -76,6 +83,14 @@ func NewRotatingWriter(workerName string, clock func() time.Time) (*RotatingWrit
 		return nil, err
 	}
 	return writer, nil
+}
+
+// warnWriter returns the configured warning writer, defaulting to stderr.
+func (w *RotatingWriter) warnWriter() io.Writer {
+	if w.WarnOut != nil {
+		return w.WarnOut
+	}
+	return os.Stderr
 }
 
 // activePath returns the path to the active (un-rotated) log file.
@@ -152,9 +167,14 @@ func (w *RotatingWriter) maybeRotateLocked() {
 	// file fails, and on Unix it works but the historical file would still
 	// have a writer attached briefly. Closing first keeps semantics simple.
 	if err := w.file.Close(); err != nil {
-		// Not fatal — the file might already be closed by a prior partial
-		// rotation. Continue: if the rename succeeds we'll reopen below.
-		_ = err
+		// D2: not fatal — the file might already be closed by a prior
+		// partial rotation. Surface the error to WarnOut (defaults to
+		// stderr) so it's visible to operators without crashing the
+		// worker. The rotation continues; the rename below will either
+		// succeed and we move on, or fail and we re-open via the same
+		// fallback path.
+		fmt.Fprintf(w.warnWriter(),
+			"worker: log close during rotation failed: %v\n", err)
 	}
 	w.file = nil
 

@@ -466,6 +466,29 @@ func TestRunLaunchctl_ExtractsExitCode(t *testing.T) {
 	}
 }
 
+// TestLaunchctlError_NoDoubleErrText exercises D5: the .Error() format
+// must use e.Err.Error() (not %v) so wrapping does not produce a doubled
+// error chain when the outer formatter expands %w.
+func TestLaunchctlError_NoDoubleErrText(t *testing.T) {
+	inner := errors.New("inner-fail-marker")
+	wrapped := &launchctlError{
+		Args:     []string{"bootstrap", "gui/501"},
+		Output:   "some-output",
+		ExitCode: 5,
+		Err:      inner,
+	}
+	got := wrapped.Error()
+	// `inner-fail-marker` should appear exactly once.
+	count := strings.Count(got, "inner-fail-marker")
+	if count != 1 {
+		t.Fatalf("inner error appears %d times in %q; want exactly 1", count, got)
+	}
+	// Unwrap chain still functions.
+	if !errors.Is(wrapped, inner) {
+		t.Fatalf("Unwrap chain broken: errors.Is failed for %q", got)
+	}
+}
+
 func TestIsNotLoaded_Variants(t *testing.T) {
 	cases := []struct {
 		output string
