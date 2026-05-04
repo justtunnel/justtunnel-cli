@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,7 +30,7 @@ func teamCfg(serverURL string) *config.Config {
 	return &config.Config{
 		AuthToken:      "justtunnel_test_token",
 		ServerURL:      httpToWS(serverURL) + "/ws",
-		CurrentContext: "team:alpha",
+		CurrentContext: "team:team-alpha",
 	}
 }
 
@@ -81,8 +82,8 @@ func TestWorkerCreateHappyPath(t *testing.T) {
 	if loaded.WorkerID != "wkr_123" {
 		t.Errorf("local WorkerID: got %q", loaded.WorkerID)
 	}
-	if loaded.Context != "team:alpha" {
-		t.Errorf("local Context: got %q, want team:alpha", loaded.Context)
+	if loaded.Context != "team:team-alpha" {
+		t.Errorf("local Context: got %q, want team:team-alpha", loaded.Context)
 	}
 	if loaded.Subdomain != "alice-team-alpha" {
 		t.Errorf("local Subdomain: got %q", loaded.Subdomain)
@@ -175,10 +176,10 @@ func TestWorkerListMergesServerAndLocal(t *testing.T) {
 
 	// Seed local-only worker "carol" and shared worker "alice" so we exercise
 	// both dedup and "local-only" / "server-only" markers.
-	if err := worker.Write(&worker.Config{WorkerID: "wkr_local_alice", Name: "alice", Context: "team:alpha", ServiceBackend: "none"}); err != nil {
+	if err := worker.Write(&worker.Config{WorkerID: "wkr_local_alice", Name: "alice", Context: "team:team-alpha", ServiceBackend: "none"}); err != nil {
 		t.Fatalf("seed alice: %v", err)
 	}
-	if err := worker.Write(&worker.Config{WorkerID: "wkr_local_carol", Name: "carol", Context: "team:alpha", ServiceBackend: "none"}); err != nil {
+	if err := worker.Write(&worker.Config{WorkerID: "wkr_local_carol", Name: "carol", Context: "team:team-alpha", ServiceBackend: "none"}); err != nil {
 		t.Fatalf("seed carol: %v", err)
 	}
 
@@ -191,9 +192,20 @@ func TestWorkerListMergesServerAndLocal(t *testing.T) {
 			t.Errorf("output should include %q, got: %s", name, out)
 		}
 	}
-	// alice exists both places — should not be duplicated.
-	if count := strings.Count(out, "alice"); count != 1 {
-		t.Errorf("alice should appear exactly once, appeared %d times: %s", count, out)
+	// alice exists both places — should appear in exactly one row, marked
+	// "synced" rather than as two separate rows.
+	aliceRows := 0
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "alice" {
+			aliceRows++
+		}
+	}
+	if aliceRows != 1 {
+		t.Errorf("alice should appear in exactly one row, got %d: %s", aliceRows, out)
+	}
+	if !strings.Contains(out, "synced") {
+		t.Errorf("alice should be marked synced, got: %s", out)
 	}
 	if !strings.Contains(out, "server-only") {
 		t.Errorf("bob should be marked server-only, got: %s", out)
@@ -213,7 +225,7 @@ func TestWorkerRmLocalOnlyDefault(t *testing.T) {
 
 	resetWorkerState(t, teamCfg(stub.URL))
 
-	if err := worker.Write(&worker.Config{WorkerID: "wkr_x", Name: "alice", Context: "team:alpha", ServiceBackend: "none"}); err != nil {
+	if err := worker.Write(&worker.Config{WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "none"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -224,21 +236,12 @@ func TestWorkerRmLocalOnlyDefault(t *testing.T) {
 	if atomic.LoadInt32(&called) != 0 {
 		t.Errorf("server should not be called for local-only rm, got %d calls", called)
 	}
-	if _, err := worker.Read("alice"); !os.IsNotExist(unwrapPathErr(err)) {
+	if _, err := worker.Read("alice"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("local config should be gone, got err=%v", err)
 	}
 	if !strings.Contains(out, "still registered server-side") {
 		t.Errorf("output should hint about server-side, got: %s", out)
 	}
-}
-
-// unwrapPathErr returns the underlying os error from worker.Read's wrapped
-// error, preserving os.ErrNotExist semantics for IsNotExist checks.
-func unwrapPathErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	return err
 }
 
 func TestWorkerRmDeleteOnServerHappyPath(t *testing.T) {
@@ -261,7 +264,7 @@ func TestWorkerRmDeleteOnServerHappyPath(t *testing.T) {
 
 	resetWorkerState(t, teamCfg(stub.URL))
 
-	if err := worker.Write(&worker.Config{WorkerID: "wkr_x", Name: "alice", Context: "team:alpha", ServiceBackend: "none"}); err != nil {
+	if err := worker.Write(&worker.Config{WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "none"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -292,7 +295,7 @@ func TestWorkerRmDeleteOnServer404ProceedsLocally(t *testing.T) {
 
 	resetWorkerState(t, teamCfg(stub.URL))
 
-	if err := worker.Write(&worker.Config{WorkerID: "wkr_x", Name: "alice", Context: "team:alpha", ServiceBackend: "none"}); err != nil {
+	if err := worker.Write(&worker.Config{WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "none"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -318,7 +321,7 @@ func TestWorkerRmDeleteOnServer403LeavesLocal(t *testing.T) {
 
 	resetWorkerState(t, teamCfg(stub.URL))
 
-	if err := worker.Write(&worker.Config{WorkerID: "wkr_x", Name: "alice", Context: "team:alpha", ServiceBackend: "none"}); err != nil {
+	if err := worker.Write(&worker.Config{WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "none"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
