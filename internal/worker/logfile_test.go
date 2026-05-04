@@ -358,6 +358,103 @@ func TestRotatingWriter_InvalidNameRejected(t *testing.T) {
 	}
 }
 
+// TestRotatingWriter_RenameFailurePreservesOpenedDate verifies that when
+// the rotation rename fails (e.g. disk full, permission flap), the writer
+// keeps openedDate pointing at the ORIGINAL day, not "today". This way,
+// when rename eventually succeeds on a later rotation attempt, the
+// historical filename still reflects the original date of the file's
+// content — not the day the rename happened to land.
+//
+// Reproduction: pre-create the destination historical filename as a
+// directory. os.Rename refuses to overwrite a directory with a file, so
+// the first rotation rename fails. After we remove the directory and
+// trigger a second rotation, the file must end up with day-1's stamp.
+func TestRotatingWriter_RenameFailurePreservesOpenedDate(t *testing.T) {
+	home := setupLogsHome(t)
+	logsDir := filepath.Join(home, "logs")
+	if err := os.MkdirAll(logsDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	day1 := time.Date(2026, 5, 4, 10, 0, 0, 0, time.UTC)
+	day2 := time.Date(2026, 5, 5, 10, 0, 0, 0, time.UTC)
+	day3 := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+
+	clock := newFakeClock(day1)
+	writer, err := NewRotatingWriter("foo", clock.Now)
+	if err != nil {
+		t.Fatalf("new writer: %v", err)
+	}
+	defer writer.Close()
+
+	if _, err := writer.Write([]byte("day1-content\n")); err != nil {
+		t.Fatalf("day1 write: %v", err)
+	}
+
+	// Block the day-1 -> historical rename by occupying the destination
+	// path with a non-empty directory (Rename can't replace it).
+	day1Historical := writer.historicalPath(time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC))
+	if err := os.MkdirAll(day1Historical, 0o700); err != nil {
+		t.Fatalf("seed blocking dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(day1Historical, "occupant"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed blocking dir occupant: %v", err)
+	}
+
+	// Trigger first rotation attempt — must fail at rename, fall back to
+	// keep-writing-active with openedDate restored to day1.
+	clock.Set(day2)
+	if _, err := writer.Write([]byte("day2-content\n")); err != nil {
+		t.Fatalf("day2 write: %v", err)
+	}
+
+	// Verify rename did NOT succeed (historical path is still the dir).
+	dirInfo, err := os.Stat(day1Historical)
+	if err != nil {
+		t.Fatalf("blocking dir stat: %v", err)
+	}
+	if !dirInfo.IsDir() {
+		t.Fatal("expected blocking directory still in place; rename should have failed")
+	}
+
+	// Verify both day1 and day2 content are now in the active file
+	// (rotation deferred — durability over on-time).
+	activeContent := readFile(t, writer.activePath())
+	if !strings.Contains(activeContent, "day1-content") || !strings.Contains(activeContent, "day2-content") {
+		t.Fatalf("active file should contain day1+day2 after deferred rotation; got %q", activeContent)
+	}
+
+	// Now unblock: remove the directory so the next rename can succeed.
+	if err := os.RemoveAll(day1Historical); err != nil {
+		t.Fatalf("remove blocking dir: %v", err)
+	}
+
+	// Trigger second rotation attempt on day3.
+	clock.Set(day3)
+	if _, err := writer.Write([]byte("day3-content\n")); err != nil {
+		t.Fatalf("day3 write: %v", err)
+	}
+
+	// CRITICAL: the historical file must use day1's date (the file's
+	// original openedDate), NOT day2.
+	day2Historical := writer.historicalPath(time.Date(2026, 5, 5, 0, 0, 0, 0, time.UTC))
+	if _, err := os.Stat(day2Historical); err == nil {
+		t.Fatalf("historical file was named with day2 stamp (%s); should be day1", day2Historical)
+	}
+	historicalContent := readFile(t, day1Historical)
+	if !strings.Contains(historicalContent, "day1-content") || !strings.Contains(historicalContent, "day2-content") {
+		t.Fatalf("day1 historical missing accumulated content; got %q", historicalContent)
+	}
+	// And the new active file should contain only day3 content.
+	finalActive := readFile(t, writer.activePath())
+	if strings.Contains(finalActive, "day1-content") || strings.Contains(finalActive, "day2-content") {
+		t.Fatalf("active file still contains pre-rotation content; got %q", finalActive)
+	}
+	if !strings.Contains(finalActive, "day3-content") {
+		t.Fatalf("active file missing day3 content; got %q", finalActive)
+	}
+}
+
 // TestRotatingWriter_RotationProducesNewInode verifies the reader-side
 // rotation-detection contract: after rotation, the active file path resolves
 // to a different on-disk file than the pre-rotation handle. os.SameFile is

@@ -158,8 +158,14 @@ func (w *RotatingWriter) maybeRotateLocked() {
 	if err := os.Rename(from, to); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		// Rename failed (e.g. disk full, permissions changed). Re-open the
 		// active file and keep writing — rotation will retry on the next
-		// write. This intentionally trades on-time rotation for log durability.
-		_ = w.openActive(w.now())
+		// write. Crucially, we preserve openedDate as the ORIGINAL day, not
+		// today: the active file on disk still contains data from openedDay,
+		// so the next rotation attempt must rename it to that historical
+		// stamp (not whatever "today" becomes by the time rename succeeds).
+		// Without this, days of accumulated content would eventually land
+		// under a misleading filename. We re-open with `openedDay` so
+		// openedDate is restored to its pre-rotation value.
+		_ = w.openActive(openedDay)
 		return
 	}
 	if err := w.openActive(w.now()); err != nil {

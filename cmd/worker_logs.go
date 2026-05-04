@@ -59,15 +59,18 @@ func runWorkerLogs(cmd *cobra.Command, args []string) error {
 	}
 
 	// Existence check: an empty active file is fine (worker started but no
-	// output yet), but a missing one means `worker start` was never run.
+	// output yet), but a missing one means `worker start` was never run (or
+	// the worker was started, rotated, and never wrote again on the new day).
+	activeMissing := false
 	if _, statErr := os.Stat(activePath); statErr != nil {
-		if errors.Is(statErr, os.ErrNotExist) && len(historical) == 0 {
-			return display.InputError(fmt.Sprintf(
-				"no log file for worker %q (has it been started?)", name,
-			))
+		if errors.Is(statErr, os.ErrNotExist) {
+			if len(historical) == 0 {
+				return display.InputError(fmt.Sprintf(
+					"no log file for worker %q (has it been started?)", name,
+				))
+			}
+			activeMissing = true
 		}
-		// If the active file is missing but historical exist, fall through —
-		// --all still works, default/follow will create-on-tail.
 	}
 
 	out := cmd.OutOrStdout()
@@ -76,10 +79,21 @@ func runWorkerLogs(cmd *cobra.Command, args []string) error {
 	case workerLogsAll:
 		return printAllLogs(out, historical, activePath)
 	case workerLogsFollow:
+		if activeMissing {
+			return display.InputError(fmt.Sprintf(
+				"no active log file for worker %q (start the worker first, or use --all to read historical logs)", name,
+			))
+		}
 		ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 		return followActive(ctx, out, activePath)
 	default:
+		if activeMissing {
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"no active log file for worker %q; use --all to view %d historical log file(s)\n",
+				name, len(historical))
+			return nil
+		}
 		return printTail(out, activePath, workerLogsLines)
 	}
 }
@@ -182,9 +196,14 @@ func followActive(ctx context.Context, out io.Writer, path string) error {
 
 	for {
 		// Drain any unread bytes before checking for rotation, so we don't
-		// lose the tail of the file we're about to swap out.
+		// lose the tail of the file we're about to swap out. drainInto
+		// itself watches ctx so a high write throughput cannot starve the
+		// outer ctx.Done() select.
 		if file != nil {
-			if err := drainInto(out, file, buffer); err != nil {
+			if err := drainInto(ctx, out, file, buffer); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil
+				}
 				return err
 			}
 		}
@@ -206,7 +225,11 @@ func followActive(ctx context.Context, out io.Writer, path string) error {
 				// Read any final bytes from the old (now historical) handle
 				// before swapping. The rename does not invalidate our fd on
 				// POSIX; we keep reading until EOF.
-				_ = drainInto(out, file, buffer)
+				if drainErr := drainInto(ctx, out, file, buffer); drainErr != nil &&
+					!errors.Is(drainErr, context.Canceled) &&
+					!errors.Is(drainErr, context.DeadlineExceeded) {
+					fmt.Fprintf(os.Stderr, "worker logs: drain pre-swap: %v\n", drainErr)
+				}
 				_ = file.Close()
 			}
 			reopened, reopenedInfo, err := openForFollow(path)
@@ -219,12 +242,17 @@ func followActive(ctx context.Context, out io.Writer, path string) error {
 	}
 }
 
-// openForFollow opens path for reading and returns the file plus its
+// openForFollow opens path read-only and returns the file plus its
 // FileInfo (used by os.SameFile for rotation detection). The reader starts
 // at offset 0 by design — `worker logs -f` is "show me what happened and
 // keep showing me", matching `tail -f -n +1` semantics.
+//
+// The reader does NOT create the file: file lifecycle is owned by the
+// writer (worker process). A missing active file means the worker has not
+// started; the caller is expected to surface that as a usage error before
+// invoking followActive.
 func openForFollow(path string) (*os.File, os.FileInfo, error) {
-	file, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0o600)
+	file, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open %s: %w", path, err)
 	}
@@ -238,9 +266,18 @@ func openForFollow(path string) (*os.File, os.FileInfo, error) {
 
 // drainInto copies all currently-available bytes from file into out, using
 // the supplied scratch buffer. Stops at EOF or when a read returns fewer
-// bytes than requested (no more data ready right now).
-func drainInto(out io.Writer, file *os.File, scratch []byte) error {
+// bytes than requested (no more data ready right now). Returns ctx.Err()
+// promptly when ctx is cancelled, so a high-throughput writer cannot starve
+// shutdown by keeping every Read fully populated.
+func drainInto(ctx context.Context, out io.Writer, file *os.File, scratch []byte) error {
 	for {
+		// Tight per-iteration ctx check so a steady stream of full-buffer
+		// reads cannot pin this loop indefinitely.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		count, err := file.Read(scratch)
 		if count > 0 {
 			if _, writeErr := out.Write(scratch[:count]); writeErr != nil {
@@ -255,6 +292,11 @@ func drainInto(out io.Writer, file *os.File, scratch []byte) error {
 		}
 		if count < len(scratch) {
 			return nil
+		}
+		// Re-check ctx between reads as well — covers the case where a
+		// short read came back but more data is queued behind it.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
 	}
 }
