@@ -59,7 +59,6 @@ func TestBackoff_NonPositiveAttempt(t *testing.T) {
 type fakeDialer struct {
 	script   []dialResult
 	attempts int32
-	calls    []string // dial URLs, for assertion
 }
 
 type dialResult struct {
@@ -92,7 +91,6 @@ func (fc *fakeConn) Close() error { return nil }
 
 func (fd *fakeDialer) Dial(ctx context.Context, dialURL string) (workerConn, error) {
 	idx := int(atomic.AddInt32(&fd.attempts, 1)) - 1
-	fd.calls = append(fd.calls, dialURL)
 	if idx >= len(fd.script) {
 		// After script ends, block forever (so the runner is held up until
 		// the test cancels the context).
@@ -196,7 +194,9 @@ func TestRunner_TerminalCloseAlreadyAttached(t *testing.T) {
 }
 
 // TestRunner_CancelDuringBackoff verifies that cancelling the context while
-// the runner is sleeping between reconnect attempts exits cleanly.
+// the runner is sleeping between reconnect attempts exits cleanly. Uses a
+// channel-based sync (instead of time.Sleep) so the test is deterministic
+// under race-detector load.
 func TestRunner_CancelDuringBackoff(t *testing.T) {
 	dialer := &fakeDialer{
 		script: []dialResult{
@@ -206,15 +206,28 @@ func TestRunner_CancelDuringBackoff(t *testing.T) {
 		},
 	}
 	runner := newTestRunner(dialer)
-	// Override the backoff so the runner lingers in sleep.
-	runner.backoff = func(attempt int) time.Duration { return 1 * time.Second }
+	// Signal the moment the runner enters backoff sleep so we cancel
+	// AFTER it's actually sleeping. Buffered + sync.Once-style guard so
+	// later backoff calls don't panic on a closed channel.
+	inBackoff := make(chan struct{}, 1)
+	runner.backoff = func(attempt int) time.Duration {
+		select {
+		case inBackoff <- struct{}{}:
+		default:
+		}
+		return 1 * time.Second
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- runner.Run(ctx) }()
 
-	// Let it fail at least once then enter backoff sleep.
-	time.Sleep(50 * time.Millisecond)
+	// Wait deterministically for the runner to enter backoff sleep.
+	select {
+	case <-inBackoff:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not enter backoff within 2s")
+	}
 	cancel()
 
 	select {
@@ -303,9 +316,200 @@ func newTestRunner(dialer Dialer) *Runner {
 		WorkerID:   "wkr_123",
 		Subdomain:  "build--acme",
 		ServerURL:  "wss://api.example.com/ws",
-		AuthToken:  "tok",
 		Logger:     newDiscardLogger(),
 		Dialer:     dialer,
 		backoff:    func(attempt int) time.Duration { return time.Millisecond },
 	}
+}
+
+// TestRunner_AuthFailureIsTerminal verifies that a Dialer returning an
+// ErrAuthFailed-wrapped error causes Runner.Run to exit immediately with
+// no retry. This guards against the previous behavior of looping forever
+// on a 401/403 — the token won't change without operator action, so
+// retrying just hammers the server.
+func TestRunner_AuthFailureIsTerminal(t *testing.T) {
+	dialer := &fakeDialer{
+		script: []dialResult{
+			{dialErr: fmt.Errorf("worker: dial returned 401: %w", ErrAuthFailed)},
+		},
+	}
+	runner := newTestRunner(dialer)
+
+	err := runner.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run returned nil; want ErrAuthFailed")
+	}
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("Run returned %v; want errors.Is(err, ErrAuthFailed)", err)
+	}
+	if got := atomic.LoadInt32(&dialer.attempts); got != 1 {
+		t.Fatalf("expected exactly 1 dial attempt for auth failure; got %d", got)
+	}
+}
+
+// TestRunner_AuthFailureForbidden is the 403 sibling of the 401 test —
+// same expectation: terminate immediately.
+func TestRunner_AuthFailureForbidden(t *testing.T) {
+	dialer := &fakeDialer{
+		script: []dialResult{
+			{dialErr: fmt.Errorf("worker: dial returned 403: %w", ErrAuthFailed)},
+		},
+	}
+	runner := newTestRunner(dialer)
+	err := runner.Run(context.Background())
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("Run returned %v; want errors.Is(err, ErrAuthFailed)", err)
+	}
+	if got := atomic.LoadInt32(&dialer.attempts); got != 1 {
+		t.Fatalf("expected exactly 1 dial attempt; got %d", got)
+	}
+}
+
+// TestRunner_FlapBackoffBetweenServerDisconnects verifies that when the
+// server accepts the handshake but immediately closes (1006), the runner
+// SLEEPS the backoff before reconnecting — it does not tight-loop.
+//
+// Regression test for the bug where Run reset attempt=0 on every successful
+// dial, causing flapping connections to spin at thousands of dials/sec.
+//
+// Asserts wall-clock gap between dial #1 and dial #2 is at least 0.5s
+// (1s backoff with 25% jitter floor = 0.75s; 0.5s is a safe lower bound).
+func TestRunner_FlapBackoffBetweenServerDisconnects(t *testing.T) {
+	dialTimes := make(chan time.Time, 4)
+	dialer := &recordingDialer{
+		dialTimes: dialTimes,
+		script: []dialResult{
+			{closeErr: &fakeCloseError{code: 1006, reason: "abnormal"}},
+			{closeErr: &fakeCloseError{code: 1006, reason: "abnormal"}},
+			{blockUntilCancel: true},
+		},
+	}
+	runner := newTestRunner(dialer)
+	// Real (non-instant) backoff so we can measure the gap.
+	runner.backoff = func(attempt int) time.Duration { return 1 * time.Second }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+
+	// Wait for the first two dials.
+	var firstDial, secondDial time.Time
+	select {
+	case firstDial = <-dialTimes:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first dial did not happen within 2s")
+	}
+	select {
+	case secondDial = <-dialTimes:
+	case <-time.After(3 * time.Second):
+		t.Fatal("second dial did not happen within 3s")
+	}
+
+	gap := secondDial.Sub(firstDial)
+	if gap < 500*time.Millisecond {
+		t.Fatalf("flap backoff gap = %s; want >= 500ms (server-disconnect must trigger backoff before reconnect)", gap)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit within 2s of cancel")
+	}
+}
+
+// TestRunner_MixedCloseCodeSequence verifies the most common real-world
+// failure mode: a transient 1006 followed by a terminal 4403. The runner
+// must reconnect once after 1006 and then exit cleanly with TerminalError
+// on 4403 — no further dials.
+func TestRunner_MixedCloseCodeSequence(t *testing.T) {
+	dialer := &fakeDialer{
+		script: []dialResult{
+			{closeErr: &fakeCloseError{code: 1006, reason: "abnormal"}},
+			{closeErr: &fakeCloseError{code: 4403, reason: "suspended"}},
+		},
+	}
+	runner := newTestRunner(dialer)
+
+	err := runner.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run returned nil; want *TerminalError")
+	}
+	var terminal *TerminalError
+	if !errors.As(err, &terminal) {
+		t.Fatalf("Run returned %v; want *TerminalError", err)
+	}
+	if terminal.Code != 4403 {
+		t.Fatalf("TerminalError.Code = %d; want 4403", terminal.Code)
+	}
+	if got := atomic.LoadInt32(&dialer.attempts); got != 2 {
+		t.Fatalf("expected exactly 2 dial attempts (1006 then 4403); got %d", got)
+	}
+}
+
+// TestRunner_SecondCancelDuringTeardown verifies that a second context
+// cancel arriving while the runner is shutting down does not deadlock —
+// Run still returns context.Canceled. This mirrors a SIGINT-then-SIGINT
+// sequence in production: the first signal flips the context, the second
+// arrives during the read-loop unwind. Without correct context plumbing
+// the second cancel could race with conn.Close() and stall.
+func TestRunner_SecondCancelDuringTeardown(t *testing.T) {
+	dialer := &fakeDialer{
+		script: []dialResult{
+			{blockUntilCancel: true},
+		},
+	}
+	runner := newTestRunner(dialer)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+
+	// Wait for the runner to actually be attached and blocking.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&dialer.attempts) >= 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// First cancel — graceful.
+	cancel()
+	// Second cancel — must be a no-op, not a deadlock or panic.
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v; want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit within 2s after double-cancel")
+	}
+}
+
+// recordingDialer is a fakeDialer variant that timestamps each Dial call
+// so flap-backoff tests can measure the wall-clock gap between attempts.
+type recordingDialer struct {
+	script    []dialResult
+	attempts  int32
+	dialTimes chan<- time.Time
+}
+
+func (rd *recordingDialer) Dial(ctx context.Context, dialURL string) (workerConn, error) {
+	idx := int(atomic.AddInt32(&rd.attempts, 1)) - 1
+	select {
+	case rd.dialTimes <- time.Now():
+	default:
+	}
+	if idx >= len(rd.script) {
+		return &fakeConn{result: dialResult{blockUntilCancel: true}}, nil
+	}
+	step := rd.script[idx]
+	if step.dialErr != nil {
+		return nil, step.dialErr
+	}
+	return &fakeConn{result: step}, nil
 }

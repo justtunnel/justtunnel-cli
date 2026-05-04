@@ -29,6 +29,12 @@ func (te *TerminalError) Error() string {
 	return fmt.Sprintf("worker terminated by server: code=%d reason=%q", te.Code, te.Reason)
 }
 
+// ErrAuthFailed is returned (wrapped) by a Dialer when the server rejects
+// the worker handshake with 401 or 403. The token will not change on its
+// own, so Runner.Run treats this as terminal — same semantics as
+// TerminalError — to avoid a tight retry loop hammering the server.
+var ErrAuthFailed = errors.New("worker: auth failed")
+
 // Terminal close codes per tech spec §7. Both indicate the operator must
 // take action — restart the worker won't help.
 const (
@@ -81,9 +87,19 @@ type Dialer interface {
 	Dial(ctx context.Context, dialURL string) (workerConn, error)
 }
 
+// stableConnDuration is how long an attached connection must survive
+// before its disconnect "resets" the flap counter. Anything shorter is
+// treated as part of an ongoing flap cycle and the next dial is delayed
+// by the backoff schedule.
+const stableConnDuration = 30 * time.Second
+
 // Runner owns the connect-reconnect loop for a single worker. Construct one
 // per `worker start` invocation; Run blocks until ctx is done or a terminal
 // close code arrives.
+//
+// Auth token is intentionally NOT a field: it lives in the Dialer (see
+// NewRealDialer) so there's a single source of truth and we don't risk
+// passing a stale value via two paths.
 type Runner struct {
 	WorkerName string
 	WorkerID   string
@@ -92,7 +108,6 @@ type Runner struct {
 	// runner does not need to know context-parsing rules.
 	Subdomain string
 	ServerURL string
-	AuthToken string
 	Logger    *slog.Logger
 	Dialer    Dialer
 
@@ -100,6 +115,16 @@ type Runner struct {
 	// package-level Backoff (jittered exponential, capped at 60s). Tests
 	// override to a near-zero constant.
 	backoff func(attempt int) time.Duration
+
+	// now is the clock for measuring connection lifetime to detect flaps.
+	// Nil means time.Now. Tests inject a fake clock to drive the
+	// stable-connection threshold deterministically.
+	now func() time.Time
+
+	// stableConnDuration overrides the package-level constant. Zero means
+	// use the default. Tests set a small value (or zero-equivalent) to
+	// exercise reset behavior without waiting 30s of wall time.
+	stableConnDuration time.Duration
 }
 
 // Run drives the connect-read-reconnect loop. It returns:
@@ -120,13 +145,31 @@ func (r *Runner) Run(ctx context.Context) error {
 	if backoffFunc == nil {
 		backoffFunc = Backoff
 	}
+	clock := r.now
+	if clock == nil {
+		clock = time.Now
+	}
+	stableThreshold := r.stableConnDuration
+	if stableThreshold == 0 {
+		stableThreshold = stableConnDuration
+	}
 
 	dialURL, err := BuildDialURL(r.ServerURL, r.WorkerID, r.WorkerName, r.Subdomain)
 	if err != nil {
 		return fmt.Errorf("worker: build dial URL: %w", err)
 	}
 
-	for attempt := 1; ; attempt++ {
+	// dialAttempt tracks consecutive failed dials (network errors).
+	// disconnectAttempt tracks consecutive flapping disconnects (a connect
+	// that came up then dropped before stableThreshold). Tracking these
+	// separately ensures a server that ACCEPTS the handshake then drops it
+	// (e.g. 1006) still triggers backoff — the previous implementation
+	// reset the attempt counter on any successful dial, which produced a
+	// tight reconnect loop on flapping connections.
+	dialAttempt := 0
+	disconnectAttempt := 0
+
+	for {
 		// Fresh context check before any work this iteration.
 		if err := ctx.Err(); err != nil {
 			return err
@@ -139,16 +182,27 @@ func (r *Runner) Run(ctx context.Context) error {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
+			// Auth failures are terminal: the token won't change without
+			// operator action, so retrying is futile and would hammer the
+			// server.
+			if errors.Is(dialErr, ErrAuthFailed) {
+				r.Logger.Error("worker auth failed (no reconnect)",
+					"worker", r.WorkerName,
+					"error", dialErr,
+				)
+				return dialErr
+			}
+			dialAttempt++
 			r.Logger.Info("worker dial failed",
 				"worker", r.WorkerName,
-				"attempt", attempt,
+				"attempt", dialAttempt,
 				"error", dialErr,
 			)
-			wait := backoffFunc(attempt)
+			wait := backoffFunc(dialAttempt)
 			r.Logger.Info("worker reconnecting",
 				"worker", r.WorkerName,
 				"in", wait.String(),
-				"attempt", attempt+1,
+				"attempt", dialAttempt+1,
 			)
 			if err := sleepCtx(ctx, wait); err != nil {
 				return err
@@ -156,9 +210,10 @@ func (r *Runner) Run(ctx context.Context) error {
 			continue
 		}
 
-		// Successful dial — reset attempt counter so the next disconnect
-		// starts the backoff schedule fresh.
-		attempt = 0
+		// Dial succeeded. Reset the dial-failure counter; the disconnect
+		// counter is governed by how long this connection survives.
+		dialAttempt = 0
+		attachedAt := clock()
 		r.Logger.Info("worker attached",
 			"worker", r.WorkerName,
 			"subdomain", r.Subdomain,
@@ -191,8 +246,23 @@ func (r *Runner) Run(ctx context.Context) error {
 			return &TerminalError{Code: closeCode, Reason: reason}
 		}
 
-		// Loop continues — `attempt` was reset to 0, so the increment in
-		// the for clause makes it 1 for the next backoff calculation.
+		// Flap detection: only reset the disconnect counter if the
+		// connection survived stableThreshold. Otherwise this is part of
+		// a flap cycle — increment so the backoff escalates and we stop
+		// hammering the server.
+		if clock().Sub(attachedAt) >= stableThreshold {
+			disconnectAttempt = 0
+		}
+		disconnectAttempt++
+		wait := backoffFunc(disconnectAttempt)
+		r.Logger.Info("worker reconnecting after disconnect",
+			"worker", r.WorkerName,
+			"in", wait.String(),
+			"attempt", disconnectAttempt,
+		)
+		if err := sleepCtx(ctx, wait); err != nil {
+			return err
+		}
 	}
 }
 
@@ -356,7 +426,9 @@ func (rd *realDialer) Dial(ctx context.Context, dialURL string) (workerConn, err
 		// Surface auth failures distinctly so callers can decide whether
 		// reconnecting is futile (it is — the token won't change).
 		if httpResp != nil && (httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden) {
-			return nil, fmt.Errorf("worker: auth failed (%d): %w", httpResp.StatusCode, err)
+			// Wrap with ErrAuthFailed so Runner.Run can match via
+			// errors.Is and exit terminally instead of looping.
+			return nil, fmt.Errorf("worker: dial returned %d: %w", httpResp.StatusCode, ErrAuthFailed)
 		}
 		return nil, fmt.Errorf("worker: dial: %w", err)
 	}

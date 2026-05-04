@@ -84,6 +84,11 @@ func runWorkerStart(cmd *cobra.Command, args []string) error {
 	// a SECOND signal during the runner's shutdown produces a hard exit
 	// (Go default behavior for SIGINT is exit; for SIGTERM the OS kills the
 	// process).
+	//
+	// Note re: tech spec "wait up to 5s for in-flight requests" — this does
+	// not apply to workers. Workers are pure WebSocket attach with no
+	// port-forwarded HTTP traffic to drain; that wording is borrowed from
+	// the tunnel-mode spec and is N/A here.
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -92,7 +97,6 @@ func runWorkerStart(cmd *cobra.Command, args []string) error {
 		WorkerID:   workerCfg.WorkerID,
 		Subdomain:  subdomain,
 		ServerURL:  cfg.ServerURL,
-		AuthToken:  cfg.AuthToken,
 		Logger:     logger,
 		Dialer:     worker.NewRealDialer(cfg.AuthToken),
 	}
