@@ -59,13 +59,23 @@ func (s *LinuxSupervisor) Probe(ctx context.Context, workerName string) (ProbeRe
 	managedByUs := unitFileExists(workerName)
 
 	cmd := exec.CommandContext(ctx, "systemctl", "--user", "is-active", unitName)
-	output, err := cmd.CombinedOutput()
+	// Use Output() (NOT CombinedOutput): is-active prints the unit state
+	// to stdout. Stderr carries diagnostics like
+	// "Failed to connect to bus: …" that would corrupt the parser if
+	// they were folded into the same stream.
+	output, err := cmd.Output()
 
 	exitCode := 0
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
+			// stderr is available on *exec.ExitError when Output() is
+			// used. We deliberately do NOT pass it to ParseIsActive —
+			// the parser only knows the canonical state vocabulary
+			// (active/inactive/failed/unknown). Stderr is preserved
+			// here for future error context if we ever surface it.
+			_ = exitErr.Stderr
 		} else {
 			// Process couldn't be started at all (e.g. systemctl not
 			// found). Surface as a probe error rather than silently

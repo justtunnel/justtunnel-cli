@@ -80,6 +80,16 @@ func ParseIsActive(output string, exitCode int) (ProbeState, string) {
 		return ProbeStateWaiting, ""
 	case "failed":
 		return ProbeStateWaiting, "failed"
+	case "activating":
+		// Transitional state during unit start (exit 3). Surface as
+		// "waiting" so callers know it's not yet running but it is
+		// loaded and progressing; Detail carries the state name so
+		// `worker status` can show "(activating)".
+		return ProbeStateWaiting, "activating"
+	case "deactivating":
+		// Transitional state during unit stop (exit 3). Same handling
+		// as activating — loaded, not running, transient.
+		return ProbeStateWaiting, "deactivating"
 	case "unknown":
 		return ProbeStateNotLoaded, ""
 	}

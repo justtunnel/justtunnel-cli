@@ -144,6 +144,20 @@ type SystemdInstaller struct {
 	// "systemd is present"; a non-nil error is surfaced verbatim by
 	// Bootstrap. When nil, the production check probes the filesystem.
 	SystemdDetector func() error
+
+	// WarnOut receives non-fatal diagnostic warnings (e.g. "could not
+	// query linger status"). When nil, os.Stderr is used. Tests inject
+	// a buffer to assert on warning text.
+	WarnOut io.Writer
+}
+
+// warnWriter returns the configured warning writer, defaulting to stderr
+// so production output goes where operators expect.
+func (s *SystemdInstaller) warnWriter() io.Writer {
+	if s.WarnOut != nil {
+		return s.WarnOut
+	}
+	return os.Stderr
 }
 
 // NewSystemdInstaller returns an installer wired to ExecRunner, the
@@ -301,7 +315,16 @@ func (s *SystemdInstaller) Bootstrap(ctx context.Context, workerName string, opt
 	}
 
 	if err := s.runSystemctl(ctx, "--user", "daemon-reload"); err != nil {
-		return SystemdResult{}, fmt.Errorf("installer: systemctl daemon-reload: %w", err)
+		// daemon-reload failed AFTER we successfully wrote the unit
+		// file. Leaving the file behind would cause the next
+		// daemon-reload (on the user's next login) to silently pick
+		// up a partially-installed worker. Compensate by removing the
+		// just-written unit file and surface BOTH outcomes.
+		cleanupNote := "unit file removed"
+		if removeErr := os.Remove(unitPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cleanupNote = fmt.Sprintf("unit file cleanup failed: %v", removeErr)
+		}
+		return SystemdResult{}, fmt.Errorf("installer: systemctl daemon-reload (%s): %w", cleanupNote, err)
 	}
 	if err := s.runSystemctl(ctx, "--user", "enable", "--now", UnitName(workerName)); err != nil {
 		return SystemdResult{}, fmt.Errorf("installer: systemctl enable --now: %w", err)
@@ -325,10 +348,12 @@ func (s *SystemdInstaller) Bootstrap(ctx context.Context, workerName string, opt
 
 	alreadyOn, lingerErr := s.lingerEnabled(ctx, username)
 	if lingerErr != nil {
-		// Couldn't probe linger state. Surface as an error but mark
-		// the result so callers still print the deny-path notice.
-		return SystemdResult{LingerEnabled: false, NoLingerWarningPrinted: true},
-			fmt.Errorf("installer: probe linger state (worker installed but linger NOT configured): %w", lingerErr)
+		// Couldn't probe linger state (e.g. dbus failure). Don't fail
+		// the install — just warn and proceed to the consent prompt.
+		// The user can still opt in or out, and the worker is already
+		// installed and enabled at this point.
+		fmt.Fprintf(s.warnWriter(), "warning: could not query linger status (%v); proceeding with consent prompt\n", lingerErr)
+		alreadyOn = false
 	}
 	if alreadyOn {
 		return SystemdResult{LingerEnabled: true}, nil
@@ -402,15 +427,43 @@ func (s *SystemdInstaller) requireSystemd(_ context.Context) error {
 }
 
 // lingerEnabled returns true when loginctl reports Linger=yes for username.
+//
+// Error policy: loginctl exits non-zero for unknown users (a brand-new
+// user that has never logged in) — that is benign and we surface it as
+// `(false, nil)` so the install proceeds via the prompt path. Anything
+// else (dbus failure, EACCES, loginctl missing) returns `(false, err)`
+// so the caller can decide whether to abort or continue.
 func (s *SystemdInstaller) lingerEnabled(ctx context.Context, username string) (bool, error) {
 	out, err := s.Runner.Run(ctx, "loginctl", "show-user", username, "--property=Linger")
 	if err != nil {
-		// loginctl returns non-zero for unknown users (e.g. a brand-new
-		// user that has never logged in). Treat as "not enabled" so the
-		// install can proceed via the prompt path.
-		return false, nil
+		if isUnknownLoginctlUser(out, err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("installer: loginctl show-user %s: %w", username, err)
 	}
 	return systemctl.ParseLingerEnabled(string(out)), nil
+}
+
+// isUnknownLoginctlUser reports whether a non-zero loginctl exit indicates
+// the queried user is unknown to systemd-logind (which is benign for a
+// linger probe — there is simply nothing to query). Distinguishing this
+// from real I/O failures lets the caller surface dbus / permission errors
+// instead of silently treating them as "linger=no".
+func isUnknownLoginctlUser(out []byte, err error) bool {
+	// "executable not installed" — loginctl missing entirely. Not an
+	// unknown-user case; surface it.
+	if errors.Is(err, exec.ErrNotFound) {
+		return false
+	}
+	lower := strings.ToLower(string(out))
+	if strings.Contains(lower, "unknown user") || strings.Contains(lower, "no such user") {
+		return true
+	}
+	// Some loginctl builds print to the err string only.
+	if strings.Contains(strings.ToLower(err.Error()), "unknown user") {
+		return true
+	}
+	return false
 }
 
 // runSystemctl invokes `systemctl <args...>` via Runner. The exit code is
@@ -532,16 +585,24 @@ func (s *SystemdInstaller) currentUser() (string, error) {
 }
 
 // validateUnitPath rejects paths containing characters that would break
-// the systemd unit file's INI grammar. Real Linux paths in commonly-used
-// locations don't contain newlines or NUL; rejecting them defends against
-// an attacker who controls $HOME or some other input flowing into the
-// unit file.
+// the systemd unit file's INI grammar OR get reinterpreted by systemd's
+// specifier expansion. Real Linux paths in commonly-used locations don't
+// contain newlines, NUL, or `%`; rejecting them defends against an attacker
+// who controls $HOME or some other input flowing into the unit file.
+//
+// `%` is rejected because systemd performs specifier expansion on unit-file
+// values (e.g. `%n` -> unit name, `%h` -> user home) and a path like
+// `/log/%n.log` would silently substitute rather than write to the literal
+// path. See systemd.unit(5) "SPECIFIERS".
 func validateUnitPath(label, path string) error {
 	if path == "" {
 		return fmt.Errorf("installer: empty %s", label)
 	}
 	if strings.ContainsAny(path, "\n\r\x00") {
 		return fmt.Errorf("installer: %s %q contains newline or NUL", label, path)
+	}
+	if strings.ContainsRune(path, '%') {
+		return fmt.Errorf("installer: %s %q contains %% (systemd specifier metacharacter)", label, path)
 	}
 	return nil
 }

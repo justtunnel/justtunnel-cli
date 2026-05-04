@@ -92,6 +92,8 @@ func TestRenderUnit_RejectsBadInputs(t *testing.T) {
 		{"newline in log path", "ok", "/bin/x", "/tmp/x\ny.log", "log path"},
 		{"empty binary path", "ok", "", "/tmp/x.log", "empty binary path"},
 		{"NUL in binary path", "ok", "/bin/x\x00evil", "/tmp/x.log", "binary path"},
+		{"percent in log path", "ok", "/bin/x", "/log/%n.log", "log path"},
+		{"percent in binary path", "ok", "/bin/just%h", "/tmp/x.log", "binary path"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.label, func(subTest *testing.T) {
@@ -520,6 +522,185 @@ func TestIsUnitNotLoaded_ExitCodeOnly(t *testing.T) {
 	}
 	if !isUnitNotLoaded(err) {
 		t.Fatal("isUnitNotLoaded should match exit code 5 even without text")
+	}
+}
+
+// TestStdLingerPrompter_WhitespaceOnlyAccepts pins the documented behavior
+// that whitespace-only input is treated like Enter (accept). This follows
+// from TrimSpace: `"   \n"` reduces to `""`, which the `[Y/n]` convention
+// maps to "yes". The test exists so a future "tighten input handling"
+// patch can't quietly flip this without updating the prompter godoc.
+func TestStdLingerPrompter_WhitespaceOnlyAccepts(t *testing.T) {
+	out := &bytes.Buffer{}
+	prompter := &StdLingerPrompter{In: strings.NewReader("   \n"), Out: out}
+	got, err := prompter.Prompt(context.Background())
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	if !got {
+		t.Fatal("whitespace-only input should accept (TrimSpace -> empty -> Enter)")
+	}
+}
+
+// TestValidateUnitPath_RejectsPercent guards against systemd specifier
+// expansion smuggling values into the unit file. `%n` would expand to the
+// unit name; `%h` to the user home; etc.
+func TestValidateUnitPath_RejectsPercent(t *testing.T) {
+	if err := validateUnitPath("log path", "/log/%n.log"); err == nil {
+		t.Fatal("want error for path containing %, got nil")
+	} else if !strings.Contains(err.Error(), "%") {
+		t.Fatalf("error %q should mention %%", err)
+	}
+}
+
+// TestBootstrap_DaemonReloadFails_RemovesUnitFile verifies the
+// compensating-action path: a successful unit-file write followed by a
+// daemon-reload failure must NOT leave the unit file behind on disk.
+func TestBootstrap_DaemonReloadFails_RemovesUnitFile(t *testing.T) {
+	withWorkerHome(t)
+	seedWorkerConfig(t, "alpha")
+	installer, fake, _, homeDir := newTestSystemdInstaller(t)
+	// First systemctl call (daemon-reload) fails. We never reach
+	// enable --now, so only one queued result is needed.
+	fake.results = []runResult{
+		{Output: []byte("Failed to connect to bus\n"), Err: &fakeExitError{Code: 1}},
+	}
+
+	_, err := installer.Bootstrap(context.Background(), "alpha", SystemdOptions{NoLinger: true})
+	if err == nil {
+		t.Fatal("want error from daemon-reload failure")
+	}
+	if !strings.Contains(err.Error(), "daemon-reload") {
+		t.Fatalf("error %q should mention daemon-reload", err)
+	}
+	if !strings.Contains(err.Error(), "unit file removed") {
+		t.Fatalf("error %q should report unit file cleanup outcome", err)
+	}
+	unitPath := filepath.Join(homeDir, ".config", "systemd", "user", "justtunnel-worker-alpha.service")
+	if _, statErr := os.Stat(unitPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("unit file should be removed after daemon-reload failure; stat err = %v", statErr)
+	}
+}
+
+// TestBootstrap_LingerProbeError_ContinuesToPrompt asserts the warning
+// path: a non-benign loginctl failure (e.g. dbus error) must NOT abort
+// the install; it must log a warning and fall through to the prompt.
+func TestBootstrap_LingerProbeError_ContinuesToPrompt(t *testing.T) {
+	withWorkerHome(t)
+	seedWorkerConfig(t, "alpha")
+	installer, fake, prompter, _ := newTestSystemdInstaller(t)
+	warn := &bytes.Buffer{}
+	installer.WarnOut = warn
+	prompter.answers = []bool{false} // user denies at the prompt
+
+	// daemon-reload OK, enable --now OK, loginctl show-user fails with
+	// a NON-"unknown user" error (simulating dbus failure), then no
+	// enable-linger because user denies.
+	fake.results = []runResult{
+		{Output: nil, Err: nil},
+		{Output: nil, Err: nil},
+		{Output: []byte("Failed to connect to bus: No such file or directory\n"), Err: &fakeExitError{Code: 1}},
+	}
+
+	result, err := installer.Bootstrap(context.Background(), "alpha", SystemdOptions{NoLinger: false})
+	if err != nil {
+		t.Fatalf("Bootstrap should not fail when linger probe errors; got %v", err)
+	}
+	if result.LingerEnabled {
+		t.Fatal("LingerEnabled should be false when user denies after probe warning")
+	}
+	if prompter.calls != 1 {
+		t.Fatalf("prompter should be invoked exactly once; calls=%d", prompter.calls)
+	}
+	if !strings.Contains(warn.String(), "could not query linger status") {
+		t.Fatalf("warning text not emitted; warn=%q", warn.String())
+	}
+}
+
+// TestBootstrap_LingerProbe_UnknownUserIsBenign confirms the existing
+// behavior survives the new error policy: loginctl exit 1 with
+// "unknown user" output is still treated as "linger=no, prompt the user".
+// No warning should be printed in this case.
+func TestBootstrap_LingerProbe_UnknownUserIsBenign(t *testing.T) {
+	withWorkerHome(t)
+	seedWorkerConfig(t, "alpha")
+	installer, fake, prompter, _ := newTestSystemdInstaller(t)
+	warn := &bytes.Buffer{}
+	installer.WarnOut = warn
+	prompter.answers = []bool{false}
+
+	fake.results = []runResult{
+		{Output: nil, Err: nil},
+		{Output: nil, Err: nil},
+		{Output: []byte("Failed to look up user alice: Unknown user\n"), Err: &fakeExitError{Code: 1}},
+	}
+
+	_, err := installer.Bootstrap(context.Background(), "alpha", SystemdOptions{NoLinger: false})
+	if err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if prompter.calls != 1 {
+		t.Fatalf("prompter should be called once for unknown-user benign path; calls=%d", prompter.calls)
+	}
+	if warn.Len() != 0 {
+		t.Fatalf("no warning should be printed for benign unknown-user; got %q", warn.String())
+	}
+}
+
+// TestBootstrap_Idempotent_LingerAlreadyEnabledOnRerun asserts that on a
+// second Bootstrap with NoLinger=false, when loginctl now reports
+// Linger=yes (because the first run enabled it), the prompter is NOT
+// re-invoked. This is the canonical re-run scenario.
+func TestBootstrap_Idempotent_LingerAlreadyEnabledOnRerun(t *testing.T) {
+	withWorkerHome(t)
+	seedWorkerConfig(t, "alpha")
+	installer, fake, prompter, _ := newTestSystemdInstaller(t)
+	prompter.answers = []bool{true} // first run accepts; second run shouldn't ask
+
+	// Run 1: daemon-reload, enable --now, show-user (Linger=no),
+	// enable-linger.
+	// Run 2: daemon-reload, enable --now, show-user (Linger=yes) — done.
+	fake.results = []runResult{
+		{Output: nil, Err: nil},
+		{Output: nil, Err: nil},
+		{Output: []byte("Linger=no\n"), Err: nil},
+		{Output: nil, Err: nil},
+		{Output: nil, Err: nil},
+		{Output: nil, Err: nil},
+		{Output: []byte("Linger=yes\n"), Err: nil},
+	}
+
+	if _, err := installer.Bootstrap(context.Background(), "alpha", SystemdOptions{NoLinger: false}); err != nil {
+		t.Fatalf("Bootstrap 1: %v", err)
+	}
+	if prompter.calls != 1 {
+		t.Fatalf("after run 1, prompter should have been called once; calls=%d", prompter.calls)
+	}
+
+	result, err := installer.Bootstrap(context.Background(), "alpha", SystemdOptions{NoLinger: false})
+	if err != nil {
+		t.Fatalf("Bootstrap 2: %v", err)
+	}
+	if !result.LingerEnabled {
+		t.Fatal("run 2: LingerEnabled should be true (already on)")
+	}
+	if result.NoLingerWarningPrinted {
+		t.Fatal("run 2: NoLingerWarningPrinted should be false")
+	}
+	if prompter.calls != 1 {
+		t.Fatalf("run 2: prompter must NOT be called when linger already on; total calls=%d", prompter.calls)
+	}
+
+	// Verify call sequence: 4 calls in run 1, 3 in run 2 (no
+	// enable-linger because already on).
+	calls := fake.Calls()
+	if len(calls) != 7 {
+		t.Fatalf("want 7 total calls, got %d: %+v", len(calls), calls)
+	}
+	for _, call := range calls[4:] {
+		if call.Name == "loginctl" && len(call.Args) > 0 && call.Args[0] == "enable-linger" {
+			t.Fatalf("run 2: enable-linger should not be called; got %+v", call)
+		}
 	}
 }
 
