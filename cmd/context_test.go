@@ -12,7 +12,10 @@ import (
 )
 
 // resetContextState reinitializes process-level state that the context
-// commands touch so each test starts from a clean slate.
+// commands touch so each test starts from a clean slate. It also installs
+// a t.Cleanup that resets contextOverride so a test failure (e.g. t.Fatal
+// before a manual reset) cannot poison subsequent tests with stale flag
+// state.
 func resetContextState(t *testing.T, cfg *config.Config) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -20,6 +23,7 @@ func resetContextState(t *testing.T, cfg *config.Config) string {
 	config.SetConfigPath(path)
 	cfgFile = path
 	contextOverride = ""
+	t.Cleanup(func() { contextOverride = "" })
 
 	if cfg == nil {
 		cfg = &config.Config{ServerURL: "wss://api.example.com/ws"}
@@ -28,6 +32,12 @@ func resetContextState(t *testing.T, cfg *config.Config) string {
 		t.Fatalf("seed config: %v", err)
 	}
 	return path
+}
+
+// httpToWS rewrites an httptest.Server URL (http://...) into the ws:// form
+// that the CLI's config layer expects for ServerURL.
+func httpToWS(serverURL string) string {
+	return strings.Replace(serverURL, "http://", "ws://", 1)
 }
 
 // runCmd executes the named subcommand in isolation, capturing stdout.
@@ -112,9 +122,19 @@ func TestContextFlagOverridesShow(t *testing.T) {
 	if strings.TrimSpace(out) != "team:override" {
 		t.Errorf("show with --context override: got %q, want %q", strings.TrimSpace(out), "team:override")
 	}
+	// Cleanup is handled by resetContextState's t.Cleanup hook.
+}
 
-	// Reset the persistent flag value so subsequent tests aren't poisoned.
-	contextOverride = ""
+// TestContextFlagRejectsInvalid verifies the rootCmd PersistentPreRunE hook
+// short-circuits with an error when --context is set to a syntactically
+// invalid value, rather than letting it propagate via ResolveContext.
+func TestContextFlagRejectsInvalid(t *testing.T) {
+	resetContextState(t, nil)
+
+	_, err := runCmd(t, "--context", "garbage", "context", "show")
+	if err == nil {
+		t.Fatal("expected error for --context garbage, got nil")
+	}
 }
 
 func TestContextListWithoutAuthShowsPersonalOnly(t *testing.T) {
@@ -149,7 +169,7 @@ func TestContextListWithMembershipsEndpoint(t *testing.T) {
 
 	resetContextState(t, &config.Config{
 		AuthToken: "justtunnel_test_token",
-		ServerURL: strings.Replace(stubServer.URL, "http://", "ws://", 1) + "/ws",
+		ServerURL: httpToWS(stubServer.URL) + "/ws",
 	})
 
 	out, err := runCmd(t, "context", "list")
@@ -175,7 +195,7 @@ func TestContextListFallsBackWhenServerLacksEndpoint(t *testing.T) {
 
 	resetContextState(t, &config.Config{
 		AuthToken: "justtunnel_test_token",
-		ServerURL: strings.Replace(stubServer.URL, "http://", "ws://", 1) + "/ws",
+		ServerURL: httpToWS(stubServer.URL) + "/ws",
 	})
 
 	out, err := runCmd(t, "context", "list")

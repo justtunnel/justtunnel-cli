@@ -42,7 +42,19 @@ var rootCmd = &cobra.Command{
 	Short: "Expose a local HTTP server to the internet",
 	Long:  "justtunnel creates a public URL that tunnels traffic to a local port via a persistent WebSocket connection.",
 	Args:  cobra.RangeArgs(0, 1),
-	RunE:  runTunnel,
+	// Validate the --context flag once, before any subcommand runs, so a
+	// bad value short-circuits with a usable error instead of being
+	// silently propagated by config.ResolveContext.
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if contextOverride == "" {
+			return nil
+		}
+		if err := config.ValidateContext(contextOverride); err != nil {
+			return display.InputError(err.Error())
+		}
+		return nil
+	},
+	RunE: runTunnel,
 }
 
 func init() {

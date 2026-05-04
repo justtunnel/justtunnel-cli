@@ -2,9 +2,13 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -99,10 +103,19 @@ func runContextList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
 
-	memberships, supported, err := fetchMemberships(http.DefaultClient, baseURL, cfg.AuthToken)
+	// Pass nil so fetchMembershipsHTTP builds its own client with a 10s
+	// timeout. Passing http.DefaultClient would skip the timeout and risk a
+	// hang against an unresponsive server.
+	memberships, supported, err := fetchMemberships(nil, baseURL, cfg.AuthToken)
 	if err != nil {
-		fmt.Fprintf(out, "\n(could not list team memberships: %v)\n", err)
-		return nil
+		// Network/timeout errors degrade gracefully (warning to stderr) so
+		// the user still sees their personal context. Other non-2xx
+		// responses (401/403/500/...) are loud failures with non-zero exit.
+		if isNetworkError(err) {
+			fmt.Fprintf(os.Stderr, "warning: could not list team memberships: %v\n", err)
+			return nil
+		}
+		return fmt.Errorf("list team memberships: %w", err)
 	}
 	if !supported {
 		fmt.Fprintln(out, "\n(team membership listing not yet supported by this server;")
@@ -112,6 +125,12 @@ func runContextList(cmd *cobra.Command, args []string) error {
 
 	for _, mem := range memberships {
 		name := config.TeamContextPrefix + mem.TeamSlug
+		// Defensive: if the server returns a syntactically invalid slug,
+		// skip it with a stderr warning rather than emitting garbage.
+		if validateErr := config.ValidateContext(name); validateErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping invalid membership %q: %v\n", name, validateErr)
+			continue
+		}
 		fmt.Fprintf(out, "%s%s", marker(name), name)
 		if mem.TeamName != "" {
 			fmt.Fprintf(out, "  (%s)", mem.TeamName)
@@ -119,6 +138,25 @@ func runContextList(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(out)
 	}
 	return nil
+}
+
+// isNetworkError reports whether err looks like a transient transport-layer
+// failure (DNS, connection refused, timeout) as opposed to a structured HTTP
+// error response. Network failures degrade gracefully; structured errors
+// surface to the user.
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
 }
 
 func runContextUse(cmd *cobra.Command, args []string) error {
@@ -173,7 +211,9 @@ func fetchMembershipsHTTP(client *http.Client, baseURL, authToken string) ([]mem
 		return nil, false, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		// Bound the read so a malicious or misconfigured server cannot OOM
+		// the CLI by streaming an enormous error body.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, true, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
 	}
 
