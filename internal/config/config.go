@@ -15,6 +15,7 @@ type Config struct {
 	ServerURL            string `mapstructure:"server_url" yaml:"server_url,omitempty"`
 	LogLevel             string `mapstructure:"log_level" yaml:"log_level,omitempty"`
 	MaxReconnectAttempts *int   `mapstructure:"max_reconnect_attempts" yaml:"max_reconnect_attempts,omitempty"`
+	CurrentContext       string `mapstructure:"current_context" yaml:"current_context,omitempty"`
 }
 
 var configFilePath string

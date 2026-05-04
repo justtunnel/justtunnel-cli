@@ -34,6 +34,7 @@ var (
 	maxReconnectAttempts int
 	tunnelConfigFile     string
 	localTimeout         time.Duration
+	contextOverride      string
 )
 
 var rootCmd = &cobra.Command{
@@ -46,6 +47,7 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default ~/.config/justtunnel/config.yaml)")
+	rootCmd.PersistentFlags().StringVar(&contextOverride, "context", "", "context override for this invocation (e.g. personal, team:<slug>)")
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.Flags().StringVarP(&subdomain, "subdomain", "s", "", "request a specific subdomain")
 	rootCmd.Flags().IntVar(&maxReconnectAttempts, "max-reconnect-attempts", 50, "maximum number of reconnection attempts (0 = unlimited)")
