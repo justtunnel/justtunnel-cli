@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -134,6 +135,130 @@ func TestContextFlagRejectsInvalid(t *testing.T) {
 	_, err := runCmd(t, "--context", "garbage", "context", "show")
 	if err == nil {
 		t.Fatal("expected error for --context garbage, got nil")
+	}
+}
+
+// TestContextUsePushesToServer verifies that `context use team:<slug>` calls
+// the active-context sync endpoint with the right body when an auth token
+// is present. Regression guard for justtunnel-cli#44.
+func TestContextUsePushesToServer(t *testing.T) {
+	resetContextState(t, &config.Config{
+		ServerURL: "wss://api.example.com/ws",
+		AuthToken: "tok_test",
+	})
+
+	previousPusher := pushActiveContext
+	t.Cleanup(func() { pushActiveContext = previousPusher })
+
+	var got struct {
+		called      bool
+		baseURL     string
+		authToken   string
+		contextName string
+	}
+	pushActiveContext = func(client *http.Client, baseURL, authToken, contextName string) error {
+		got.called = true
+		got.baseURL = baseURL
+		got.authToken = authToken
+		got.contextName = contextName
+		return nil
+	}
+
+	if _, err := runCmd(t, "context", "use", "team:acme"); err != nil {
+		t.Fatalf("use: %v", err)
+	}
+	if !got.called {
+		t.Fatal("pushActiveContext was not called")
+	}
+	if got.contextName != "team:acme" {
+		t.Errorf("contextName: got %q want %q", got.contextName, "team:acme")
+	}
+	if got.authToken != "tok_test" {
+		t.Errorf("authToken: got %q want %q", got.authToken, "tok_test")
+	}
+	if !strings.HasPrefix(got.baseURL, "https://") {
+		t.Errorf("baseURL should be https-derived: got %q", got.baseURL)
+	}
+}
+
+// TestContextUseSkipsServerSyncWhenLoggedOut verifies that the push is a
+// no-op when no auth token is present — the user can still configure the
+// CLI offline.
+func TestContextUseSkipsServerSyncWhenLoggedOut(t *testing.T) {
+	resetContextState(t, &config.Config{ServerURL: "wss://api.example.com/ws"})
+
+	previousPusher := pushActiveContext
+	t.Cleanup(func() { pushActiveContext = previousPusher })
+
+	called := false
+	pushActiveContext = func(client *http.Client, baseURL, authToken, contextName string) error {
+		called = true
+		return nil
+	}
+
+	if _, err := runCmd(t, "context", "use", "team:acme"); err != nil {
+		t.Fatalf("use: %v", err)
+	}
+	if called {
+		t.Fatal("pushActiveContext should not be called without auth token")
+	}
+}
+
+// TestContextUseTolerates404FromOlderServer verifies that pushActiveContextHTTP
+// returns nil when the server returns 404, so older servers without the
+// route don't surface a confusing warning.
+func TestPushActiveContextHTTP_TolerantOf404(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+
+	if err := pushActiveContextHTTP(server.Client(), server.URL, "tok", "personal"); err != nil {
+		t.Fatalf("404 should be soft: got %v", err)
+	}
+}
+
+// TestPushActiveContextHTTP_BodyShape verifies the wire format the server
+// expects: {"kind":"personal"} and {"kind":"team","slug":"<s>"}.
+func TestPushActiveContextHTTP_BodyShape(t *testing.T) {
+	tests := []struct {
+		contextName string
+		wantKind    string
+		wantSlug    string
+	}{
+		{"personal", "personal", ""},
+		{"team:acme", "team", "acme"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.contextName, func(t *testing.T) {
+			var receivedBody struct {
+				Kind string `json:"kind"`
+				Slug string `json:"slug,omitempty"`
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, request *http.Request) {
+				if request.URL.Path != "/api/me/preferences/active-context" {
+					t.Errorf("path: got %q want %q", request.URL.Path, "/api/me/preferences/active-context")
+				}
+				if got := request.Header.Get("Authorization"); got != "Bearer tok" {
+					t.Errorf("auth header: got %q", got)
+				}
+				if err := json.NewDecoder(request.Body).Decode(&receivedBody); err != nil {
+					t.Fatalf("decode body: %v", err)
+				}
+				rw.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(server.Close)
+
+			if err := pushActiveContextHTTP(server.Client(), server.URL, "tok", testCase.contextName); err != nil {
+				t.Fatalf("push: %v", err)
+			}
+			if receivedBody.Kind != testCase.wantKind {
+				t.Errorf("kind: got %q want %q", receivedBody.Kind, testCase.wantKind)
+			}
+			if receivedBody.Slug != testCase.wantSlug {
+				t.Errorf("slug: got %q want %q", receivedBody.Slug, testCase.wantSlug)
+			}
+		})
 	}
 }
 
