@@ -29,3 +29,7 @@ coverage.out
 
 # Local mongodump output — never commit DB snapshots
 jt-backup/
+
+# Local planning / agent telemetry — never commit
+.planning/
+tunnels.yaml

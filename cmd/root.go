@@ -34,6 +34,7 @@ var (
 	maxReconnectAttempts int
 	tunnelConfigFile     string
 	localTimeout         time.Duration
+	contextOverride      string
 )
 
 var rootCmd = &cobra.Command{
@@ -41,11 +42,24 @@ var rootCmd = &cobra.Command{
 	Short: "Expose a local HTTP server to the internet",
 	Long:  "justtunnel creates a public URL that tunnels traffic to a local port via a persistent WebSocket connection.",
 	Args:  cobra.RangeArgs(0, 1),
-	RunE:  runTunnel,
+	// Validate the --context flag once, before any subcommand runs, so a
+	// bad value short-circuits with a usable error instead of being
+	// silently propagated by config.ResolveContext.
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if contextOverride == "" {
+			return nil
+		}
+		if err := config.ValidateContext(contextOverride); err != nil {
+			return display.InputError(err.Error())
+		}
+		return nil
+	},
+	RunE: runTunnel,
 }
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default ~/.config/justtunnel/config.yaml)")
+	rootCmd.PersistentFlags().StringVar(&contextOverride, "context", "", "context override for this invocation (e.g. personal, team:<slug>)")
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.Flags().StringVarP(&subdomain, "subdomain", "s", "", "request a specific subdomain")
 	rootCmd.Flags().IntVar(&maxReconnectAttempts, "max-reconnect-attempts", 50, "maximum number of reconnection attempts (0 = unlimited)")

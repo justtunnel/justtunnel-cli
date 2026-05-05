@@ -10,11 +10,19 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
+// AuthHeaderPrefix is the canonical "Bearer " (note the trailing space)
+// string used wherever the CLI sets an Authorization header. E7: defined
+// once here so cmd/, internal/worker/, and internal/tui/ all reference
+// the same value — a typo in one call site cannot accidentally diverge
+// from the others.
+const AuthHeaderPrefix = "Bearer "
+
 type Config struct {
 	AuthToken            string `mapstructure:"auth_token" yaml:"auth_token,omitempty"`
 	ServerURL            string `mapstructure:"server_url" yaml:"server_url,omitempty"`
 	LogLevel             string `mapstructure:"log_level" yaml:"log_level,omitempty"`
 	MaxReconnectAttempts *int   `mapstructure:"max_reconnect_attempts" yaml:"max_reconnect_attempts,omitempty"`
+	CurrentContext       string `mapstructure:"current_context" yaml:"current_context,omitempty"`
 }
 
 var configFilePath string
