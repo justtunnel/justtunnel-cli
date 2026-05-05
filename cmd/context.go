@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -33,6 +35,15 @@ type membershipFetcher func(client *http.Client, baseURL, authToken string) ([]m
 
 // fetchMemberships is the package-level fetcher; tests may swap it.
 var fetchMemberships membershipFetcher = fetchMembershipsHTTP
+
+// activeContextPusher syncs the user's active context to the server so the
+// WS worker handshake can resolve the team without requiring team_slug on
+// every dial. Production wiring uses pushActiveContextHTTP; tests inject
+// stubs.
+type activeContextPusher func(client *http.Client, baseURL, authToken, contextName string) error
+
+// pushActiveContext is the package-level pusher; tests may swap it.
+var pushActiveContext activeContextPusher = pushActiveContextHTTP
 
 var contextCmd = &cobra.Command{
 	Use:   "context",
@@ -175,6 +186,21 @@ func runContextUse(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(cmd.OutOrStdout(), "Active context set to %s.\n", name)
+
+	// Best-effort sync to the server so the WS worker handshake can resolve
+	// the team without team_slug on the dial URL. Local config remains the
+	// source of truth — push failures degrade to a stderr warning so the
+	// user can keep working offline. See justtunnel-cli#44.
+	if cfg.AuthToken != "" {
+		baseURL, parseErr := apiBaseURL(cfg.ServerURL)
+		if parseErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not sync context to server: %v\n", parseErr)
+			return nil
+		}
+		if pushErr := pushActiveContext(nil, baseURL, cfg.AuthToken, name); pushErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not sync context to server: %v\n", pushErr)
+		}
+	}
 	return nil
 }
 
@@ -224,4 +250,62 @@ func fetchMembershipsHTTP(client *http.Client, baseURL, authToken string) ([]mem
 		return nil, true, fmt.Errorf("decode response: %w", err)
 	}
 	return payload.Memberships, true, nil
+}
+
+// pushActiveContextHTTP POSTs the active context name to the server so the
+// user.active_context column reflects the CLI's local choice. The endpoint
+// is /api/me/preferences/active-context with body
+// {"kind":"personal"|"team","slug":"<slug>"}. Empty input is rejected here
+// (caller validates first via config.ValidateContext).
+func pushActiveContextHTTP(client *http.Client, baseURL, authToken, contextName string) error {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+
+	var body struct {
+		Kind string `json:"kind"`
+		Slug string `json:"slug,omitempty"`
+	}
+	switch {
+	case contextName == config.PersonalContext:
+		body.Kind = "personal"
+	case strings.HasPrefix(contextName, config.TeamContextPrefix):
+		body.Kind = "team"
+		body.Slug = strings.TrimPrefix(contextName, config.TeamContextPrefix)
+		if body.Slug == "" {
+			return fmt.Errorf("team context missing slug")
+		}
+	default:
+		return fmt.Errorf("unknown context shape: %s", contextName)
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encode body: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/me/preferences/active-context", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", config.AuthHeaderPrefix+authToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 404 from older servers without the route is treated as a soft failure
+	// so the CLI doesn't surface a confusing warning every time someone
+	// runs against a not-yet-upgraded server.
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(errorBody)))
+	}
+	return nil
 }
