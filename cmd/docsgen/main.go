@@ -72,18 +72,9 @@ func main() {
 }
 
 func run(out *os.File) error {
-	root := cmd.RootCmd()
-	if root == nil {
-		return fmt.Errorf("cmd.RootCmd() returned nil")
-	}
-
-	entries := make([]commandEntry, 0, 32)
-	walk(root, []string{root.Name()}, &entries)
-
-	doc := manifest{
-		Version:     version.Version,
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		Commands:    entries,
+	doc, err := BuildManifest()
+	if err != nil {
+		return err
 	}
 
 	encoder := json.NewEncoder(out)
@@ -92,6 +83,26 @@ func run(out *os.File) error {
 		return fmt.Errorf("encode manifest: %w", err)
 	}
 	return nil
+}
+
+// BuildManifest walks the cobra command tree exposed by cmd.RootCmd()
+// and returns a fully populated manifest. Exposed for testing so that
+// assertions about command/flag coverage can be made without re-parsing
+// the JSON output.
+func BuildManifest() (manifest, error) {
+	root := cmd.RootCmd()
+	if root == nil {
+		return manifest{}, fmt.Errorf("cmd.RootCmd() returned nil")
+	}
+
+	entries := make([]commandEntry, 0, 32)
+	walk(root, []string{root.Name()}, &entries)
+
+	return manifest{
+		Version:     version.Version,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Commands:    entries,
+	}, nil
 }
 
 // walk recursively appends an entry for `current` and each of its
