@@ -224,6 +224,24 @@ go test ./...            # run all tests
 go test -race ./...      # with race detector
 ```
 
+## Generating the docs manifest
+
+`justtunnel-landing` consumes a JSON manifest of every CLI command and flag
+to render the CLI Reference pages. Regenerate after any command or flag change:
+
+```sh
+make docs-manifest
+```
+
+This writes `dist/cli-manifest.json`. To publish to landing:
+
+```sh
+cp dist/cli-manifest.json ../justtunnel-landing/src/lib/
+```
+
+Then commit the updated manifest in the landing repo. Automation of this
+cross-repo copy is a future improvement (not v1).
+
 ## Project Structure
 
 ```
