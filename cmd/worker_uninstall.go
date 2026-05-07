@@ -212,6 +212,17 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(cmd.OutOrStdout(), "worker %q already uninstalled\n", name)
 		return nil
 	}
+	if workerUninstallDeleteOnServer {
+		// Server soft-deletes (status=retired_quarantined); a reaper
+		// removes the row 30 days later. Tell the operator so they
+		// aren't surprised by `worker list --all` still showing the
+		// name. See justtunnel-cli#50.
+		fmt.Fprintf(cmd.OutOrStdout(),
+			"Uninstalled worker %q (server-side row quarantined; permanent removal in 30 days)\n",
+			name,
+		)
+		return nil
+	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Uninstalled worker %q\n", name)
 	return nil
 }

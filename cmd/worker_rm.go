@@ -129,8 +129,14 @@ func runWorkerRm(cmd *cobra.Command, args []string) error {
 			name, workerID,
 		)
 	} else {
+		// The server soft-deletes (status=retired_quarantined) and a
+		// background reaper removes the row 30 days later — see #70 /
+		// admin-lifecycle. Reflect that in the success message so the
+		// user isn't confused by the worker still showing up in
+		// `worker list --all`. See justtunnel-cli#50.
 		fmt.Fprintf(cmd.OutOrStdout(),
-			"Deleted worker %q (server + local).\n", name,
+			"Quarantined worker %q (local config removed; permanent server-side removal in 30 days).\n",
+			name,
 		)
 	}
 	return nil
