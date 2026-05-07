@@ -138,6 +138,7 @@ func (t *Tunnel) connect(ctx context.Context) error {
 }
 
 func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
+	t.logger.Debug("dialing tunnel websocket", "url", dialURL)
 	opts := &websocket.DialOptions{}
 	if t.authToken != "" {
 		opts.HTTPHeader = http.Header{
@@ -153,8 +154,23 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 
 	conn, httpResp, err := websocket.Dial(ctx, dialURL, opts)
 	if err != nil {
-		if httpResp != nil && (httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden) {
-			return display.AuthError(fmt.Sprintf("server returned %d: %v", httpResp.StatusCode, err))
+		if httpResp != nil {
+			switch httpResp.StatusCode {
+			case http.StatusUnauthorized:
+				return display.AuthError(fmt.Sprintf("server returned %d: %v", httpResp.StatusCode, err))
+			case http.StatusForbidden:
+				// 403 means "authenticated but not allowed". The most
+				// common causes for tunnel dial are: subdomain
+				// reservation requires Pro plan, the requested
+				// subdomain is taken, or the account/team is
+				// suspended. None of those are fixed by re-auth, so
+				// we deliberately steer the user away from
+				// `justtunnel auth`. See justtunnel-cli#47.
+				return display.ForbiddenError(
+					fmt.Sprintf("server returned 403: %v", err),
+					"This is not an authentication problem. Common causes: requested subdomain requires the Pro plan, the subdomain is in use, or your account/team is suspended.",
+				)
+			}
 		}
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -192,6 +208,12 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 	t.reconnectToken = assigned.ReconnectToken
 	t.reconnectIssuedAt = assigned.ReconnectIssuedAt
 	t.passwordProtected = assigned.PasswordProtected
+	t.logger.Debug("tunnel assigned",
+		"subdomain", assigned.Subdomain,
+		"url", assigned.URL,
+		"tunnel_id", assigned.TunnelID,
+		"password_protected", assigned.PasswordProtected,
+	)
 
 	// Only fire OnConnected for the initial connection, not during reconnects.
 	if !t.reconnecting && t.callbacks.OnConnected != nil {
@@ -220,6 +242,11 @@ func (t *Tunnel) readLoop(ctx context.Context) error {
 
 		switch parsed := frame.(type) {
 		case *RequestFrame:
+			t.logger.Debug("incoming request frame",
+				"id", parsed.ID,
+				"method", parsed.Method,
+				"path", parsed.Path,
+			)
 			t.wg.Add(1)
 			go t.handleRequest(ctx, parsed)
 		case *ErrorFrame:
@@ -290,6 +317,17 @@ func (t *Tunnel) writeJSONTo(ctx context.Context, targetConn *websocket.Conn, v 
 func isAuthError(err error) bool {
 	var cliErr *display.CLIError
 	return errors.As(err, &cliErr) && cliErr.Category == display.CategoryAuth
+}
+
+// isTerminalDialError reports whether reconnecting is futile. Auth (401)
+// won't fix itself across attempts, and Forbidden (403) policy decisions
+// won't either — keep retrying would just hammer the server.
+func isTerminalDialError(err error) bool {
+	var cliErr *display.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	return cliErr.Category == display.CategoryAuth || cliErr.Category == display.CategoryForbidden
 }
 
 // buildReconnectURL appends reconnect token parameters to the server URL
@@ -364,9 +402,13 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 		if err := t.connectWithURL(ctx, reconnectURL); err != nil {
 			t.logger.Error("reconnect attempt failed", "attempt", attempt, "error", err)
 
-			// Don't retry on auth errors — credentials won't change between attempts.
+			// Don't retry on auth or forbidden errors — credentials and
+			// policy decisions won't change between attempts.
 			if isAuthError(err) {
 				return display.AuthError("authentication failed during reconnect - run 'justtunnel auth' to re-authenticate")
+			}
+			if isTerminalDialError(err) {
+				return err
 			}
 
 			backoff *= 2

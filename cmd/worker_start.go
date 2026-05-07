@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -64,18 +63,18 @@ func runWorkerStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Tee logs to both stderr (for foreground operators) and the per-worker
-	// log file (for `worker logs` in #31). The file is opened in append mode
-	// with 0600 perms — see worker.OpenLogFile.
-	logFile, err := worker.OpenLogFile(name)
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-
+	// Logs go to stderr only. The platform supervisor (launchd on macOS,
+	// systemd-user on Linux) is configured to redirect stderr to the
+	// per-worker log file at ~/.justtunnel/logs/worker-<name>.log, which
+	// is what `worker logs` reads. Writing to the file in-process AND
+	// having the supervisor capture stderr to the same path produced
+	// duplicate lines in the log file (F-10) — see justtunnel-cli#51.
+	//
+	// Foreground use without a supervisor (`justtunnel worker start
+	// <name>` directly) emits to stderr only; that's intentional, since
+	// the operator is watching the terminal in that mode.
 	logLevel := parseLogLevel(cfg.LogLevel)
-	multiWriter := io.MultiWriter(cmd.ErrOrStderr(), logFile)
-	logger := slog.New(slog.NewTextHandler(multiWriter, &slog.HandlerOptions{
+	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{
 		Level: logLevel,
 	}))
 
@@ -113,9 +112,10 @@ func runWorkerStart(cmd *cobra.Command, args []string) error {
 
 	runErr := runner.Run(ctx)
 
-	// Disambiguate the three exit modes for the operator and the caller:
+	// Disambiguate the four exit modes for the operator and the caller:
 	//   * context cancelled (SIGINT/SIGTERM) → exit 0
-	//   * terminal close code (4403/4409)    → return error so cobra exits 1
+	//   * 403 forbidden                      → display.ForbiddenError (no re-auth misdirection)
+	//   * 401 / terminal close code          → return error so cobra exits 1
 	//   * any other error                    → return error
 	switch {
 	case runErr == nil:
@@ -123,6 +123,15 @@ func runWorkerStart(cmd *cobra.Command, args []string) error {
 	case errors.Is(runErr, context.Canceled):
 		logger.Info("worker stopped (signal received)", "worker", workerCfg.Name)
 		return nil
+	case errors.Is(runErr, worker.ErrForbidden):
+		// Most common cause for a worker 403 is creating the worker via
+		// `worker create` (no service token) and then trying to start
+		// it directly. Steer the operator there instead of suggesting
+		// re-auth, which won't help. See justtunnel-cli#47.
+		return display.ForbiddenError(
+			fmt.Sprintf("worker %q rejected by server (403)", workerCfg.Name),
+			fmt.Sprintf("This is not an authentication problem. If %[1]q was created with `worker create`, run `justtunnel worker install %[1]s` to provision a service token. Other causes: the team is suspended or your membership was revoked.", workerCfg.Name),
+		)
 	default:
 		return runErr
 	}

@@ -12,6 +12,12 @@ const (
 	CategoryAuth
 	CategoryInput
 	CategoryServer
+	// CategoryForbidden is for 403 / policy-rejection style errors where
+	// the user IS authenticated but the requested action is not allowed
+	// (plan limits, missing service token, suspended team, etc.). It
+	// renders without the misleading "re-authenticate" suggestion that
+	// CategoryAuth carries. See justtunnel-cli#47.
+	CategoryForbidden
 )
 
 type CLIError struct {
@@ -55,6 +61,18 @@ func ServerError(message string) *CLIError {
 	}
 }
 
+// ForbiddenError builds a 403-style CLIError. Suggestion is caller-supplied
+// because the right next step depends on context (plan upgrade, install a
+// service token, contact billing, etc.) — anything generic risks
+// reintroducing the "re-authenticate" misdirection that #47 fixed.
+func ForbiddenError(message, suggestion string) *CLIError {
+	return &CLIError{
+		Category:   CategoryForbidden,
+		Message:    message,
+		Suggestion: suggestion,
+	}
+}
+
 func PrintError(err error) {
 	var cliErr *CLIError
 	if !errors.As(err, &cliErr) {
@@ -75,6 +93,9 @@ func PrintError(err error) {
 		prefix = "Error"
 	case CategoryServer:
 		prefix = "Server error"
+	case CategoryForbidden:
+		prefix = "Forbidden"
+		prefixColor = colorYellow
 	}
 
 	fmt.Fprintln(output)
