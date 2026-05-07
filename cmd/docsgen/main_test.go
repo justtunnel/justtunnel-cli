@@ -68,12 +68,14 @@ func TestRootFlagCount(t *testing.T) {
 	if rootEntry == nil {
 		t.Fatalf("root entry missing")
 	}
-	// Root currently declares 6 user-facing flags (subdomain, password,
-	// log-level, local-timeout, max-reconnect-attempts, config-file).
+	// Root currently declares 8 user-facing flags:
+	//   6 local non-persistent: subdomain, password, log-level,
+	//     local-timeout, max-reconnect-attempts, config-file
+	//   2 persistent: config, context
 	// Cobra's auto --help is added at parse time and not present here.
 	// This lower bound catches regressions where a declared flag goes
 	// missing without forcing churn when a new flag is intentionally added.
-	const minFlags = 6
+	const minFlags = 8
 	if got := len(rootEntry.Flags); got < minFlags {
 		t.Fatalf("root flag count: got %d, want >= %d (flags: %+v)", got, minFlags, rootEntry.Flags)
 	}

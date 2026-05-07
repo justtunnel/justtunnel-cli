@@ -142,8 +142,24 @@ func buildEntry(current *cobra.Command, path []string) commandEntry {
 			flags = append(flags, toFlagEntry(flag))
 		})
 	} else {
-		// Root: include local + persistent flags declared on root.
+		// Root: walk Flags() (local non-persistent) AND PersistentFlags()
+		// separately and merge — cobra's Flags() does NOT include persistent
+		// flags declared on the same command, only inherited ones (and root
+		// has nothing to inherit). Both are user-passable on the bare root
+		// invocation.
+		seen := make(map[string]struct{})
 		current.Flags().VisitAll(func(flag *pflag.Flag) {
+			if _, dup := seen[flag.Name]; dup {
+				return
+			}
+			seen[flag.Name] = struct{}{}
+			flags = append(flags, toFlagEntry(flag))
+		})
+		current.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+			if _, dup := seen[flag.Name]; dup {
+				return
+			}
+			seen[flag.Name] = struct{}{}
 			flags = append(flags, toFlagEntry(flag))
 		})
 	}
