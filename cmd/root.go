@@ -91,6 +91,13 @@ func Execute() error {
 	return err
 }
 
+// RootCmd returns the root cobra command. Exported so out-of-package
+// tools (e.g. cmd/docsgen) can walk the command tree without exec'ing
+// the binary.
+func RootCmd() *cobra.Command {
+	return rootCmd
+}
+
 func runTunnel(cmd *cobra.Command, args []string) error {
 	// Parse port arg if provided
 	var port int
