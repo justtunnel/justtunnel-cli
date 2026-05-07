@@ -46,7 +46,11 @@ func runWorkerList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	serverWorkers, err := fetchWorkers(cmd.Context(), baseURL, cfg.AuthToken, teamID)
+	// When --all is set, ask the server to include quarantined workers.
+	// The default endpoint strips them entirely (justtunnel-server #170 /
+	// F-16) so the billing quota stays accurate; without the explicit
+	// query param the --all flag would be a dead toggle (F-20).
+	serverWorkers, err := fetchWorkersWithOptions(cmd.Context(), baseURL, cfg.AuthToken, teamID, workerListAll)
 	if err != nil {
 		return err
 	}
@@ -58,6 +62,10 @@ func runWorkerList(cmd *cobra.Command, args []string) error {
 
 	rows := mergeWorkers(serverWorkers, localWorkers, ctxName)
 	if !workerListAll {
+		// Defense-in-depth: the server already strips quarantined rows for
+		// the default listing, but keep the client-side filter so a stale
+		// CLI talking to a future server that surfaces quarantined rows
+		// without an explicit opt-in still hides them by default.
 		rows = filterQuarantined(rows)
 	}
 

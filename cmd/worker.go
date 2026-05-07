@@ -202,9 +202,25 @@ func postWorker(ctx context.Context, baseURL, authToken, teamID, name string) (*
 	return &worker, nil
 }
 
-// fetchWorkers calls GET /api/teams/{teamID}/workers.
+// fetchWorkers calls GET /api/teams/{teamID}/workers. The default response
+// excludes workers in `retired_quarantined` (the 30-day soft-delete window
+// after `worker rm --delete-on-server`).
 func fetchWorkers(ctx context.Context, baseURL, authToken, teamID string) ([]workerAPI, error) {
+	return fetchWorkersWithOptions(ctx, baseURL, authToken, teamID, false)
+}
+
+// fetchWorkersWithOptions is fetchWorkers with an explicit
+// includeQuarantined flag. When true, the request adds
+// `?include=quarantined` so the server returns soft-deleted workers
+// alongside live ones — used by `worker list --all` (justtunnel-cli#50,
+// justtunnel-server F-20). The default path goes through fetchWorkers so
+// quota-counting consumers (status, install, uninstall, rm) keep matching
+// the dashboard view.
+func fetchWorkersWithOptions(ctx context.Context, baseURL, authToken, teamID string, includeQuarantined bool) ([]workerAPI, error) {
 	url := baseURL + "/api/teams/" + teamID + "/workers"
+	if includeQuarantined {
+		url += "?include=quarantined"
+	}
 	status, raw, err := httpDo(ctx, http.MethodGet, url, authToken, nil)
 	if err != nil {
 		return nil, err

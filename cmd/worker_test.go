@@ -734,7 +734,9 @@ func TestWorkerRmDeleteOnServerMessageReflectsQuarantine(t *testing.T) {
 // soft-deleted, otherwise a user who just ran `rm --delete-on-server`
 // sees their "deleted" worker still listed.
 func TestWorkerListHidesQuarantinedByDefault(t *testing.T) {
+	var observedInclude string
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		observedInclude = request.URL.Query().Get("include")
 		writer.Header().Set("Content-Type", "application/json")
 		writer.Write([]byte(`{"workers":[
 		    {"id":"wkr_a","name":"alice","team_id":"team-alpha","subdomain":"alice--team-alpha","status":"online"},
@@ -755,13 +757,28 @@ func TestWorkerListHidesQuarantinedByDefault(t *testing.T) {
 	if strings.Contains(out, "zombie") {
 		t.Errorf("quarantined worker should be hidden by default: %s", out)
 	}
+	// Default mode must NOT pass `?include=quarantined` so the server keeps
+	// the billing-quota-accurate filtered view (justtunnel-server #170).
+	if observedInclude != "" {
+		t.Errorf("default list must not request quarantined; got include=%q", observedInclude)
+	}
 }
 
 // TestWorkerListAllShowsQuarantined verifies the --all flag opts the
 // quarantined rows back in.
 func TestWorkerListAllShowsQuarantined(t *testing.T) {
+	var observedInclude string
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		observedInclude = request.URL.Query().Get("include")
 		writer.Header().Set("Content-Type", "application/json")
+		// Server only echoes back quarantined rows when explicitly asked
+		// (justtunnel-server F-20). If the CLI omits the query param the
+		// stub returns nothing, so the assertions below also catch a
+		// regression where --all silently drops the include flag.
+		if observedInclude != "quarantined" {
+			writer.Write([]byte(`{"workers":[]}`))
+			return
+		}
 		writer.Write([]byte(`{"workers":[
 		    {"id":"wkr_z","name":"zombie","team_id":"team-alpha","subdomain":"zombie--team-alpha","status":"retired_quarantined"}
 		]}`))
@@ -773,6 +790,9 @@ func TestWorkerListAllShowsQuarantined(t *testing.T) {
 	out, err := runCmd(t, "worker", "list", "--all")
 	if err != nil {
 		t.Fatalf("list --all: %v", err)
+	}
+	if observedInclude != "quarantined" {
+		t.Fatalf("--all must send ?include=quarantined; got include=%q", observedInclude)
 	}
 	if !strings.Contains(out, "zombie") {
 		t.Errorf("--all should reveal quarantined rows: %s", out)
