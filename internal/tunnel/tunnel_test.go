@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"nhooyr.io/websocket"
+
+	"github.com/justtunnel/justtunnel-cli/internal/display"
 )
 
 func TestTunnelEndToEnd(t *testing.T) {
@@ -124,4 +127,62 @@ func TestTunnelEndToEnd(t *testing.T) {
 
 	// Wait for server handler to finish so t.Errorf calls are safe
 	<-serverDone
+}
+
+// TestTunnelDial403MapsToForbidden guards justtunnel-cli#47: a 403 from
+// the WebSocket dial must surface as a CategoryForbidden CLIError, NOT
+// a CategoryAuth one. The user is authenticated; suggesting they
+// re-authenticate is misleading and sends them down the wrong path.
+func TestTunnelDial403MapsToForbidden(t *testing.T) {
+	wsServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Error(writer, "subdomain reserved for Pro plan", http.StatusForbidden)
+	}))
+	defer wsServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tun := New(wsURL, "http://localhost:0", "", logger, Callbacks{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := tun.Run(ctx)
+	if err == nil {
+		t.Fatal("expected dial error on 403, got nil")
+	}
+	var cliErr *display.CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("expected CLIError, got %T: %v", err, err)
+	}
+	if cliErr.Category != display.CategoryForbidden {
+		t.Errorf("category: got %v, want CategoryForbidden (must NOT be CategoryAuth)", cliErr.Category)
+	}
+}
+
+// TestTunnelDial401MapsToAuth is the contrast case: a 401 still maps to
+// CategoryAuth (re-authentication IS the right next step there).
+func TestTunnelDial401MapsToAuth(t *testing.T) {
+	wsServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Error(writer, "invalid token", http.StatusUnauthorized)
+	}))
+	defer wsServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tun := New(wsURL, "http://localhost:0", "", logger, Callbacks{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := tun.Run(ctx)
+	if err == nil {
+		t.Fatal("expected dial error on 401, got nil")
+	}
+	var cliErr *display.CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("expected CLIError, got %T: %v", err, err)
+	}
+	if cliErr.Category != display.CategoryAuth {
+		t.Errorf("category: got %v, want CategoryAuth", cliErr.Category)
+	}
 }

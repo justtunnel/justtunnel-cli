@@ -569,33 +569,35 @@ func TestWorkerURLForConfigured(t *testing.T) {
 			want:      "https://alpha--team.justtunnel.dev",
 		},
 		{
-			name:      "localhost dev fallback",
+			// Localhost dev: server routes by host (subdomain), so the
+			// URL must put the subdomain on the host side. The previous
+			// path-form fallback (http://localhost:8080/<sub>) returned
+			// 404 against the real server — see #48.
+			name:      "localhost dev",
 			serverURL: "ws://localhost:8080/ws",
 			subdomain: "alpha--team",
-			want:      "http://localhost:8080/alpha--team",
+			want:      "http://alpha--team.localhost:8080",
 		},
 		{
 			name:      "custom domain without api prefix",
 			serverURL: "wss://tunnels.example.com/ws",
 			subdomain: "alpha--team",
-			want:      "https://tunnels.example.com/alpha--team",
+			want:      "https://alpha--team.tunnels.example.com",
 		},
 		{
 			// Dev/staging splits sometimes pin api.* on a non-default
-			// port. We deliberately do NOT strip "api." in that case
-			// because rewriting `api.example.com:8443` to
-			// `<sub>.example.com:8443` would silently change the
-			// host's intent. Fall back to /<subdomain>.
-			name:      "api host with explicit port falls back to path form",
+			// port. We still strip "api." and prepend the subdomain so
+			// the URL routes; the explicit port is preserved.
+			name:      "api host with explicit port",
 			serverURL: "https://api.example.com:8443/ws",
 			subdomain: "build--acme",
-			want:      "https://api.example.com:8443/build--acme",
+			want:      "https://build--acme.example.com:8443",
 		},
 		{
 			name:      "api host with explicit port wss scheme",
 			serverURL: "wss://api.example.com:8443/ws",
 			subdomain: "build--acme",
-			want:      "https://api.example.com:8443/build--acme",
+			want:      "https://build--acme.example.com:8443",
 		},
 	}
 	for _, tc := range cases {
@@ -805,13 +807,16 @@ func TestWorkerURLStripsUserinfo(t *testing.T) {
 		t.Errorf("workerURL = %q, want %q", got, want)
 	}
 
-	// Path-form fallback (custom domain): same expectation.
+	// Custom domain: still must strip userinfo.
 	got2, err := workerURL("wss://user:pass@tunnels.example.com/ws", "alpha--team")
 	if err != nil {
 		t.Fatalf("workerURL: %v", err)
 	}
 	if strings.Contains(got2, "user") || strings.Contains(got2, "pass") {
-		t.Errorf("workerURL leaked userinfo on fallback path, got: %q", got2)
+		t.Errorf("workerURL leaked userinfo on custom-domain path, got: %q", got2)
+	}
+	if want2 := "https://alpha--team.tunnels.example.com"; got2 != want2 {
+		t.Errorf("workerURL = %q, want %q", got2, want2)
 	}
 }
 

@@ -31,6 +31,7 @@ import (
 //   - workerInstallNonInteractive (worker_install.go)
 //   - workerUninstallDeleteOnServer (worker_uninstall.go)
 //   - workerUninstallForce (worker_uninstall.go)
+//   - workerListAll (worker_list.go)
 func resetWorkerState(t *testing.T, cfg *config.Config) string {
 	t.Helper()
 	path := resetContextState(t, cfg)
@@ -41,12 +42,14 @@ func resetWorkerState(t *testing.T, cfg *config.Config) string {
 	workerInstallNonInteractive = false
 	workerUninstallDeleteOnServer = false
 	workerUninstallForce = false
+	workerListAll = false
 	t.Cleanup(func() {
 		workerRmDeleteOnServer = false
 		workerInstallNoLinger = false
 		workerInstallNonInteractive = false
 		workerUninstallDeleteOnServer = false
 		workerUninstallForce = false
+		workerListAll = false
 	})
 	return path
 }
@@ -637,5 +640,120 @@ func TestResolveTeamIDRejectsMalformedSlugs(t *testing.T) {
 				t.Errorf("error should mention context, got: %v", err)
 			}
 		})
+	}
+}
+
+// TestWorkerRmDeleteOnServerMessageReflectsQuarantine guards against the
+// regression in justtunnel-cli#50 where `rm --delete-on-server` printed
+// "Deleted worker (server + local)" even though the server only
+// soft-deletes and the worker remains visible (as retired_quarantined)
+// in `worker list --all` for 30 days.
+func TestWorkerRmDeleteOnServerMessageReflectsQuarantine(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && request.URL.Path == "/api/teams/team-alpha/workers" {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[{"id":"wkr_x","name":"alice","team_id":"team-alpha"}]}`))
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		writer.Write([]byte(`{"status":"deleted"}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "none",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	out, err := runCmd(t, "worker", "rm", "alice", "--delete-on-server")
+	if err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	// New honest messaging — must NOT claim outright deletion.
+	if strings.Contains(out, "Deleted worker") {
+		t.Errorf("output still claims permanent deletion (#50 regression): %s", out)
+	}
+	if !strings.Contains(out, "Quarantined") || !strings.Contains(out, "30 days") {
+		t.Errorf("output should describe quarantine + 30-day reaper window: %s", out)
+	}
+}
+
+// TestWorkerListHidesQuarantinedByDefault guards justtunnel-cli#50: the
+// default `worker list` view must NOT display rows the server has
+// soft-deleted, otherwise a user who just ran `rm --delete-on-server`
+// sees their "deleted" worker still listed.
+func TestWorkerListHidesQuarantinedByDefault(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Write([]byte(`{"workers":[
+		    {"id":"wkr_a","name":"alice","team_id":"team-alpha","subdomain":"alice--team-alpha","status":"online"},
+		    {"id":"wkr_z","name":"zombie","team_id":"team-alpha","subdomain":"zombie--team-alpha","status":"retired_quarantined"}
+		]}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	out, err := runCmd(t, "worker", "list")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(out, "alice") {
+		t.Errorf("active worker should be listed: %s", out)
+	}
+	if strings.Contains(out, "zombie") {
+		t.Errorf("quarantined worker should be hidden by default: %s", out)
+	}
+}
+
+// TestWorkerListAllShowsQuarantined verifies the --all flag opts the
+// quarantined rows back in.
+func TestWorkerListAllShowsQuarantined(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Write([]byte(`{"workers":[
+		    {"id":"wkr_z","name":"zombie","team_id":"team-alpha","subdomain":"zombie--team-alpha","status":"retired_quarantined"}
+		]}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	out, err := runCmd(t, "worker", "list", "--all")
+	if err != nil {
+		t.Fatalf("list --all: %v", err)
+	}
+	if !strings.Contains(out, "zombie") {
+		t.Errorf("--all should reveal quarantined rows: %s", out)
+	}
+}
+
+// TestWorkerListSubdomainFallsBackToLocal guards F-07 (#51): when the
+// server omits subdomain in its list response, the row should fall back
+// to the locally-derived value rather than rendering "-".
+func TestWorkerListSubdomainFallsBackToLocal(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		// subdomain field intentionally omitted server-side.
+		writer.Write([]byte(`{"workers":[{"id":"wkr_a","name":"alice","team_id":"team-alpha","status":"offline"}]}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_a", Name: "alice", Context: "team:team-alpha",
+		Subdomain: "alice--team-alpha", ServiceBackend: "none",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	out, err := runCmd(t, "worker", "list")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(out, "alice--team-alpha") {
+		t.Errorf("subdomain should fall back to local value, got: %s", out)
 	}
 }

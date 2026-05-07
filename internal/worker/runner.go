@@ -33,10 +33,19 @@ func (te *TerminalError) Error() string {
 }
 
 // ErrAuthFailed is returned (wrapped) by a Dialer when the server rejects
-// the worker handshake with 401 or 403. The token will not change on its
-// own, so Runner.Run treats this as terminal — same semantics as
-// TerminalError — to avoid a tight retry loop hammering the server.
+// the worker handshake with 401. The token will not change on its own, so
+// Runner.Run treats this as terminal — same semantics as TerminalError —
+// to avoid a tight retry loop hammering the server.
 var ErrAuthFailed = errors.New("worker: auth failed")
+
+// ErrForbidden is returned (wrapped) by a Dialer when the server rejects
+// the worker handshake with 403. Unlike 401 this is NOT an
+// authentication problem — common causes are a worker registered without
+// a service token (created via `worker create` instead of
+// `worker install`) or a suspended team. Runner.Run treats this as
+// terminal because the policy decision won't change on retry. See
+// justtunnel-cli#47.
+var ErrForbidden = errors.New("worker: forbidden")
 
 // Terminal close codes per tech spec §7. Both indicate the operator must
 // take action — restart the worker won't help.
@@ -269,6 +278,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("worker: build dial URL: %w", err)
 	}
+	r.Logger.Debug("worker runner starting",
+		"worker", r.WorkerName,
+		"subdomain", r.Subdomain,
+		"dial_url", dialURL,
+	)
 
 	// dialAttempt tracks consecutive failed dials (network errors).
 	// disconnectAttempt tracks consecutive flapping disconnects (a connect
@@ -298,6 +312,14 @@ func (r *Runner) Run(ctx context.Context) error {
 			// server.
 			if errors.Is(dialErr, ErrAuthFailed) {
 				r.Logger.Error("worker auth failed (no reconnect)",
+					"worker", r.WorkerName,
+					"error", dialErr,
+				)
+				return dialErr
+			}
+			// 403 / policy rejection is also terminal — see #47.
+			if errors.Is(dialErr, ErrForbidden) {
+				r.Logger.Error("worker forbidden by server (no reconnect)",
 					"worker", r.WorkerName,
 					"error", dialErr,
 				)
@@ -590,10 +612,19 @@ func (rd *realDialer) Dial(ctx context.Context, dialURL string) (workerConn, err
 	if err != nil {
 		// Surface auth failures distinctly so callers can decide whether
 		// reconnecting is futile (it is — the token won't change).
-		if httpResp != nil && (httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden) {
-			// Wrap with ErrAuthFailed so Runner.Run can match via
-			// errors.Is and exit terminally instead of looping.
-			return nil, fmt.Errorf("worker: dial returned %d: %w", httpResp.StatusCode, ErrAuthFailed)
+		if httpResp != nil {
+			switch httpResp.StatusCode {
+			case http.StatusUnauthorized:
+				// Wrap with ErrAuthFailed so Runner.Run can match via
+				// errors.Is and exit terminally instead of looping.
+				return nil, fmt.Errorf("worker: dial returned %d: %w", httpResp.StatusCode, ErrAuthFailed)
+			case http.StatusForbidden:
+				// 403 is "authenticated but not allowed" — distinct
+				// from 401. The cmd layer renders a non-misleading
+				// message instead of asking the operator to re-auth.
+				// See justtunnel-cli#47.
+				return nil, fmt.Errorf("worker: dial returned %d: %w", httpResp.StatusCode, ErrForbidden)
+			}
 		}
 		return nil, fmt.Errorf("worker: dial: %w", err)
 	}

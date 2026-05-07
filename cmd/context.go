@@ -181,6 +181,49 @@ func runContextUse(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	// Membership validation for team contexts. Without this, `context use
+	// team:<bogus>` silently succeeds against a server that has never
+	// heard of the team, and subsequent commands fail with downstream
+	// 403/404s instead of the real cause. See justtunnel-cli#49.
+	//
+	// We only validate when the user is authenticated AND the server
+	// supports the memberships endpoint. If it doesn't, fall through to
+	// the previous behavior so older servers still work.
+	if cfg.AuthToken != "" && strings.HasPrefix(name, config.TeamContextPrefix) {
+		baseURL, parseErr := apiBaseURL(cfg.ServerURL)
+		if parseErr == nil {
+			memberships, supported, fetchErr := fetchMemberships(nil, baseURL, cfg.AuthToken)
+			switch {
+			case fetchErr != nil && isNetworkError(fetchErr):
+				// Offline / unreachable server: warn and proceed so the
+				// user can keep working without connectivity.
+				fmt.Fprintf(os.Stderr,
+					"warning: could not verify team membership (offline?): %v\n", fetchErr)
+			case fetchErr != nil:
+				// Structured server error (4xx/5xx other than 404):
+				// surface so the user knows validation failed.
+				return fmt.Errorf("verify team membership: %w", fetchErr)
+			case supported:
+				slug := strings.TrimPrefix(name, config.TeamContextPrefix)
+				found := false
+				for _, mem := range memberships {
+					if mem.TeamSlug == slug {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return display.InputError(fmt.Sprintf(
+						"you are not a member of %s — run `justtunnel context list` to see available teams",
+						name,
+					))
+				}
+			}
+			// supported=false (older server): fall through; we cannot
+			// verify and forcing a hard error would break compatibility.
+		}
+	}
+
 	if err := config.SetCurrentContext(cfg, name); err != nil {
 		return fmt.Errorf("set context: %w", err)
 	}

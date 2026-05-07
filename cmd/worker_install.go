@@ -403,24 +403,22 @@ func serviceBackendForOS(goos string) string {
 }
 
 // workerURL derives the public URL for a worker subdomain from the
-// configured server URL. The transformation is:
+// configured server URL. The server routes by host (subdomain), not by
+// path, so the URL is always built by injecting <subdomain> into the
+// host portion of the server URL. The transformation is:
 //
 //   - Convert ws/wss → http/https.
-//   - If the host begins with "api." AND the URL carries no port, strip
-//     the "api." prefix and prepend "<subdomain>.".
+//   - Strip a leading "api." from the host so we don't end up with
+//     "<sub>.api.example.com" when the host is "api.example.com".
+//   - Prepend "<subdomain>." to the resulting host (port preserved).
 //     e.g. wss://api.justtunnel.dev/ws + "build--acme" → https://build--acme.justtunnel.dev
-//   - Otherwise (localhost, custom domain, "api."-prefixed host with an
-//     explicit port like dev/staging splits, or any non-standard host),
-//     fall back to "<server>/<subdomain>" — less polished but always
-//     meaningful and unambiguous.
+//          ws://localhost:8080/ws       + "alpha--team" → http://alpha--team.localhost:8080
 //
-// Note: the "api." strip ONLY kicks in when no port is present.
-// Production hosts are bare; "api.example.com:8443" indicates a
-// dev/staging environment where the operator deliberately pinned a
-// port, and rewriting `api.example.com:8443` to
-// `<sub>.example.com:8443` would silently lose that signal. We instead
-// keep the original host and append "/<subdomain>" so the result still
-// resolves something the operator can click through to.
+// Previously this function fell back to a path-style form
+// (`<server>/<subdomain>`) for hosts that lacked a bare "api." prefix
+// (localhost, custom domains, api.* with an explicit port). That form
+// returned 404 because the reverse proxy keys on host, not path —
+// see justtunnel-cli#48.
 //
 // This lives in cmd because it's a CLI display concern, not a server URL
 // rule. If the URL shape ever moves into the worker config (e.g. as
@@ -448,18 +446,16 @@ func workerURL(serverURL, subdomain string) (string, error) {
 	// the secret into terminal scrollback and CI logs.
 	parsed.User = nil
 
-	host := parsed.Host
-	// Only transform when host has the literal "api." prefix AND port is
-	// empty — production hosts are bare. localhost:8080 has a port and
-	// would never carry the api. prefix anyway, so this gate keeps the
-	// "fall back to /<sub>" branch simple.
-	if strings.HasPrefix(host, "api.") && parsed.Port() == "" {
-		baseDomain := strings.TrimPrefix(host, "api.")
-		parsed.Host = subdomain + "." + baseDomain
-		return parsed.String(), nil
+	hostname := parsed.Hostname()
+	port := parsed.Port()
+	// Strip a leading "api." so we end up with `<sub>.justtunnel.dev`
+	// rather than `<sub>.api.justtunnel.dev`. Hosts that don't carry the
+	// prefix (localhost, tunnels.example.com) keep their full host.
+	hostname = strings.TrimPrefix(hostname, "api.")
+	newHost := subdomain + "." + hostname
+	if port != "" {
+		newHost += ":" + port
 	}
-	// Fallback: append /<subdomain> to the server URL. Documented as a
-	// less-polished form for non-standard server URLs.
-	parsed.Path = "/" + subdomain
+	parsed.Host = newHost
 	return parsed.String(), nil
 }

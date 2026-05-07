@@ -11,6 +11,12 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/worker"
 )
 
+// workerListAll controls whether `worker list` includes quarantined
+// rows. Default false hides them so a freshly-deleted worker doesn't
+// linger in the listing for 30 days; pass --all to see the soft-deleted
+// rows (e.g. before they're permanently removed). See justtunnel-cli#50.
+var workerListAll bool
+
 var workerListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List workers for the active team context",
@@ -19,6 +25,8 @@ var workerListCmd = &cobra.Command{
 }
 
 func init() {
+	workerListCmd.Flags().BoolVar(&workerListAll, "all", false,
+		"include quarantined workers (soft-deleted; permanently removed after 30 days)")
 	workerCmd.AddCommand(workerListCmd)
 }
 
@@ -49,6 +57,9 @@ func runWorkerList(cmd *cobra.Command, args []string) error {
 	}
 
 	rows := mergeWorkers(serverWorkers, localWorkers, ctxName)
+	if !workerListAll {
+		rows = filterQuarantined(rows)
+	}
 
 	out := cmd.OutOrStdout()
 	if len(rows) == 0 {
@@ -113,6 +124,13 @@ func mergeWorkers(server []workerAPI, local []worker.Config, ctxName string) []w
 		if loc.WorkerID != "" {
 			if existing, ok := byID[loc.WorkerID]; ok {
 				existing.Presence = "synced"
+				// F-07: when the server omits subdomain in its list
+				// response, fall back to the locally-derived value
+				// rather than rendering "-" for every row. See
+				// justtunnel-cli#51.
+				if existing.Subdomain == "" {
+					existing.Subdomain = loc.Subdomain
+				}
 				matched[loc.Name] = true
 				continue
 			}
@@ -126,6 +144,9 @@ func mergeWorkers(server []workerAPI, local []worker.Config, ctxName string) []w
 			for _, row := range rows {
 				if row.Name == loc.Name {
 					row.Presence = "synced"
+					if row.Subdomain == "" {
+						row.Subdomain = loc.Subdomain
+					}
 					matched[loc.Name] = true
 					break
 				}
@@ -148,6 +169,21 @@ func mergeWorkers(server []workerAPI, local []worker.Config, ctxName string) []w
 		out = append(out, *row)
 	}
 	sort.Slice(out, func(left, right int) bool { return out[left].Name < out[right].Name })
+	return out
+}
+
+// filterQuarantined drops rows that the server has already soft-deleted
+// (status=retired_quarantined). The default `worker list` view hides
+// these so a freshly-deleted worker doesn't linger for 30 days; pass
+// --all to see them. See justtunnel-cli#50.
+func filterQuarantined(rows []workerRow) []workerRow {
+	out := rows[:0]
+	for _, row := range rows {
+		if row.Status == "retired_quarantined" {
+			continue
+		}
+		out = append(out, row)
+	}
 	return out
 }
 

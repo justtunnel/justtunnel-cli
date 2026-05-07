@@ -383,3 +383,96 @@ func TestFetchMembershipsHTTP404(t *testing.T) {
 		t.Errorf("memberships should be nil on 404, got %v", memberships)
 	}
 }
+
+// TestContextUseRejectsNonMemberTeam verifies the membership validation
+// added for justtunnel-cli#49: `context use team:<bogus>` must error
+// (non-zero exit) when the server's memberships endpoint reports the
+// user is not a member, instead of silently accepting the slug.
+func TestContextUseRejectsNonMemberTeam(t *testing.T) {
+	stubServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/memberships" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Write([]byte(`{"memberships":[{"team_slug":"acme"}]}`))
+	}))
+	defer stubServer.Close()
+
+	resetContextState(t, &config.Config{
+		AuthToken: "tok",
+		ServerURL: httpToWS(stubServer.URL) + "/ws",
+	})
+
+	_, err := runCmd(t, "context", "use", "team:does-not-exist")
+	if err == nil {
+		t.Fatal("expected error for non-member team, got nil")
+	}
+	if !strings.Contains(err.Error(), "not a member") {
+		t.Errorf("error should mention membership: got %v", err)
+	}
+
+	// Config must be unchanged — the user did not switch.
+	loaded, loadErr := config.Load(cfgFile)
+	if loadErr != nil {
+		t.Fatalf("load: %v", loadErr)
+	}
+	if loaded.CurrentContext == "team:does-not-exist" {
+		t.Errorf("config should not have been mutated; got CurrentContext=%q",
+			loaded.CurrentContext)
+	}
+}
+
+// TestContextUseAcceptsMemberTeam complements TestContextUseRejectsNonMemberTeam
+// by verifying the happy path still works after membership validation.
+func TestContextUseAcceptsMemberTeam(t *testing.T) {
+	stubServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/memberships":
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"memberships":[{"team_slug":"acme"}]}`))
+		case "/api/me/preferences/active-context":
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stubServer.Close()
+
+	resetContextState(t, &config.Config{
+		AuthToken: "tok",
+		ServerURL: httpToWS(stubServer.URL) + "/ws",
+	})
+
+	if _, err := runCmd(t, "context", "use", "team:acme"); err != nil {
+		t.Fatalf("expected success for member team: %v", err)
+	}
+	loaded, err := config.Load(cfgFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.CurrentContext != "team:acme" {
+		t.Errorf("CurrentContext: got %q want %q", loaded.CurrentContext, "team:acme")
+	}
+}
+
+// TestContextUseTolerates404FromOlderServer verifies older servers (no
+// /api/memberships route) still allow `context use` so the CLI doesn't
+// break compatibility. The previous behavior is preserved when supported
+// is false.
+func TestContextUseTolerates404FromOlderServer(t *testing.T) {
+	stubServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		// Every endpoint returns 404 — simulating an older server.
+		http.NotFound(writer, request)
+	}))
+	defer stubServer.Close()
+
+	resetContextState(t, &config.Config{
+		AuthToken: "tok",
+		ServerURL: httpToWS(stubServer.URL) + "/ws",
+	})
+
+	if _, err := runCmd(t, "context", "use", "team:acme"); err != nil {
+		t.Fatalf("404 from /api/memberships should not block context use: %v", err)
+	}
+}

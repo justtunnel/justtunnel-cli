@@ -355,17 +355,22 @@ func TestRunner_AuthFailureIsTerminal(t *testing.T) {
 }
 
 // TestRunner_AuthFailureForbidden is the 403 sibling of the 401 test —
-// same expectation: terminate immediately.
+// same exit-immediately expectation, but the runner must surface
+// ErrForbidden (not ErrAuthFailed) so the cmd layer can render a
+// non-misleading message. See justtunnel-cli#47.
 func TestRunner_AuthFailureForbidden(t *testing.T) {
 	dialer := &fakeDialer{
 		script: []dialResult{
-			{dialErr: fmt.Errorf("worker: dial returned 403: %w", ErrAuthFailed)},
+			{dialErr: fmt.Errorf("worker: dial returned 403: %w", ErrForbidden)},
 		},
 	}
 	runner := newTestRunner(dialer)
 	err := runner.Run(context.Background())
-	if !errors.Is(err, ErrAuthFailed) {
-		t.Fatalf("Run returned %v; want errors.Is(err, ErrAuthFailed)", err)
+	if !errors.Is(err, ErrForbidden) {
+		t.Fatalf("Run returned %v; want errors.Is(err, ErrForbidden)", err)
+	}
+	if errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("403 must NOT surface as ErrAuthFailed (would trigger misleading 're-authenticate' UI)")
 	}
 	if got := atomic.LoadInt32(&dialer.attempts); got != 1 {
 		t.Fatalf("expected exactly 1 dial attempt; got %d", got)
