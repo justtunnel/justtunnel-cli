@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -108,7 +109,44 @@ func loadWorkerEnv() (cfg *config.Config, teamID, ctxName, baseURL string, err e
 	if err != nil {
 		return nil, "", "", "", fmt.Errorf("parse server URL: %w", err)
 	}
+	// F-21: refuse early when the active team context is a stale slug the
+	// user is no longer a member of. Without this check, every worker
+	// subcommand fails with an opaque 403/404 from the team-scoped REST
+	// route. stalenessAnnotation returns stale=false when verification is
+	// not possible (offline, older server, ULID-shaped identifier), so we
+	// preserve compatibility and offline workflows.
+	if _, stale := stalenessAnnotation(cfg, baseURL, ctxName); stale {
+		return nil, "", "", "", display.InputError(fmt.Sprintf(
+			"active context %s is no longer valid — run `justtunnel context use personal` to clear",
+			ctxName,
+		))
+	}
 	return cfg, teamID, ctxName, baseURL, nil
+}
+
+// mapForbiddenError converts a 403 response from a team-scoped REST endpoint
+// into a typed display.InputError with an actionable, server-shape-aware
+// message. The server returns {"error":"..."} bodies; we detect a few known
+// phrasings ("not a member", "admin", "only team admins") and fall back to
+// a generic "forbidden: <body>" otherwise. Keeps the user from staring at
+// an opaque "server returned 403" mid-flight after membership pre-check
+// already passed (e.g. revoked between the two calls, or the action is
+// admin-gated like ?include=quarantined).
+func mapForbiddenError(body []byte) error {
+	serverMsg := extractServerError(body)
+	lowerMsg := strings.ToLower(serverMsg)
+	switch {
+	case strings.Contains(lowerMsg, "not a member"):
+		return display.InputError(
+			"your team membership is no longer valid — run `justtunnel context use personal` and retry",
+		)
+	case strings.Contains(lowerMsg, "only team admins") || strings.Contains(lowerMsg, "admin"):
+		return display.InputError(
+			"this action requires team admin role; re-run without admin-only options",
+		)
+	default:
+		return display.InputError(fmt.Sprintf("forbidden: %s", serverMsg))
+	}
 }
 
 // httpDo performs an authenticated request and returns body + status. The
@@ -169,16 +207,21 @@ func extractServerError(body []byte) string {
 }
 
 // postWorker calls POST /api/teams/{teamID}/workers and returns the parsed
-// worker. Non-2xx responses surface as errors with the server's message.
+// worker. Non-2xx responses surface as errors with the server's message;
+// 403 specifically routes through mapForbiddenError so the user gets a
+// friendly recovery hint rather than "server returned 403".
 func postWorker(ctx context.Context, baseURL, authToken, teamID, name string) (*workerAPI, error) {
 	// json.Marshal on a map[string]string with a literal key cannot fail
 	// (no unsupported types possible). Explicit `_ =` documents the
 	// intentional discard.
 	body, _ := json.Marshal(map[string]string{"name": name})
-	url := baseURL + "/api/teams/" + teamID + "/workers"
-	status, raw, err := httpDo(ctx, http.MethodPost, url, authToken, bytes.NewReader(body))
+	requestURL := baseURL + "/api/teams/" + teamID + "/workers"
+	status, raw, err := httpDo(ctx, http.MethodPost, requestURL, authToken, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
+	}
+	if status == http.StatusForbidden {
+		return nil, mapForbiddenError(raw)
 	}
 	if status < 200 || status >= 300 {
 		return nil, fmt.Errorf("server returned %d: %s", status, extractServerError(raw))
@@ -190,12 +233,40 @@ func postWorker(ctx context.Context, baseURL, authToken, teamID, name string) (*
 	return &worker, nil
 }
 
-// fetchWorkers calls GET /api/teams/{teamID}/workers.
-func fetchWorkers(ctx context.Context, baseURL, authToken, teamID string) ([]workerAPI, error) {
-	url := baseURL + "/api/teams/" + teamID + "/workers"
-	status, raw, err := httpDo(ctx, http.MethodGet, url, authToken, nil)
+// FetchWorkersOptions controls optional behavior of fetchWorkers. The
+// zero-value is the safe default (live workers only); set
+// IncludeQuarantined to additionally surface soft-deleted rows. Callers
+// pass empty options for the default path (status, install, uninstall,
+// rm) so quota-counting consumers keep matching the dashboard view.
+type FetchWorkersOptions struct {
+	// IncludeQuarantined sends `?include=quarantined` so the server
+	// returns workers in retired_quarantined alongside live ones — used by
+	// `worker list --all` (justtunnel-cli#50, justtunnel-server F-20).
+	// Note: the server admin-gates this on some plans; non-admin callers
+	// receive a 403 which mapForbiddenError translates.
+	IncludeQuarantined bool
+}
+
+// fetchWorkers calls GET /api/teams/{teamID}/workers. opts.IncludeQuarantined
+// adds `?include=quarantined`. 403 responses route through mapForbiddenError
+// so admin-gated server policies surface as actionable errors rather than
+// "server returned 403".
+func fetchWorkers(ctx context.Context, baseURL, authToken, teamID string, opts FetchWorkersOptions) ([]workerAPI, error) {
+	requestURL := baseURL + "/api/teams/" + teamID + "/workers"
+	if opts.IncludeQuarantined {
+		// Use url.Values rather than bare string concatenation so adding
+		// future params (e.g. ?status=...) doesn't require rewriting this
+		// callsite for proper '&' joining and percent-encoding.
+		queryValues := url.Values{}
+		queryValues.Set("include", "quarantined")
+		requestURL += "?" + queryValues.Encode()
+	}
+	status, raw, err := httpDo(ctx, http.MethodGet, requestURL, authToken, nil)
 	if err != nil {
 		return nil, err
+	}
+	if status == http.StatusForbidden {
+		return nil, mapForbiddenError(raw)
 	}
 	if status < 200 || status >= 300 {
 		return nil, fmt.Errorf("server returned %d: %s", status, extractServerError(raw))
@@ -209,15 +280,19 @@ func fetchWorkers(ctx context.Context, baseURL, authToken, teamID string) ([]wor
 
 // deleteWorker calls DELETE /api/teams/{teamID}/workers/{workerID}.
 // Returns (notFound=true, nil) on 404 so the caller can treat it as
-// already-deleted and continue local cleanup.
+// already-deleted and continue local cleanup. 403 routes through
+// mapForbiddenError for friendly admin/membership messaging.
 func deleteWorker(ctx context.Context, baseURL, authToken, teamID, workerID string) (notFound bool, err error) {
-	url := baseURL + "/api/teams/" + teamID + "/workers/" + workerID
-	status, raw, err := httpDo(ctx, http.MethodDelete, url, authToken, nil)
+	requestURL := baseURL + "/api/teams/" + teamID + "/workers/" + workerID
+	status, raw, err := httpDo(ctx, http.MethodDelete, requestURL, authToken, nil)
 	if err != nil {
 		return false, err
 	}
 	if status == http.StatusNotFound {
 		return true, nil
+	}
+	if status == http.StatusForbidden {
+		return false, mapForbiddenError(raw)
 	}
 	if status < 200 || status >= 300 {
 		return false, fmt.Errorf("server returned %d: %s", status, extractServerError(raw))

@@ -60,7 +60,7 @@ func runWorkerStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	serverWorkers, err := fetchWorkers(cmd.Context(), baseURL, cfg.AuthToken, teamID)
+	serverWorkers, err := fetchWorkers(cmd.Context(), baseURL, cfg.AuthToken, teamID, FetchWorkersOptions{})
 	if err != nil {
 		return err
 	}

@@ -46,7 +46,11 @@ func runWorkerList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	serverWorkers, err := fetchWorkers(cmd.Context(), baseURL, cfg.AuthToken, teamID)
+	// When --all is set, ask the server to include quarantined workers.
+	// The default endpoint strips them entirely (justtunnel-server #170 /
+	// F-16) so the billing quota stays accurate; without the explicit
+	// query param the --all flag would be a dead toggle (F-20).
+	serverWorkers, err := fetchWorkers(cmd.Context(), baseURL, cfg.AuthToken, teamID, FetchWorkersOptions{IncludeQuarantined: workerListAll})
 	if err != nil {
 		return err
 	}
@@ -58,6 +62,10 @@ func runWorkerList(cmd *cobra.Command, args []string) error {
 
 	rows := mergeWorkers(serverWorkers, localWorkers, ctxName)
 	if !workerListAll {
+		// Defense-in-depth: the server already strips quarantined rows for
+		// the default listing, but keep the client-side filter so a stale
+		// CLI talking to a future server that surfaces quarantined rows
+		// without an explicit opt-in still hides them by default.
 		rows = filterQuarantined(rows)
 	}
 
@@ -176,8 +184,14 @@ func mergeWorkers(server []workerAPI, local []worker.Config, ctxName string) []w
 // (status=retired_quarantined). The default `worker list` view hides
 // these so a freshly-deleted worker doesn't linger for 30 days; pass
 // --all to see them. See justtunnel-cli#50.
+//
+// We allocate a fresh output slice rather than aliasing rows[:0]: the
+// in-place pattern mutates the caller's backing array as a side effect,
+// which is a footgun if any future caller also retains the original
+// slice. Allocation cost is negligible against the user-bounded number
+// of workers.
 func filterQuarantined(rows []workerRow) []workerRow {
-	out := rows[:0]
+	out := make([]workerRow, 0, len(rows))
 	for _, row := range rows {
 		if row.Status == "retired_quarantined" {
 			continue
