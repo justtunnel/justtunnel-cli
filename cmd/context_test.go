@@ -456,6 +456,156 @@ func TestContextUseAcceptsMemberTeam(t *testing.T) {
 	}
 }
 
+// TestContextShowAnnotatesStaleSlug verifies F-21: when the active context
+// is a team slug the user is no longer a member of (e.g. team was deleted
+// or membership revoked while a stale slug lingered in local config),
+// `context show` prints the slug with an "(invalid — ...)" annotation
+// rather than emitting it verbatim. The local config is left untouched so
+// the user can clear it explicitly with `context use personal`.
+func TestContextShowAnnotatesStaleSlug(t *testing.T) {
+	stubServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/memberships" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Write([]byte(`{"memberships":[{"team_slug":"acme"}]}`))
+	}))
+	defer stubServer.Close()
+
+	resetContextState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stubServer.URL) + "/ws",
+		CurrentContext: "team:does-not-exist-xyz",
+	})
+
+	out, err := runCmd(t, "context", "show")
+	if err != nil {
+		t.Fatalf("show: %v", err)
+	}
+	if !strings.Contains(out, "team:does-not-exist-xyz") {
+		t.Errorf("output should still include the stale slug for visibility, got: %q", out)
+	}
+	if !strings.Contains(out, "invalid") {
+		t.Errorf("output should annotate the slug as invalid, got: %q", out)
+	}
+	if !strings.Contains(out, "context use personal") {
+		t.Errorf("output should hint at the recovery command, got: %q", out)
+	}
+
+	// Read-path must not mutate config: a subsequent `context use personal`
+	// is the only way to clear the stale value.
+	loaded, loadErr := config.Load(cfgFile)
+	if loadErr != nil {
+		t.Fatalf("load: %v", loadErr)
+	}
+	if loaded.CurrentContext != "team:does-not-exist-xyz" {
+		t.Errorf("show must not mutate config; got CurrentContext=%q", loaded.CurrentContext)
+	}
+}
+
+// TestContextShowDoesNotAnnotateValidTeam verifies the no-false-positive
+// case: when the active slug IS in the membership list, `context show`
+// prints it verbatim with no annotation.
+func TestContextShowDoesNotAnnotateValidTeam(t *testing.T) {
+	stubServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/memberships" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Write([]byte(`{"memberships":[{"team_slug":"acme"}]}`))
+	}))
+	defer stubServer.Close()
+
+	resetContextState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stubServer.URL) + "/ws",
+		CurrentContext: "team:acme",
+	})
+
+	out, err := runCmd(t, "context", "show")
+	if err != nil {
+		t.Fatalf("show: %v", err)
+	}
+	if strings.TrimSpace(out) != "team:acme" {
+		t.Errorf("valid team should print without annotation; got %q", strings.TrimSpace(out))
+	}
+}
+
+// TestContextShowFailsOpenWhenServerUnsupported verifies that older servers
+// (no /api/memberships route) do not cause `context show` to annotate
+// every team context as invalid. The CLI cannot prove staleness, so it
+// must emit the slug verbatim.
+func TestContextShowFailsOpenWhenServerUnsupported(t *testing.T) {
+	stubServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.NotFound(writer, request)
+	}))
+	defer stubServer.Close()
+
+	resetContextState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stubServer.URL) + "/ws",
+		CurrentContext: "team:acme",
+	})
+
+	out, err := runCmd(t, "context", "show")
+	if err != nil {
+		t.Fatalf("show: %v", err)
+	}
+	if strings.TrimSpace(out) != "team:acme" {
+		t.Errorf("unsupported server must fail open; got %q", strings.TrimSpace(out))
+	}
+}
+
+// TestContextShowFailsOpenWhenLoggedOut verifies that without an auth token
+// the CLI never annotates — there is no way to verify, and a logged-out
+// user shouldn't get a confusing warning on a read-only command.
+func TestContextShowFailsOpenWhenLoggedOut(t *testing.T) {
+	resetContextState(t, &config.Config{
+		ServerURL:      "wss://api.example.com/ws",
+		CurrentContext: "team:acme",
+	})
+
+	out, err := runCmd(t, "context", "show")
+	if err != nil {
+		t.Fatalf("show: %v", err)
+	}
+	if strings.TrimSpace(out) != "team:acme" {
+		t.Errorf("logged-out show must not annotate; got %q", strings.TrimSpace(out))
+	}
+}
+
+// TestContextShowFailsOpenForULIDIdentifier verifies the ULID escape
+// hatch: the memberships endpoint returns slugs, so a ULID-shaped
+// identifier cannot be cross-checked and must NOT be flagged as stale.
+func TestContextShowFailsOpenForULIDIdentifier(t *testing.T) {
+	stubServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/memberships" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Write([]byte(`{"memberships":[{"team_slug":"acme"}]}`))
+	}))
+	defer stubServer.Close()
+
+	const ulid = "01KQTJBVA6REFPMKT8MPKX8Z9N"
+	resetContextState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stubServer.URL) + "/ws",
+		CurrentContext: "team:" + ulid,
+	})
+
+	out, err := runCmd(t, "context", "show")
+	if err != nil {
+		t.Fatalf("show: %v", err)
+	}
+	if strings.TrimSpace(out) != "team:"+ulid {
+		t.Errorf("ULID-shaped id must not be annotated; got %q", strings.TrimSpace(out))
+	}
+}
+
 // TestContextUseTolerates404FromOlderServer verifies older servers (no
 // /api/memberships route) still allow `context use` so the CLI doesn't
 // break compatibility. The previous behavior is preserved when supported

@@ -43,6 +43,18 @@ func resetWorkerState(t *testing.T, cfg *config.Config) string {
 	workerUninstallDeleteOnServer = false
 	workerUninstallForce = false
 	workerListAll = false
+	// loadWorkerEnv now performs an F-21 staleness check by hitting
+	// /api/memberships. The single-handler stubs used by worker tests
+	// don't model that endpoint and would either decode garbage as an
+	// empty membership list (false-positive stale) or return arbitrary
+	// success bodies. Default to "endpoint unsupported" (supported=false)
+	// so the staleness check fails open in worker tests; tests that
+	// specifically want to exercise the stale path can override
+	// fetchMemberships themselves.
+	previousFetcher := fetchMemberships
+	fetchMemberships = func(client *http.Client, baseURL, authToken string) ([]membership, bool, error) {
+		return nil, false, nil
+	}
 	t.Cleanup(func() {
 		workerRmDeleteOnServer = false
 		workerInstallNoLinger = false
@@ -50,8 +62,45 @@ func resetWorkerState(t *testing.T, cfg *config.Config) string {
 		workerUninstallDeleteOnServer = false
 		workerUninstallForce = false
 		workerListAll = false
+		fetchMemberships = previousFetcher
 	})
 	return path
+}
+
+// TestWorkerCommandRejectsStaleContext verifies F-21 on the worker
+// command path: when the active context is a team the user is no longer a
+// member of, worker subcommands fail fast with an actionable message
+// referencing `context use personal`, instead of the opaque 403/404 from
+// the team-scoped REST route.
+func TestWorkerCommandRejectsStaleContext(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		// Worker REST calls should never run — loadWorkerEnv must abort
+		// before reaching them.
+		t.Errorf("unexpected request to %s; loadWorkerEnv should have aborted", request.URL.Path)
+		writer.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	// Override the fetcher installed by resetWorkerState so the membership
+	// check actually runs and reports the active team as missing.
+	previousFetcher := fetchMemberships
+	t.Cleanup(func() { fetchMemberships = previousFetcher })
+	fetchMemberships = func(client *http.Client, baseURL, authToken string) ([]membership, bool, error) {
+		return []membership{{TeamSlug: "some-other-team"}}, true, nil
+	}
+
+	_, err := runCmd(t, "worker", "list")
+	if err == nil {
+		t.Fatal("expected loadWorkerEnv to reject stale team context, got nil error")
+	}
+	if !strings.Contains(err.Error(), "context use personal") {
+		t.Errorf("error should reference recovery command; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "team-alpha") {
+		t.Errorf("error should mention the stale slug; got %v", err)
+	}
 }
 
 func teamCfg(serverURL string) *config.Config {

@@ -253,8 +253,80 @@ func runContextShow(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 	active := config.ResolveContext(cfg, contextOverride)
+
+	// F-21: detect a stale team context — a slug that was set in an older
+	// binary (before write-side validation in justtunnel-cli#49) and has
+	// since been deleted or had the user removed. We annotate but do not
+	// mutate config: the user clears it explicitly with `context use
+	// personal`. Failures to verify (offline, unsupported endpoint, network)
+	// fall through silently so `context show` keeps working without a
+	// reachable server.
+	if note := stalenessAnnotation(cfg, active); note != "" {
+		fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", active, note)
+		return nil
+	}
+
 	fmt.Fprintln(cmd.OutOrStdout(), active)
 	return nil
+}
+
+// stalenessAnnotation returns a parenthesized note when the active context
+// references a team the user is not a member of, or "" when the context is
+// either valid, personal, or cannot be verified (offline, older server,
+// ULID-shaped identifier we cannot resolve via the slug-keyed memberships
+// endpoint). Callers append the annotation to the printed context.
+func stalenessAnnotation(cfg *config.Config, active string) string {
+	if cfg == nil || cfg.AuthToken == "" {
+		return ""
+	}
+	if !strings.HasPrefix(active, config.TeamContextPrefix) {
+		return ""
+	}
+	identifier := strings.TrimPrefix(active, config.TeamContextPrefix)
+	if identifier == "" || looksLikeULID(identifier) {
+		// ULIDs are addressed by Team.ID, not slug — the memberships
+		// endpoint returns slugs, so we cannot prove staleness here.
+		// Fail open rather than annotate a valid ULID-shaped context.
+		return ""
+	}
+
+	baseURL, err := apiBaseURL(cfg.ServerURL)
+	if err != nil {
+		return ""
+	}
+	memberships, supported, err := fetchMemberships(nil, baseURL, cfg.AuthToken)
+	if err != nil || !supported {
+		// Unsupported endpoint or any fetch error: fail open. Loud server
+		// errors (4xx/5xx) are intentionally swallowed here — `context
+		// show` is a read-only diagnostic and shouldn't fail because of an
+		// auth blip on a sibling endpoint.
+		return ""
+	}
+	for _, mem := range memberships {
+		if mem.TeamSlug == identifier {
+			return ""
+		}
+	}
+	return "(invalid — not a member; run `justtunnel context use personal` to clear)"
+}
+
+// looksLikeULID reports whether identifier has the shape of a Crockford
+// base32 ULID (26 uppercase alphanumerics, no I/L/O/U). The CLI accepts
+// either a slug or a ULID in `team:<id-or-slug>` form (see
+// config.ValidateContext); the memberships endpoint only returns slugs, so
+// ULID-shaped identifiers cannot be cross-checked and should not be flagged.
+func looksLikeULID(identifier string) bool {
+	if len(identifier) != 26 {
+		return false
+	}
+	for _, character := range identifier {
+		isUpper := character >= 'A' && character <= 'Z'
+		isDigit := character >= '0' && character <= '9'
+		if !isUpper && !isDigit {
+			return false
+		}
+	}
+	return true
 }
 
 // fetchMembershipsHTTP calls GET /api/memberships on the server. If the server

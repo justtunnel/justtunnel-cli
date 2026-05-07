@@ -108,6 +108,18 @@ func loadWorkerEnv() (cfg *config.Config, teamID, ctxName, baseURL string, err e
 	if err != nil {
 		return nil, "", "", "", fmt.Errorf("parse server URL: %w", err)
 	}
+	// F-21: refuse early when the active team context is a stale slug the
+	// user is no longer a member of. Without this check, every worker
+	// subcommand fails with an opaque 403/404 from the team-scoped REST
+	// route. stalenessAnnotation returns "" when verification is not
+	// possible (offline, older server, ULID-shaped identifier), so we
+	// preserve compatibility and offline workflows.
+	if stalenessAnnotation(cfg, ctxName) != "" {
+		return nil, "", "", "", display.InputError(fmt.Sprintf(
+			"active context %s is invalid — you are not a member of that team. Run `justtunnel context use personal` (or `context use team:<slug>` for a current team) and retry.",
+			ctxName,
+		))
+	}
 	return cfg, teamID, ctxName, baseURL, nil
 }
 
