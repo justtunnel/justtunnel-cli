@@ -258,7 +258,7 @@ func removeLocalConfig(name string) (bool, error) {
 // already absent from the list — is treated as already-deleted; in the
 // 404 case we log to stderr so the operator knows what happened.
 func uninstallServerSide(ctx context.Context, baseURL, authToken, teamID, name string, warnOut io.Writer) error {
-	workers, err := fetchWorkers(ctx, baseURL, authToken, teamID)
+	workers, err := fetchWorkers(ctx, baseURL, authToken, teamID, FetchWorkersOptions{})
 	if err != nil {
 		return err
 	}

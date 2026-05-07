@@ -52,9 +52,10 @@ func resetWorkerState(t *testing.T, cfg *config.Config) string {
 	// specifically want to exercise the stale path can override
 	// fetchMemberships themselves.
 	previousFetcher := fetchMemberships
-	fetchMemberships = func(client *http.Client, baseURL, authToken string) ([]membership, bool, error) {
-		return nil, false, nil
+	fetchMemberships = func(client *http.Client, baseURL, authToken string) ([]membership, bool, bool, error) {
+		return nil, false, false, nil
 	}
+	resetMembershipCache()
 	t.Cleanup(func() {
 		workerRmDeleteOnServer = false
 		workerInstallNoLinger = false
@@ -63,6 +64,7 @@ func resetWorkerState(t *testing.T, cfg *config.Config) string {
 		workerUninstallForce = false
 		workerListAll = false
 		fetchMemberships = previousFetcher
+		resetMembershipCache()
 	})
 	return path
 }
@@ -87,9 +89,10 @@ func TestWorkerCommandRejectsStaleContext(t *testing.T) {
 	// check actually runs and reports the active team as missing.
 	previousFetcher := fetchMemberships
 	t.Cleanup(func() { fetchMemberships = previousFetcher })
-	fetchMemberships = func(client *http.Client, baseURL, authToken string) ([]membership, bool, error) {
-		return []membership{{TeamSlug: "some-other-team"}}, true, nil
+	fetchMemberships = func(client *http.Client, baseURL, authToken string) ([]membership, bool, bool, error) {
+		return []membership{{TeamSlug: "some-other-team"}}, true, false, nil
 	}
+	resetMembershipCache()
 
 	_, err := runCmd(t, "worker", "list")
 	if err == nil {
@@ -824,5 +827,208 @@ func TestWorkerListSubdomainFallsBackToLocal(t *testing.T) {
 	}
 	if !strings.Contains(out, "alice--team-alpha") {
 		t.Errorf("subdomain should fall back to local value, got: %s", out)
+	}
+}
+
+// TestPostWorkerMapsForbiddenNotMember verifies C-2: a 403 with a "not a
+// member" body is converted into a friendly display.InputError suggesting
+// `context use personal` rather than the opaque "server returned 403"
+// previously surfaced.
+func TestPostWorkerMapsForbiddenNotMember(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+		writer.Write([]byte(`{"error":"not a member of team-alpha"}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	_, err := runCmd(t, "worker", "create", "alice")
+	if err == nil {
+		t.Fatal("expected error for 403, got nil")
+	}
+	if !strings.Contains(err.Error(), "membership is no longer valid") {
+		t.Errorf("error should mention invalid membership; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "context use personal") {
+		t.Errorf("error should suggest recovery; got: %v", err)
+	}
+}
+
+// TestPostWorkerMapsForbiddenAdmin verifies C-2: a 403 with an "admin" hint
+// is converted into a "requires team admin role" message.
+func TestPostWorkerMapsForbiddenAdmin(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+		writer.Write([]byte(`{"error":"only team admins can create workers"}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	_, err := runCmd(t, "worker", "create", "alice")
+	if err == nil {
+		t.Fatal("expected error for 403, got nil")
+	}
+	if !strings.Contains(err.Error(), "team admin role") {
+		t.Errorf("error should mention admin role; got: %v", err)
+	}
+}
+
+// TestFetchWorkersMapsForbiddenGeneric verifies C-2 fall-through: a 403
+// body that doesn't match the "not a member" or "admin" heuristics still
+// surfaces with the body content rather than as opaque "server returned
+// 403". This exercises the fetchWorkers path (used by `worker list`).
+func TestFetchWorkersMapsForbiddenGeneric(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+		writer.Write([]byte(`{"error":"plan does not allow this action"}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	_, err := runCmd(t, "worker", "list")
+	if err == nil {
+		t.Fatal("expected error for 403, got nil")
+	}
+	if !strings.Contains(err.Error(), "forbidden") {
+		t.Errorf("generic 403 should surface as 'forbidden: ...'; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "plan does not allow") {
+		t.Errorf("error should include server's body; got: %v", err)
+	}
+}
+
+// TestDeleteWorkerMapsForbidden verifies C-2 on the DELETE path
+// (justtunnel-server admin-gates `worker rm --delete-on-server` for
+// non-admins).
+func TestDeleteWorkerMapsForbidden(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[{"id":"wkr_x","name":"alice","team_id":"team-alpha"}]}`))
+			return
+		}
+		writer.WriteHeader(http.StatusForbidden)
+		writer.Write([]byte(`{"error":"only team admins can delete workers"}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+	if err := worker.Write(&worker.Config{WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "none"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	_, err := runCmd(t, "worker", "rm", "alice", "--delete-on-server")
+	if err == nil {
+		t.Fatal("expected error on 403, got nil")
+	}
+	if !strings.Contains(err.Error(), "team admin role") {
+		t.Errorf("error should mention admin role; got: %v", err)
+	}
+}
+
+// TestWorkerListFiltersQuarantinedOnDefaultEvenIfServerReturnsThem
+// verifies C-6: filterQuarantined strips quarantined rows even if the
+// server returns them on the default endpoint, and proves
+// filterQuarantined no longer aliases the input slice's backing array.
+func TestWorkerListFiltersQuarantinedOnDefaultEvenIfServerReturnsThem(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		// Server (broken or stale) returns a quarantined row even on the
+		// default endpoint. Defense-in-depth: client filter must strip it.
+		writer.Write([]byte(`{"workers":[
+			{"id":"wkr_a","name":"alice","team_id":"team-alpha","subdomain":"alice--team-alpha","status":"online"},
+			{"id":"wkr_q","name":"qrow","team_id":"team-alpha","subdomain":"qrow--team-alpha","status":"retired_quarantined"}
+		]}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	out, err := runCmd(t, "worker", "list")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(out, "alice") {
+		t.Errorf("expected alice in output: %s", out)
+	}
+	if strings.Contains(out, "qrow") {
+		t.Errorf("client must filter quarantined even when server returns them: %s", out)
+	}
+}
+
+// TestFilterQuarantinedDoesNotMutateInput is a unit-level guard against
+// the rows[:0] aliasing footgun: filterQuarantined must return a fresh
+// slice, leaving the caller's input untouched.
+func TestFilterQuarantinedDoesNotMutateInput(t *testing.T) {
+	input := []workerRow{
+		{Name: "alice", Status: "online"},
+		{Name: "ghost", Status: "retired_quarantined"},
+		{Name: "bob", Status: "online"},
+	}
+	originalLen := len(input)
+	originalNames := []string{input[0].Name, input[1].Name, input[2].Name}
+
+	out := filterQuarantined(input)
+
+	if len(out) != 2 {
+		t.Errorf("filtered output should have 2 rows, got %d", len(out))
+	}
+	// Input slice must be untouched — header AND backing array.
+	if len(input) != originalLen {
+		t.Errorf("input slice header was modified: len=%d, want %d", len(input), originalLen)
+	}
+	for index, want := range originalNames {
+		if input[index].Name != want {
+			t.Errorf("input[%d].Name was mutated: got %q, want %q", index, input[index].Name, want)
+		}
+	}
+}
+
+// TestWorkerCommandsHappyPathThroughStalenessCheck verifies C-7: when the
+// active team appears in the membership list, loadWorkerEnv proceeds
+// without error all the way through to the actual REST call. This
+// exercises the previously-untested staleness-check happy path.
+func TestWorkerCommandsHappyPathThroughStalenessCheck(t *testing.T) {
+	var membershipsHits, workersHits int32
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		// Assert auth header on every request.
+		if got := request.Header.Get("Authorization"); got != "Bearer justtunnel_test_token" {
+			t.Errorf("Authorization: got %q, want %q", got, "Bearer justtunnel_test_token")
+		}
+		switch request.URL.Path {
+		case "/api/memberships":
+			atomic.AddInt32(&membershipsHits, 1)
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"memberships":[{"team_slug":"team-alpha"}]}`))
+		case "/api/teams/team-alpha/workers":
+			atomic.AddInt32(&workersHits, 1)
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[]}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	// Override the default-stub fetcher installed by resetWorkerState so the
+	// real fetchMembershipsHTTP runs against our stub server.
+	previousFetcher := fetchMemberships
+	t.Cleanup(func() { fetchMemberships = previousFetcher })
+	fetchMemberships = fetchMembershipsHTTP
+	resetMembershipCache()
+
+	if _, err := runCmd(t, "worker", "list"); err != nil {
+		t.Fatalf("list should succeed for current team: %v", err)
+	}
+	if atomic.LoadInt32(&membershipsHits) < 1 {
+		t.Errorf("memberships endpoint should have been called at least once")
+	}
+	if atomic.LoadInt32(&workersHits) != 1 {
+		t.Errorf("workers endpoint should have been called exactly once, got %d", workersHits)
 	}
 }

@@ -223,7 +223,7 @@ func ensureWorkerRegistered(ctx context.Context, baseURL, authToken, teamID, ctx
 		return nil, fmt.Errorf("read local worker config: %w", localErr)
 	}
 
-	servers, fetchErr := fetchWorkers(ctx, baseURL, authToken, teamID)
+	servers, fetchErr := fetchWorkers(ctx, baseURL, authToken, teamID, FetchWorkersOptions{})
 	if fetchErr != nil {
 		return nil, fmt.Errorf("list workers: %w", fetchErr)
 	}

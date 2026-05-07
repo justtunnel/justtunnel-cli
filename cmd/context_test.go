@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
@@ -24,7 +25,8 @@ func resetContextState(t *testing.T, cfg *config.Config) string {
 	config.SetConfigPath(path)
 	cfgFile = path
 	contextOverride = ""
-	t.Cleanup(func() { contextOverride = "" })
+	resetMembershipCache()
+	t.Cleanup(func() { contextOverride = ""; resetMembershipCache() })
 
 	if cfg == nil {
 		cfg = &config.Config{ServerURL: "wss://api.example.com/ws"}
@@ -147,6 +149,16 @@ func TestContextUsePushesToServer(t *testing.T) {
 		AuthToken: "tok_test",
 	})
 
+	// Stub the membership fetcher so the validation step doesn't actually
+	// hit the unreachable api.example.com (which would otherwise mark the
+	// command as "offline" and skip the push entirely).
+	previousFetcher := fetchMemberships
+	t.Cleanup(func() { fetchMemberships = previousFetcher; resetMembershipCache() })
+	fetchMemberships = func(client *http.Client, baseURL, authToken string) ([]membership, bool, bool, error) {
+		return []membership{{TeamSlug: "acme"}}, true, false, nil
+	}
+	resetMembershipCache()
+
 	previousPusher := pushActiveContext
 	t.Cleanup(func() { pushActiveContext = previousPusher })
 
@@ -204,7 +216,7 @@ func TestContextUseSkipsServerSyncWhenLoggedOut(t *testing.T) {
 	}
 }
 
-// TestContextUseTolerates404FromOlderServer verifies that pushActiveContextHTTP
+// TestPushActiveContextHTTP_TolerantOf404 verifies that pushActiveContextHTTP
 // returns nil when the server returns 404, so older servers without the
 // route don't surface a confusing warning.
 func TestPushActiveContextHTTP_TolerantOf404(t *testing.T) {
@@ -357,7 +369,7 @@ func TestFetchMembershipsHTTPError(t *testing.T) {
 	}))
 	defer stubServer.Close()
 
-	_, supported, err := fetchMembershipsHTTP(stubServer.Client(), stubServer.URL, "tok")
+	_, supported, _, err := fetchMembershipsHTTP(stubServer.Client(), stubServer.URL, "tok")
 	if err == nil {
 		t.Fatal("expected error on 500, got nil")
 	}
@@ -372,15 +384,44 @@ func TestFetchMembershipsHTTP404(t *testing.T) {
 	}))
 	defer stubServer.Close()
 
-	memberships, supported, err := fetchMembershipsHTTP(stubServer.Client(), stubServer.URL, "tok")
+	memberships, supported, definitelyNotMember, err := fetchMembershipsHTTP(stubServer.Client(), stubServer.URL, "tok")
 	if err != nil {
 		t.Fatalf("404 should not surface as error: %v", err)
 	}
 	if supported {
 		t.Errorf("supported should be false on 404")
 	}
+	if definitelyNotMember {
+		t.Errorf("definitelyNotMember should be false on 404")
+	}
 	if memberships != nil {
 		t.Errorf("memberships should be nil on 404, got %v", memberships)
+	}
+}
+
+// TestFetchMembershipsHTTP403 verifies the tri-state extension: a 403 must
+// be reported as definitelyNotMember=true rather than as an opaque error,
+// so callers (stalenessAnnotation, runContextUse) can treat the response
+// as a definitive "not a member" signal.
+func TestFetchMembershipsHTTP403(t *testing.T) {
+	stubServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+		writer.Write([]byte(`{"error":"not a member"}`))
+	}))
+	defer stubServer.Close()
+
+	memberships, supported, definitelyNotMember, err := fetchMembershipsHTTP(stubServer.Client(), stubServer.URL, "tok")
+	if err != nil {
+		t.Fatalf("403 should not surface as error: %v", err)
+	}
+	if !supported {
+		t.Errorf("supported should be true on 403")
+	}
+	if !definitelyNotMember {
+		t.Errorf("definitelyNotMember should be true on 403")
+	}
+	if memberships != nil {
+		t.Errorf("memberships should be nil on 403, got %v", memberships)
 	}
 }
 
@@ -467,6 +508,11 @@ func TestContextShowAnnotatesStaleSlug(t *testing.T) {
 		if request.URL.Path != "/api/memberships" {
 			http.NotFound(writer, request)
 			return
+		}
+		// C-7: assert the CLI is sending the right Authorization header
+		// rather than treating the stub as a black box.
+		if got := request.Header.Get("Authorization"); got != "Bearer tok" {
+			t.Errorf("Authorization header: got %q, want %q", got, "Bearer tok")
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		writer.Write([]byte(`{"memberships":[{"team_slug":"acme"}]}`))
@@ -624,5 +670,159 @@ func TestContextUseTolerates404FromOlderServer(t *testing.T) {
 
 	if _, err := runCmd(t, "context", "use", "team:acme"); err != nil {
 		t.Fatalf("404 from /api/memberships should not block context use: %v", err)
+	}
+}
+
+// TestLooksLikeULID_ExcludesCrockfordInvalid verifies that I, L, O, and U
+// (which Crockford base32 explicitly excludes to avoid visual ambiguity
+// with 1, 1, 0, V) are rejected in any position. Without this, the
+// stalenessAnnotation ULID escape hatch silently treats invalid
+// identifiers as ULID-shaped and skips the membership cross-check.
+func TestLooksLikeULID_ExcludesCrockfordInvalid(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+	}{
+		{"contains I (start)", "I1KQTJBVA6REFPMKT8MPKX8Z9N"},
+		{"contains I (mid)", "01KQTJBVA6IEFPMKT8MPKX8Z9N"},
+		{"contains L (mid)", "01KQTJBVA6REFPMKT8LPKX8Z9N"},
+		{"contains O (start)", "O1KQTJBVA6REFPMKT8MPKX8Z9N"},
+		{"contains U (mid)", "01KQTJBVA6REFPMKT8UPKX8Z9N"},
+		{"contains O (end)", "01KQTJBVA6REFPMKT8MPKX8Z9O"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			if len(testCase.id) != 26 {
+				t.Fatalf("test setup error: id length = %d, want 26", len(testCase.id))
+			}
+			if looksLikeULID(testCase.id) {
+				t.Errorf("looksLikeULID(%q) = true, want false (contains Crockford-invalid char)", testCase.id)
+			}
+		})
+	}
+}
+
+// TestLooksLikeULID_AcceptsValidCrockford complements the negative cases:
+// a real ULID using only Crockford-valid characters must still pass.
+func TestLooksLikeULID_AcceptsValidCrockford(t *testing.T) {
+	const validULID = "01KQTJBVA6REFPMKT8MPKX8Z9N"
+	if len(validULID) != 26 {
+		t.Fatalf("test setup error: id length = %d, want 26", len(validULID))
+	}
+	if !looksLikeULID(validULID) {
+		t.Errorf("looksLikeULID(%q) = false, want true (valid Crockford ULID)", validULID)
+	}
+}
+
+// TestStalenessAnnotationCachesMembershipFetch verifies C-3: back-to-back
+// staleness checks (e.g. context show then a worker subcommand within the
+// 30s TTL) reuse the cached /api/memberships response instead of hitting
+// the server twice.
+func TestStalenessAnnotationCachesMembershipFetch(t *testing.T) {
+	var requestCount int32
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/memberships" {
+			http.NotFound(writer, request)
+			return
+		}
+		atomic.AddInt32(&requestCount, 1)
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Write([]byte(`{"memberships":[{"team_slug":"acme"}]}`))
+	}))
+	defer stub.Close()
+
+	resetContextState(t, &config.Config{
+		AuthToken: "tok",
+		ServerURL: httpToWS(stub.URL) + "/ws",
+	})
+
+	// Two successive calls to stalenessAnnotation in quick succession.
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	baseURL, err := apiBaseURL(cfg.ServerURL)
+	if err != nil {
+		t.Fatalf("apiBaseURL: %v", err)
+	}
+	if _, stale := stalenessAnnotation(cfg, baseURL, "team:acme"); stale {
+		t.Fatalf("first call: should not be stale for valid membership")
+	}
+	if _, stale := stalenessAnnotation(cfg, baseURL, "team:acme"); stale {
+		t.Fatalf("second call: should not be stale for valid membership")
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 1 {
+		t.Errorf("expected 1 HTTP request to /api/memberships (cached on second call); got %d", got)
+	}
+}
+
+// TestStalenessAnnotation403MarksStale verifies C-4: a 403 from
+// /api/memberships is treated as "definitely not a member" rather than
+// failing open. This catches the case where membership was revoked
+// server-side while a stale slug lingered locally.
+func TestStalenessAnnotation403MarksStale(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/memberships" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.WriteHeader(http.StatusForbidden)
+		writer.Write([]byte(`{"error":"not a member"}`))
+	}))
+	defer stub.Close()
+
+	resetContextState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stub.URL) + "/ws",
+		CurrentContext: "team:acme",
+	})
+
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	baseURL, err := apiBaseURL(cfg.ServerURL)
+	if err != nil {
+		t.Fatalf("apiBaseURL: %v", err)
+	}
+	annotation, stale := stalenessAnnotation(cfg, baseURL, "team:acme")
+	if !stale {
+		t.Fatalf("expected stale=true on 403, got false (annotation=%q)", annotation)
+	}
+	if !strings.Contains(annotation, "not a member") {
+		t.Errorf("annotation should mention not-a-member; got %q", annotation)
+	}
+}
+
+// TestStalenessAnnotationFailsOpenOn5xx verifies the C-4 contract: a
+// transient 5xx must NOT be treated as definitive. The CLI fails open so
+// `context show` keeps working through a brief server blip.
+func TestStalenessAnnotationFailsOpenOn5xx(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/memberships" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.WriteHeader(http.StatusInternalServerError)
+		writer.Write([]byte(`{"error":"db down"}`))
+	}))
+	defer stub.Close()
+
+	resetContextState(t, &config.Config{
+		AuthToken:      "tok",
+		ServerURL:      httpToWS(stub.URL) + "/ws",
+		CurrentContext: "team:acme",
+	})
+
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	baseURL, err := apiBaseURL(cfg.ServerURL)
+	if err != nil {
+		t.Fatalf("apiBaseURL: %v", err)
+	}
+	if _, stale := stalenessAnnotation(cfg, baseURL, "team:acme"); stale {
+		t.Errorf("5xx must fail open, not annotate as stale")
 	}
 }
