@@ -24,3 +24,39 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+
+  # merge-preflight catches semantic conflicts between concurrent PRs that
+  # individually pass CI but break main once merged together (e.g. two
+  # PRs adding a same-named symbol, or one renaming a function the other
+  # depends on). Runs go vet + tests against the PR branch merged with the
+  # *current* origin/main. PR-only — push-to-main is already a real merged
+  # state covered by `build` above.
+  merge-preflight:
+    name: Merge preflight (vs latest main)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Merge latest main into PR head
+        run: |
+          git config user.email "ci@justtunnel.dev"
+          git config user.name "ci"
+          git fetch origin main
+          git merge --no-edit origin/main
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
