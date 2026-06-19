@@ -61,6 +61,12 @@ type Tunnel struct {
 	maxReconnectAttempts int
 	reconnecting         bool
 	disconnectedAt       time.Time
+
+	// sleep blocks for the given duration or until ctx is cancelled,
+	// returning ctx.Err() in the latter case. It is a seam for tests to
+	// observe the backoff schedule and advance time without real waits.
+	// Defaults to realSleep.
+	sleep func(ctx context.Context, duration time.Duration) error
 }
 
 func New(serverURL, localTarget, authToken string, logger *slog.Logger, callbacks Callbacks) *Tunnel {
@@ -71,6 +77,19 @@ func New(serverURL, localTarget, authToken string, logger *slog.Logger, callback
 		logger:               logger,
 		callbacks:            callbacks,
 		maxReconnectAttempts: 50,
+		sleep:                realSleep,
+	}
+}
+
+// realSleep blocks for the given duration or until ctx is cancelled.
+func realSleep(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -439,32 +458,23 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 // every second with the remaining time.
 func (t *Tunnel) waitWithCountdown(ctx context.Context, attempt int, backoff time.Duration) error {
 	if t.callbacks.OnReconnectWait == nil {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-			return nil
-		}
+		return t.sleep(ctx, backoff)
 	}
 
-	deadline := time.Now().Add(backoff)
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil
-		}
-
+	remaining := backoff
+	for remaining > 0 {
 		t.callbacks.OnReconnectWait(attempt, remaining)
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
+		step := time.Second
+		if remaining < step {
+			step = remaining
 		}
+		if err := t.sleep(ctx, step); err != nil {
+			return err
+		}
+		remaining -= step
 	}
+	return nil
 }
 
 // Shutdown gracefully closes the WebSocket connection and waits for in-flight
