@@ -55,17 +55,35 @@ var (
 			Foreground(colorDim)
 )
 
-// requestStatusStyle returns a style colored by HTTP status code range.
+// Status- and state-colored styles, pre-allocated once at package init. These
+// were previously rebuilt on every render via lipgloss.NewStyle(); the detail
+// view calls requestStatusStyle per recent-request row, so allocating fresh
+// styles each frame churned the heap for no benefit. Styles are immutable
+// values, so sharing one instance per color is safe.
+var (
+	styleStatusServerError = lipgloss.NewStyle().Foreground(colorRed)    // 5xx
+	styleStatusClientError = lipgloss.NewStyle().Foreground(colorYellow) // 4xx
+	styleStatusRedirect    = lipgloss.NewStyle().Foreground(colorCyan)   // 3xx — informational, not an error
+	styleStatusSuccess     = lipgloss.NewStyle().Foreground(colorGreen)  // 2xx and below
+
+	styleStateConnected    = lipgloss.NewStyle().Foreground(colorGreen)
+	styleStateTransitional = lipgloss.NewStyle().Foreground(colorYellow) // connecting / reconnecting
+	styleStateDown         = lipgloss.NewStyle().Foreground(colorRed)    // disconnected / error
+	styleStateUnknown      = lipgloss.NewStyle().Foreground(colorDim)
+)
+
+// requestStatusStyle returns a style colored by HTTP status code range. 3xx
+// redirects get their own color so they aren't mistaken for 4xx errors.
 func requestStatusStyle(statusCode int) lipgloss.Style {
 	switch {
 	case statusCode >= 500:
-		return lipgloss.NewStyle().Foreground(colorRed)
+		return styleStatusServerError
 	case statusCode >= 400:
-		return lipgloss.NewStyle().Foreground(colorYellow)
+		return styleStatusClientError
 	case statusCode >= 300:
-		return lipgloss.NewStyle().Foreground(colorYellow)
+		return styleStatusRedirect
 	default:
-		return lipgloss.NewStyle().Foreground(colorGreen)
+		return styleStatusSuccess
 	}
 }
 
@@ -73,13 +91,13 @@ func requestStatusStyle(statusCode int) lipgloss.Style {
 func stateStyle(state TunnelState) lipgloss.Style {
 	switch state {
 	case StateConnected:
-		return lipgloss.NewStyle().Foreground(colorGreen)
+		return styleStateConnected
 	case StateConnecting, StateReconnecting:
-		return lipgloss.NewStyle().Foreground(colorYellow)
+		return styleStateTransitional
 	case StateDisconnected, StateError:
-		return lipgloss.NewStyle().Foreground(colorRed)
+		return styleStateDown
 	default:
-		return lipgloss.NewStyle().Foreground(colorDim)
+		return styleStateUnknown
 	}
 }
 

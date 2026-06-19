@@ -4,13 +4,11 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/justtunnel/justtunnel-cli/internal/config"
 )
 
 const (
-	// minPort is the lowest valid port number.
-	minPort = 1
-	// maxPort is the highest valid port number.
-	maxPort = 65535
 	// shutdownTimeout is the per-tunnel shutdown timeout.
 	shutdownTimeout = 5 * time.Second
 )
@@ -45,8 +43,8 @@ func NewTunnelManager(factory TunnelFactory, sender MessageSender) *TunnelManage
 // Add creates and starts a new tunnel on the given port.
 // Returns an error if the port is invalid or already in use.
 func (m *TunnelManager) Add(port int, name string, subdomain string, password string) error {
-	if port < minPort || port > maxPort {
-		return fmt.Errorf("invalid port %d: must be between %d and %d", port, minPort, maxPort)
+	if err := config.ValidatePort(port); err != nil {
+		return err
 	}
 
 	m.mu.Lock()

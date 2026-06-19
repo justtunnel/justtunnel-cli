@@ -82,11 +82,6 @@ func ValidateDerivedSubdomain(name, slug string) error {
 	return nil
 }
 
-// validateName is the package-local alias retained so existing call sites
-// (Read, Write, runner, logfile) keep their short names. New cross-package
-// callers should use ValidateName.
-func validateName(name string) error { return ValidateName(name) }
-
 // home returns the JustTunnel home directory: $JUSTTUNNEL_HOME if set,
 // otherwise ~/.justtunnel. The directory is NOT created here.
 func home() (string, error) {
@@ -122,7 +117,7 @@ func WorkerDir() (string, error) {
 // ConfigPath returns the absolute path to the JSON file for the given worker
 // name. It validates name first to prevent path traversal.
 func ConfigPath(name string) (string, error) {
-	if err := validateName(name); err != nil {
+	if err := ValidateName(name); err != nil {
 		return "", err
 	}
 	dir, err := WorkerDir()

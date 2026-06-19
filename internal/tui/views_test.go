@@ -583,7 +583,6 @@ func TestRenderDetailViewDirect(t *testing.T) {
 			State:       StateConnected,
 			ConnectedAt: time.Now().Add(-5 * time.Minute),
 			Requests:    25,
-			AvgReqSec:   1.5,
 		},
 	}
 
@@ -612,10 +611,6 @@ func TestRenderDetailViewDirect(t *testing.T) {
 	// Request count
 	if !strings.Contains(output, "25") {
 		t.Error("detail view missing request count")
-	}
-	// Avg req/sec
-	if !strings.Contains(output, "1.5") {
-		t.Error("detail view missing avg req/sec")
 	}
 	// Recent requests section
 	if !strings.Contains(output, "Recent Requests") {

@@ -28,7 +28,6 @@ type TunnelDisplayEntry struct {
 	Error             string
 	ConnectedAt       time.Time
 	Requests          int64
-	AvgReqSec         float64
 	PasswordProtected bool
 	RecentRequests    []RequestEntry
 }

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/justtunnel/justtunnel-cli/internal/config"
 )
 
 // Command is the interface for all parsed slash commands.
@@ -86,8 +88,8 @@ func parseAddCommand(args []string) (Command, error) {
 
 	portStr := args[0]
 	port, parseErr := strconv.Atoi(portStr)
-	if parseErr != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("Invalid port: %s (must be 1-65535).", portStr)
+	if parseErr != nil || config.ValidatePort(port) != nil {
+		return nil, fmt.Errorf("Invalid port: %s (must be %d-%d).", portStr, config.MinPort, config.MaxPort)
 	}
 
 	cmd := AddCommand{Port: port}

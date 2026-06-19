@@ -247,29 +247,10 @@ func stringHash(input string) int64 {
 // reconnection with no upper bound on attempts — the only way out is
 // context cancellation or a terminal close.
 func (r *Runner) Run(ctx context.Context) error {
-	// NewRunner is the supported construction path and pre-validates
-	// deps; this guard exists for the legacy struct-literal callers in
-	// tests that construct a Runner without Dialer wired.
-	if r.Dialer == nil {
-		return errors.New("worker: runner missing Dialer")
-	}
-	if r.Logger == nil {
-		r.Logger = slog.Default()
-	}
-	if r.now == nil {
-		r.now = time.Now
-	}
-	if r.stableConnDuration == 0 {
-		r.stableConnDuration = stableConnDuration
-	}
-	if r.rng == nil {
-		r.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
-	}
-	if r.backoff == nil {
-		r.backoff = func(attempt int) time.Duration {
-			return backoffWithRand(attempt, r.rng)
-		}
-	}
+	// All fields are guaranteed populated by NewRunner (the only supported
+	// construction path), so Run does not re-init them. NewRunner panics on a
+	// nil Logger or Dialer, so there is no usable zero-value Runner to defend
+	// against here.
 	backoffFunc := r.backoff
 	clock := r.now
 	stableThreshold := r.stableConnDuration
@@ -563,7 +544,7 @@ var plaintextWarnOut io.Writer = os.Stderr
 // creating the parent directory with 0700 if missing. The name is validated
 // to prevent path traversal — same regex as config files.
 func LogFilePath(workerName string) (string, error) {
-	if err := validateName(workerName); err != nil {
+	if err := ValidateName(workerName); err != nil {
 		return "", err
 	}
 	root, err := home()
