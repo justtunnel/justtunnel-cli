@@ -317,8 +317,10 @@ func TestWorkerUninstallDeleteOnServer404OnDelete(t *testing.T) {
 }
 
 // TestWorkerUninstallForceContinuesPastUnbootstrapFailure: with --force,
-// an Unbootstrap error must NOT abort the command. Local cleanup runs,
-// the warning lands on stderr, and the command exits 0.
+// an Unbootstrap error must NOT abort the command — local cleanup still
+// runs and the warning lands on stderr. But because a step failed, the
+// command must exit NON-ZERO (ErrForceStepErrors) so scripts checking $?
+// don't get a false positive on a partial failure. See justtunnel-cli#66.
 func TestWorkerUninstallForceContinuesPastUnbootstrapFailure(t *testing.T) {
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusOK)
@@ -339,8 +341,11 @@ func TestWorkerUninstallForceContinuesPastUnbootstrapFailure(t *testing.T) {
 	useFakeSupervisor(t, newFakeSupervisor())
 
 	stdout, stderr, err := runCmdSplit(t, "worker", "uninstall", "alpha", "--force")
-	if err != nil {
-		t.Fatalf("--force should not return an error, got: %v", err)
+	if err == nil {
+		t.Fatal("--force with a step failure must exit non-zero")
+	}
+	if !errors.Is(err, ErrForceStepErrors) {
+		t.Errorf("--force step failure should return ErrForceStepErrors, got: %v", err)
 	}
 	if _, readErr := worker.Read("alpha"); !errors.Is(readErr, os.ErrNotExist) {
 		t.Errorf("local cleanup should still run under --force, got err=%v", readErr)
@@ -505,7 +510,8 @@ func TestWorkerUninstallProbeWarnsWhenStillRunning(t *testing.T) {
 // --force --delete-on-server, a server 403 is logged but local cleanup
 // (service teardown + local config delete) continues. The local pointer
 // is cleaned up; the operator can still re-attempt the server delete
-// later from a permitted account.
+// later from a permitted account. The command still exits non-zero
+// (ErrForceStepErrors) because the server step failed. See justtunnel-cli#66.
 func TestWorkerUninstallForceWith403ContinuesLocalCleanup(t *testing.T) {
 	var deleteCalls int32
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -540,8 +546,11 @@ func TestWorkerUninstallForceWith403ContinuesLocalCleanup(t *testing.T) {
 
 	stdout, stderr, err := runCmdSplit(t, "worker", "uninstall", "alpha",
 		"--delete-on-server", "--force")
-	if err != nil {
-		t.Fatalf("--force should not surface a non-zero exit on server failure: %v", err)
+	if err == nil {
+		t.Fatal("--force with a server-side failure must still exit non-zero")
+	}
+	if !errors.Is(err, ErrForceStepErrors) {
+		t.Errorf("--force server failure should return ErrForceStepErrors, got: %v", err)
 	}
 	// Server-side DELETE must have been attempted FIRST.
 	if got := atomic.LoadInt32(&deleteCalls); got != 1 {
@@ -558,6 +567,41 @@ func TestWorkerUninstallForceWith403ContinuesLocalCleanup(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Uninstalled worker") {
 		t.Errorf("expected uninstall success line in stdout, got: %s", stdout)
+	}
+}
+
+// TestWorkerUninstallForceNoErrorsExitsZero locks the happy-path contract:
+// when --force is set but every step succeeds, the command must still exit
+// 0. The non-zero exit added for justtunnel-cli#66 fires ONLY on collected
+// step errors, not on a clean --force run.
+func TestWorkerUninstallForceNoErrorsExitsZero(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, uninstallTeamCfg(stub.URL))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_1", Name: "alpha", Context: "team:team-acme",
+		Subdomain: "alpha--acme", CreatedAt: time.Now().UTC(), ServiceBackend: "launchd",
+	}); err != nil {
+		t.Fatalf("seed local: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+	useFakeSupervisor(t, newFakeSupervisor())
+
+	stdout, _, err := runCmdSplit(t, "worker", "uninstall", "alpha", "--force")
+	if err != nil {
+		t.Fatalf("--force with no step failures must exit 0, got: %v", err)
+	}
+	if !strings.Contains(stdout, "Uninstalled") {
+		t.Errorf("expected success line on clean --force run, got stdout: %s", stdout)
+	}
+	if _, readErr := worker.Read("alpha"); !errors.Is(readErr, os.ErrNotExist) {
+		t.Errorf("local config should be deleted on clean --force run, got err=%v", readErr)
 	}
 }
 
