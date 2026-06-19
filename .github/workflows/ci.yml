@@ -46,7 +46,10 @@ jobs:
           git config user.email "ci@justtunnel.dev"
           git config user.name "ci"
           git fetch origin main
-          git merge --no-edit origin/main
+          git merge --no-edit origin/main || {
+            echo "::error::Merge conflict with origin/main. Rebase or merge main into this branch locally, resolve the conflicts, and re-push."
+            exit 1
+          }
 
       - uses: actions/setup-go@v5
         with:

@@ -319,7 +319,7 @@ func TestWorkerUninstallDeleteOnServer404OnDelete(t *testing.T) {
 // TestWorkerUninstallForceContinuesPastUnbootstrapFailure: with --force,
 // an Unbootstrap error must NOT abort the command — local cleanup still
 // runs and the warning lands on stderr. But because a step failed, the
-// command must exit NON-ZERO (ErrForceStepErrors) so scripts checking $?
+// command must exit NON-ZERO (errForceStepErrors) so scripts checking $?
 // don't get a false positive on a partial failure. See justtunnel-cli#66.
 func TestWorkerUninstallForceContinuesPastUnbootstrapFailure(t *testing.T) {
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -344,8 +344,8 @@ func TestWorkerUninstallForceContinuesPastUnbootstrapFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("--force with a step failure must exit non-zero")
 	}
-	if !errors.Is(err, ErrForceStepErrors) {
-		t.Errorf("--force step failure should return ErrForceStepErrors, got: %v", err)
+	if !errors.Is(err, errForceStepErrors) {
+		t.Errorf("--force step failure should return errForceStepErrors, got: %v", err)
 	}
 	if _, readErr := worker.Read("alpha"); !errors.Is(readErr, os.ErrNotExist) {
 		t.Errorf("local cleanup should still run under --force, got err=%v", readErr)
@@ -360,12 +360,14 @@ func TestWorkerUninstallForceContinuesPastUnbootstrapFailure(t *testing.T) {
 	if strings.Contains(stdout, "launchctl wedged") || strings.Contains(stdout, "service teardown") {
 		t.Errorf("error summary must NOT leak onto stdout, got stdout: %s", stdout)
 	}
-	// The success line belongs on stdout only.
-	if !strings.Contains(stdout, "Uninstalled") {
-		t.Errorf("success line should appear on stdout, got stdout: %s", stdout)
+	// Partial-failure outcome line belongs on stdout. It must NOT claim a
+	// clean "Uninstalled" — that would contradict the non-zero exit and
+	// the stderr error summary.
+	if !strings.Contains(stdout, "cleanup completed with errors") {
+		t.Errorf("partial-failure outcome line should appear on stdout, got stdout: %s", stdout)
 	}
-	if strings.Contains(stderr, "Uninstalled") {
-		t.Errorf("success line must NOT leak onto stderr, got stderr: %s", stderr)
+	if strings.Contains(stdout, "Uninstalled") {
+		t.Errorf("partial-failure run must NOT print a clean 'Uninstalled' line, got stdout: %s", stdout)
 	}
 }
 
@@ -511,7 +513,7 @@ func TestWorkerUninstallProbeWarnsWhenStillRunning(t *testing.T) {
 // (service teardown + local config delete) continues. The local pointer
 // is cleaned up; the operator can still re-attempt the server delete
 // later from a permitted account. The command still exits non-zero
-// (ErrForceStepErrors) because the server step failed. See justtunnel-cli#66.
+// (errForceStepErrors) because the server step failed. See justtunnel-cli#66.
 func TestWorkerUninstallForceWith403ContinuesLocalCleanup(t *testing.T) {
 	var deleteCalls int32
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -549,8 +551,8 @@ func TestWorkerUninstallForceWith403ContinuesLocalCleanup(t *testing.T) {
 	if err == nil {
 		t.Fatal("--force with a server-side failure must still exit non-zero")
 	}
-	if !errors.Is(err, ErrForceStepErrors) {
-		t.Errorf("--force server failure should return ErrForceStepErrors, got: %v", err)
+	if !errors.Is(err, errForceStepErrors) {
+		t.Errorf("--force server failure should return errForceStepErrors, got: %v", err)
 	}
 	// Server-side DELETE must have been attempted FIRST.
 	if got := atomic.LoadInt32(&deleteCalls); got != 1 {
@@ -565,8 +567,10 @@ func TestWorkerUninstallForceWith403ContinuesLocalCleanup(t *testing.T) {
 		!strings.Contains(stderr, "403") {
 		t.Errorf("expected 403 / permission error in stderr, got: %s", stderr)
 	}
-	if !strings.Contains(stdout, "Uninstalled worker") {
-		t.Errorf("expected uninstall success line in stdout, got: %s", stdout)
+	// Partial failure (server 403) → stdout reports cleanup-with-errors,
+	// not a clean "Uninstalled" line.
+	if !strings.Contains(stdout, "cleanup completed with errors") {
+		t.Errorf("expected partial-failure outcome line in stdout, got: %s", stdout)
 	}
 }
 
@@ -602,6 +606,113 @@ func TestWorkerUninstallForceNoErrorsExitsZero(t *testing.T) {
 	}
 	if _, readErr := worker.Read("alpha"); !errors.Is(readErr, os.ErrNotExist) {
 		t.Errorf("local config should be deleted on clean --force run, got err=%v", readErr)
+	}
+}
+
+// TestWorkerUninstallForceTwoStepErrorsCounted exercises the multi-error
+// summary path: --force --delete-on-server where BOTH the server-side
+// DELETE fails (403) AND service teardown fails. The stderr summary must
+// report "2 step error(s)" and label both failing steps, and the command
+// must exit non-zero. This locks the count + per-error iteration that the
+// single-error tests never exercise. See justtunnel-cli#66.
+func TestWorkerUninstallForceTwoStepErrorsCounted(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme"}]}`))
+		case http.MethodDelete:
+			writer.WriteHeader(http.StatusForbidden)
+			writer.Write([]byte(`{"error":"only admins can delete workers"}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, uninstallTeamCfg(stub.URL))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_1", Name: "alpha", Context: "team:team-acme",
+		Subdomain: "alpha--acme", CreatedAt: time.Now().UTC(), ServiceBackend: "launchd",
+	}); err != nil {
+		t.Fatalf("seed local: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{unbootstrapErr: errors.New("launchctl wedged")}
+	withFakeInstaller(t, fake)
+	useFakeSupervisor(t, newFakeSupervisor())
+
+	stdout, stderr, err := runCmdSplit(t, "worker", "uninstall", "alpha",
+		"--delete-on-server", "--force")
+	if err == nil {
+		t.Fatal("--force with two step failures must exit non-zero")
+	}
+	if !errors.Is(err, errForceStepErrors) {
+		t.Errorf("expected errForceStepErrors, got: %v", err)
+	}
+	if !strings.Contains(stderr, "2 step error(s)") {
+		t.Errorf("summary should report 2 step errors, got stderr: %s", stderr)
+	}
+	if !strings.Contains(stderr, "server-side delete") {
+		t.Errorf("summary should label the server-side delete failure, got stderr: %s", stderr)
+	}
+	if !strings.Contains(stderr, "service teardown") {
+		t.Errorf("summary should label the service teardown failure, got stderr: %s", stderr)
+	}
+	// Local config is still cleaned up (best-effort) so stdout reports
+	// partial cleanup, never a clean "Uninstalled" line.
+	if !strings.Contains(stdout, "cleanup completed with errors") {
+		t.Errorf("expected partial-failure outcome line, got stdout: %s", stdout)
+	}
+}
+
+// TestWorkerUninstallForceAllStepsFailNoLocalState covers the three-way
+// state the skeptic flagged: --force --delete-on-server where the server
+// DELETE fails (403) AND the local config is already absent. Nothing
+// mutates (changed stays false), but the command must NOT print "already
+// uninstalled" — that would contradict the stderr error summary and the
+// non-zero exit. See justtunnel-cli#66.
+func TestWorkerUninstallForceAllStepsFailNoLocalState(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[{"id":"wkr_1","name":"alpha","team_id":"team-acme","subdomain":"alpha--acme"}]}`))
+		case http.MethodDelete:
+			writer.WriteHeader(http.StatusForbidden)
+			writer.Write([]byte(`{"error":"only admins can delete workers"}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer stub.Close()
+
+	// No local config seeded — removeLocalConfig returns changed=false.
+	resetWorkerState(t, uninstallTeamCfg(stub.URL))
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+	useFakeSupervisor(t, newFakeSupervisor())
+
+	stdout, stderr, err := runCmdSplit(t, "worker", "uninstall", "alpha",
+		"--delete-on-server", "--force")
+	if err == nil {
+		t.Fatal("--force with a failed server step must exit non-zero")
+	}
+	if !errors.Is(err, errForceStepErrors) {
+		t.Errorf("expected errForceStepErrors, got: %v", err)
+	}
+	// The contradiction the skeptic flagged: must NOT claim "already
+	// uninstalled" while the exit is non-zero and stderr shows an error.
+	if strings.Contains(stdout, "already uninstalled") {
+		t.Errorf("must NOT print 'already uninstalled' on a failed --force run, got stdout: %s", stdout)
+	}
+	if !strings.Contains(stdout, "cleanup completed with errors") {
+		t.Errorf("expected partial-failure outcome line, got stdout: %s", stdout)
+	}
+	if !strings.Contains(stderr, "server-side delete") {
+		t.Errorf("expected server-side delete failure in summary, got stderr: %s", stderr)
 	}
 }
 
