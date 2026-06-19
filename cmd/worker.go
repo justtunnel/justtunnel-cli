@@ -100,7 +100,7 @@ func loadWorkerEnv() (cfg *config.Config, teamID, ctxName, baseURL string, err e
 	if err != nil {
 		return nil, "", "", "", err
 	}
-	baseURL, err = apiBaseURL(cfg.ServerURL)
+	baseURL, err = config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
 		return nil, "", "", "", fmt.Errorf("parse server URL: %w", err)
 	}

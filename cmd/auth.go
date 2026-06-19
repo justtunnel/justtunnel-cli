@@ -69,7 +69,7 @@ func runKeyAuth(_ *cobra.Command, key string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
@@ -98,7 +98,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
@@ -264,7 +264,7 @@ func verifyKey(client *http.Client, baseURL, key string) (*authVerifyResponse, e
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Authorization", config.AuthHeaderPrefix+key)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -300,22 +300,4 @@ func categorizeAuthError(err error) error {
 	default:
 		return err
 	}
-}
-
-// apiBaseURL derives the REST API base URL from the WebSocket server URL.
-// e.g. "wss://api.justtunnel.dev/ws" -> "https://api.justtunnel.dev"
-func apiBaseURL(serverURL string) (string, error) {
-	parsedURL, err := url.Parse(serverURL)
-	if err != nil {
-		return "", err
-	}
-	switch parsedURL.Scheme {
-	case "wss":
-		parsedURL.Scheme = "https"
-	case "ws":
-		parsedURL.Scheme = "http"
-	}
-	parsedURL.Path = ""
-	parsedURL.RawQuery = ""
-	return parsedURL.String(), nil
 }

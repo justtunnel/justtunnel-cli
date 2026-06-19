@@ -127,28 +127,6 @@ func TestValidateKeyFormat(t *testing.T) {
 	}
 }
 
-func TestAPIBaseURL(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"wss://api.justtunnel.dev/ws", "https://api.justtunnel.dev"},
-		{"ws://localhost:8080/ws", "http://localhost:8080"},
-		{"wss://custom.domain.com/ws?foo=bar", "https://custom.domain.com"},
-	}
-
-	for _, tt := range tests {
-		got, err := apiBaseURL(tt.input)
-		if err != nil {
-			t.Errorf("apiBaseURL(%q) error: %v", tt.input, err)
-			continue
-		}
-		if got != tt.want {
-			t.Errorf("apiBaseURL(%q) = %q, want %q", tt.input, got, tt.want)
-		}
-	}
-}
-
 func TestCreateDeviceSession(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/api/auth/device" {

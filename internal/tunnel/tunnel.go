@@ -14,6 +14,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
 )
 
@@ -142,7 +143,7 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 	opts := &websocket.DialOptions{}
 	if t.authToken != "" {
 		opts.HTTPHeader = http.Header{
-			"Authorization": []string{"Bearer " + t.authToken},
+			"Authorization": []string{config.AuthHeaderPrefix + t.authToken},
 		}
 	}
 	if t.password != "" {
