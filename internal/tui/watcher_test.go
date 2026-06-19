@@ -271,6 +271,127 @@ func TestConfigWatcher_DeletedConfigSendsError(t *testing.T) {
 	}
 }
 
+// writeWatcherConfigAtomic mimics how editors save: write to a temp file in the
+// same directory, then rename it over the target. This triggers an fsnotify
+// Remove/Rename event on the watched path and drops the underlying watch.
+func writeWatcherConfigAtomic(t *testing.T, configPath string, content string) {
+	t.Helper()
+	tmpPath := configPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		t.Fatalf("failed to rename temp config: %v", err)
+	}
+}
+
+// TestConfigWatcher_ReWatchesAfterRenameReplace proves the fix deterministically
+// across platforms: after a remove/rename drops the underlying fsnotify watch,
+// a successful reload re-adds the watch so later changes keep being delivered.
+// inotify (Linux) drops the watch on rename-replace; we simulate that dropped
+// state directly so the assertion holds regardless of the host's fsnotify backend.
+func TestConfigWatcher_ReWatchesAfterRenameReplace(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "tunnels.yaml")
+
+	initialYAML := "tunnels:\n  - port: 3000\n    name: frontend\n"
+	writeWatcherConfig(t, configPath, initialYAML)
+
+	collector := newWatcherMsgCollector()
+	mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
+	watcher, err := NewConfigWatcher(configPath, mgr, collector)
+	if err != nil {
+		t.Fatalf("NewConfigWatcher failed: %v", err)
+	}
+	defer watcher.Stop()
+
+	// Simulate the inotify behavior on rename-replace: the watch is gone.
+	if err := watcher.watcher.Remove(configPath); err != nil {
+		t.Fatalf("failed to drop watch to simulate rename: %v", err)
+	}
+	for _, watched := range watcher.watcher.WatchList() {
+		if watched == configPath {
+			t.Fatalf("precondition failed: %q still watched after Remove", configPath)
+		}
+	}
+
+	// A remove/rename-triggered reload must re-add the watch.
+	writeWatcherConfig(t, configPath, "tunnels:\n  - port: 3000\n    name: frontend\n  - port: 8080\n    name: api\n")
+	watcher.handleReload(true)
+
+	rewatched := false
+	for _, watched := range watcher.watcher.WatchList() {
+		if watched == configPath {
+			rewatched = true
+			break
+		}
+	}
+	if !rewatched {
+		t.Fatalf("expected %q to be re-watched after rename-replace reload; watcher would go silent", configPath)
+	}
+}
+
+// TestConfigWatcher_KeepsWatchingAfterRenameReplace is an end-to-end check that
+// repeated editor atomic saves (write tmp + rename) keep producing change
+// messages instead of the watcher going silent after the first rename.
+func TestConfigWatcher_KeepsWatchingAfterRenameReplace(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "tunnels.yaml")
+
+	initialYAML := "tunnels:\n  - port: 3000\n    name: frontend\n"
+	writeWatcherConfig(t, configPath, initialYAML)
+
+	collector := newWatcherMsgCollector()
+	mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
+	watcher, err := NewConfigWatcher(configPath, mgr, collector)
+	if err != nil {
+		t.Fatalf("NewConfigWatcher failed: %v", err)
+	}
+	defer watcher.Stop()
+
+	watcher.Start()
+
+	// First atomic save (rename-replace) adds port 8080. fsnotify drops the
+	// watch on the rename; handleReload must re-add it.
+	firstYAML := "tunnels:\n  - port: 3000\n    name: frontend\n  - port: 8080\n    name: api\n"
+	writeWatcherConfigAtomic(t, configPath, firstYAML)
+
+	foundFirst := collector.waitForMessage(500*time.Millisecond, func(msg tea.Msg) bool {
+		changed, ok := msg.(ConfigChangedMsg)
+		return ok && len(changed.ToAdd) > 0
+	})
+	if !foundFirst {
+		t.Fatal("expected ConfigChangedMsg after first rename-replace, got none")
+	}
+
+	collector.Reset()
+
+	// Second atomic save adds port 9090. Before the fix the watcher was silent
+	// after the first rename, so this change would never be picked up.
+	secondYAML := "tunnels:\n  - port: 3000\n    name: frontend\n  - port: 8080\n    name: api\n  - port: 9090\n    name: admin\n"
+	writeWatcherConfigAtomic(t, configPath, secondYAML)
+
+	foundSecond := collector.waitForMessage(1*time.Second, func(msg tea.Msg) bool {
+		changed, ok := msg.(ConfigChangedMsg)
+		if !ok {
+			return false
+		}
+		for _, preset := range changed.ToAdd {
+			if preset.Port == 9090 {
+				return true
+			}
+		}
+		return false
+	})
+	if !foundSecond {
+		t.Fatal("expected ConfigChangedMsg for port 9090 after second rename-replace; watcher went silent after the first rename")
+	}
+}
+
 func TestModelHandlesConfigChangedMsg(t *testing.T) {
 	t.Parallel()
 

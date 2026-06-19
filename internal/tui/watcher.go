@@ -90,17 +90,14 @@ func (w *ConfigWatcher) watchLoop() {
 					debounceTimer.Stop()
 				}
 
-				if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
-					// File was removed or renamed. Send error and try to re-watch.
-					// Use a short debounce since editors may recreate the file.
-					debounceTimer = time.AfterFunc(debounceDelay, func() {
-						w.handleReload()
-					})
-				} else {
-					debounceTimer = time.AfterFunc(debounceDelay, func() {
-						w.handleReload()
-					})
-				}
+				// fsnotify drops the watch when the file is removed or renamed
+				// (e.g. an editor's atomic save: write tmp, rename over original).
+				// In that case we must re-add the watch after reloading, otherwise
+				// the watcher fires once and then goes permanently silent.
+				rewatch := event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)
+				debounceTimer = time.AfterFunc(debounceDelay, func() {
+					w.handleReload(rewatch)
+				})
 			}
 
 		case watchErr, ok := <-w.watcher.Errors:
@@ -115,7 +112,10 @@ func (w *ConfigWatcher) watchLoop() {
 }
 
 // handleReload loads the config file, computes a diff, and sends the appropriate message.
-func (w *ConfigWatcher) handleReload() {
+// When rewatch is true the triggering event removed or renamed the file, which causes
+// fsnotify to drop the watch; after a successful reload we re-add it so subsequent
+// changes (such as repeated editor atomic saves) keep being picked up.
+func (w *ConfigWatcher) handleReload(rewatch bool) {
 	// Check if stopped before sending
 	select {
 	case <-w.stopCh:
@@ -129,6 +129,16 @@ func (w *ConfigWatcher) handleReload() {
 			Error: fmt.Sprintf("config reload failed: %v", err),
 		})
 		return
+	}
+
+	// The reload succeeded, so the path exists again. Re-add the watch that
+	// fsnotify dropped on the remove/rename, ignoring "already watching" no-ops.
+	if rewatch {
+		if err := w.watcher.Add(w.configPath); err != nil {
+			w.sender.Send(ConfigReloadErrorMsg{
+				Error: fmt.Sprintf("re-watch config file %q: %v", w.configPath, err),
+			})
+		}
 	}
 
 	currentTunnels := w.manager.Tunnels()
