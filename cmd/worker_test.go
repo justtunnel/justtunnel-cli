@@ -507,6 +507,104 @@ func TestWorkerRmLocalOnlyMissingConfigIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestWorkerRmLocalOnlyManagedBackendTearsDownService covers CLI-7: when
+// the local config records a managed supervisor (launchd/systemd), a
+// local-only `rm` must tear down the service unit too — otherwise a ghost
+// launchd/systemd job keeps firing on boot reading a now-deleted config.
+func TestWorkerRmLocalOnlyManagedBackendTearsDownService(t *testing.T) {
+	var httpCalls int32
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&httpCalls, 1)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "launchd",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+
+	out, err := runCmd(t, "worker", "rm", "alice")
+	if err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	if got := atomic.LoadInt32(&fake.unbootstrapCalls); got != 1 {
+		t.Errorf("Unbootstrap calls: got %d, want 1 (service unit must be removed)", got)
+	}
+	if got := fake.readGotUnbootName(); got != "alice" {
+		t.Errorf("Unbootstrap name: got %q, want alice", got)
+	}
+	if atomic.LoadInt32(&httpCalls) != 0 {
+		t.Errorf("local-only rm must not call the server, got %d calls", httpCalls)
+	}
+	if _, readErr := worker.Read("alice"); !errors.Is(readErr, os.ErrNotExist) {
+		t.Errorf("local config should be gone, got err=%v", readErr)
+	}
+	if !strings.Contains(out, "Removed local config") {
+		t.Errorf("expected success message, got: %s", out)
+	}
+}
+
+// TestWorkerRmLocalOnlyNoneBackendSkipsTeardown verifies the guard: a config
+// with ServiceBackend "none" never registered a service unit, so a local-only
+// `rm` must NOT invoke the supervisor.
+func TestWorkerRmLocalOnlyNoneBackendSkipsTeardown(t *testing.T) {
+	resetWorkerState(t, teamCfg("http://unused.invalid"))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "none",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+
+	if _, err := runCmd(t, "worker", "rm", "alice"); err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	if got := atomic.LoadInt32(&fake.unbootstrapCalls); got != 0 {
+		t.Errorf("Unbootstrap must NOT run for ServiceBackend=none, got %d calls", got)
+	}
+}
+
+// TestWorkerRmLocalOnlyTeardownFailureIsBestEffort verifies CLI-7's
+// best-effort contract: an Unbootstrap failure must NOT fail the command (the
+// config is already gone) — it warns on stderr and points at `worker
+// uninstall --force`.
+func TestWorkerRmLocalOnlyTeardownFailureIsBestEffort(t *testing.T) {
+	resetWorkerState(t, teamCfg("http://unused.invalid"))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "systemd",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{unbootstrapErr: errors.New("systemctl boom")}
+	withFakeInstaller(t, fake)
+
+	stdout, stderr, err := runCmdSplit(t, "worker", "rm", "alice")
+	if err != nil {
+		t.Fatalf("rm must succeed despite teardown failure, got err=%v", err)
+	}
+	if _, readErr := worker.Read("alice"); !errors.Is(readErr, os.ErrNotExist) {
+		t.Errorf("local config should still be deleted, got err=%v", readErr)
+	}
+	if !strings.Contains(stdout, "Removed local config") {
+		t.Errorf("expected success message on stdout, got: %s", stdout)
+	}
+	if !strings.Contains(stderr, "worker uninstall") {
+		t.Errorf("expected stderr warning pointing at `worker uninstall`, got: %s", stderr)
+	}
+}
+
 // TestWorkerCreateRollsBackOnLocalWriteFailure covers blocker #2 happy
 // rollback: local worker.Write fails, compensating DELETE succeeds. The
 // CLI must surface a "rolled back, please retry" error.

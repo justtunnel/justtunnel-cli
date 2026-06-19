@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 
 	"github.com/spf13/cobra"
 
@@ -46,7 +47,8 @@ func runWorkerRm(cmd *cobra.Command, args []string) error {
 		// config" line. Idempotent success is still success — `rm` of a
 		// non-existent thing is a no-op success in Unix — but we owe the
 		// user an honest message.
-		if _, readErr := worker.Read(name); errors.Is(readErr, os.ErrNotExist) {
+		cfg, readErr := worker.Read(name)
+		if errors.Is(readErr, os.ErrNotExist) {
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"No local config found for %q.\n", name,
 			)
@@ -55,9 +57,20 @@ func runWorkerRm(cmd *cobra.Command, args []string) error {
 		// Read may also fail with non-ENOENT errors (permissions, parse
 		// failure). In that case still try to delete so the user has a
 		// path forward; surface the read error only if delete also fails.
+		// cfg is nil on a non-ENOENT read failure, so the service-teardown
+		// step below short-circuits — we can't know the backend.
 		if err := worker.Delete(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("delete local worker config: %w", err)
 		}
+		// If the config recorded a managed supervisor (launchd/systemd),
+		// deleting only the config would orphan the service unit — a ghost
+		// launchd/systemd job keeps firing on login/boot, now reading a
+		// config that no longer exists. Best-effort tear it down so
+		// local-only `rm` leaves no residue. Unbootstrap is idempotent
+		// (a missing unit is a no-op), and any failure is surfaced as a
+		// warning with a `worker uninstall` pointer rather than failing the
+		// command — the config is already gone and the user wants cleanup.
+		teardownLocalService(cmd, cfg, name)
 		fmt.Fprintf(cmd.OutOrStdout(),
 			"Removed local config for %q. The worker may still be registered server-side.\n"+
 				"Use --delete-on-server to also delete server-side.\n",
@@ -140,4 +153,47 @@ func runWorkerRm(cmd *cobra.Command, args []string) error {
 		)
 	}
 	return nil
+}
+
+// teardownLocalService best-effort removes the platform service unit that
+// `worker install` registered for this worker. It runs only when the config
+// recorded a real managed backend (launchd/systemd) — configs with
+// ServiceBackend "none"/""/"unsupported" never registered a unit, so there
+// is nothing to tear down.
+//
+// This is intentionally non-fatal: the local config is already deleted by the
+// time we get here and the operator's intent is cleanup, so a teardown failure
+// is downgraded to a stderr warning that points at `worker uninstall` (which
+// has --force for stubborn cases) rather than failing the command.
+func teardownLocalService(cmd *cobra.Command, cfg *worker.Config, name string) {
+	if cfg == nil {
+		return
+	}
+	switch cfg.ServiceBackend {
+	case "launchd", "systemd":
+		// managed backend — fall through to teardown.
+	default:
+		// "none", "", or "unsupported": no service unit was ever
+		// registered, so there is nothing to remove.
+		return
+	}
+
+	svc, err := newServiceInstaller(runtime.GOOS)
+	if err != nil {
+		// No supervisor adapter for this OS (e.g. the config was created
+		// on another platform). Point the user at uninstall on the matching
+		// host and move on.
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"warning: worker %q recorded a %s service but this host (%s) has no supervisor to remove it; run `justtunnel worker uninstall %s` on the original machine\n",
+			name, cfg.ServiceBackend, runtime.GOOS, name,
+		)
+		return
+	}
+	if unbootErr := svc.Unbootstrap(cmd.Context(), name); unbootErr != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"warning: removed local config but could not stop the %s service for %q: %v\n"+
+				"run `justtunnel worker uninstall %s --force` to finish removing the service unit\n",
+			cfg.ServiceBackend, name, unbootErr, name,
+		)
+	}
 }
