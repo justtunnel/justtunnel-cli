@@ -12,11 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
 
+	"github.com/justtunnel/justtunnel-cli/internal/backoff"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 )
 
@@ -426,65 +426,19 @@ func sleepCtx(ctx context.Context, duration time.Duration) error {
 	}
 }
 
-// backoffMu guards the package-level rng used by the convenience Backoff
-// function. Production runners use a per-runner *rand.Rand (see
-// backoffWithRand) and never touch this mutex; only direct callers of
-// Backoff (tests, ad-hoc code) pay the lock cost.
-var (
-	backoffMu  sync.Mutex
-	backoffRng = rand.New(rand.NewSource(time.Now().UnixNano()))
-)
-
-// Backoff computes the wait before the Nth reconnect attempt. The schedule
-// is base*2^(attempt-1) with a hard cap at 60s, then ±25% uniform jitter
-// to spread thundering-herd reconnects across many workers.
-//
-// B5: the 60s cap is enforced AFTER jitter so the actual wait NEVER exceeds
-// 60s even when jitter rounds up.
-//
-// Convenience wrapper around backoffWithRand. Production runners pass a
-// per-runner rng (see NewRunner) to avoid the global-mutex cost; this
-// variant exists for direct test calls and external one-off uses.
+// Backoff computes the wait before the Nth reconnect attempt: base*2^(attempt-1)
+// capped at 60s with ±25% jitter. Convenience wrapper around the shared
+// backoff package; production runners pass a per-runner rng (see NewRunner)
+// via backoffWithRand to avoid the shared mutex.
 func Backoff(attempt int) time.Duration {
-	backoffMu.Lock()
-	defer backoffMu.Unlock()
-	return backoffWithRand(attempt, backoffRng)
+	return backoff.Compute(attempt)
 }
 
-// backoffWithRand is the pure (modulo rng) backoff implementation. Cap is
-// applied AFTER jitter so the returned duration is bounded by maxDelay
-// regardless of jitter direction.
+// backoffWithRand computes the backoff using a caller-owned rng so each runner
+// gets its own jitter sequence without locking. Delegates to the shared
+// backoff package so the tunnel client and worker runner stay aligned.
 func backoffWithRand(attempt int, rng *rand.Rand) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
-	const baseDelay = time.Second
-	const maxDelay = 60 * time.Second
-	// Compute 2^(attempt-1) with overflow protection: anything >= 6 saturates
-	// the 60s cap before jitter.
-	multiplier := 1
-	if attempt-1 >= 6 {
-		multiplier = 64 // produces >= 60s, will be clamped below
-	} else {
-		multiplier = 1 << (attempt - 1)
-	}
-	wait := baseDelay * time.Duration(multiplier)
-	if wait > maxDelay {
-		wait = maxDelay
-	}
-	// Uniform jitter in [-25%, +25%]. math/rand is fine here — this is a
-	// reconnect spreader, not a security primitive.
-	jitterFraction := (rng.Float64() - 0.5) * 0.5 // [-0.25, +0.25]
-	jittered := time.Duration(float64(wait) * (1.0 + jitterFraction))
-	// Clamp AFTER jitter so the upper bound is honored even when jitter
-	// pushes a 60s wait toward 75s.
-	if jittered > maxDelay {
-		jittered = maxDelay
-	}
-	if jittered < 0 {
-		jittered = 0
-	}
-	return jittered
+	return backoff.ComputeWithRand(attempt, rng)
 }
 
 // DeriveSubdomain returns the host-router subdomain for the given worker

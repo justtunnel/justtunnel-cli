@@ -160,9 +160,10 @@ func TestReconnectGivesUpAfterMaxAttempts(t *testing.T) {
 	}
 }
 
-// TestReconnectBackoffSchedule asserts the exponential backoff sequence
-// (1s, 2s, 4s, ...) capped at 30s by recording the durations the reconnect
-// loop sleeps for before each retry dial.
+// TestReconnectBackoffSchedule asserts the reconnect loop feeds each attempt
+// number to its backoff function and sleeps for whatever that function returns.
+// A deterministic injected backoff keeps the assertion exact; jitter is covered
+// separately by TestReconnectBackoffUsesSharedSchedule.
 func TestReconnectBackoffSchedule(t *testing.T) {
 	relay := &fakeRelay{
 		dropAfterAssign: true,
@@ -174,6 +175,10 @@ func TestReconnectBackoffSchedule(t *testing.T) {
 	sleep, schedule := recordingSleep()
 	tun := New(wsURL, "http://localhost:0", "", discardLogger(), Callbacks{})
 	tun.sleep = sleep
+	// Deterministic per-attempt backoff so the recorded schedule is exact.
+	tun.backoff = func(attempt int) time.Duration {
+		return time.Duration(attempt) * time.Second
+	}
 	tun.SetMaxReconnectAttempts(8)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -184,12 +189,12 @@ func TestReconnectBackoffSchedule(t *testing.T) {
 	want := []time.Duration{
 		1 * time.Second,
 		2 * time.Second,
+		3 * time.Second,
 		4 * time.Second,
+		5 * time.Second,
+		6 * time.Second,
+		7 * time.Second,
 		8 * time.Second,
-		16 * time.Second,
-		30 * time.Second, // 32s capped to 30s
-		30 * time.Second,
-		30 * time.Second,
 	}
 	got := schedule()
 	if len(got) != len(want) {
@@ -198,6 +203,57 @@ func TestReconnectBackoffSchedule(t *testing.T) {
 	for index := range want {
 		if got[index] != want[index] {
 			t.Errorf("backoff[%d]: got %s, want %s (full schedule %v)", index, got[index], want[index], got)
+		}
+	}
+}
+
+// TestReconnectBackoffUsesSharedSchedule asserts the default backoff (no
+// injection) follows the shared backoff package: exponential base doubling,
+// capped at 60s, with every wait staying inside the ±25% jitter band. This is
+// the regression guard for CLI-9 — the tunnel must NOT use the old 30s,
+// no-jitter cap.
+func TestReconnectBackoffUsesSharedSchedule(t *testing.T) {
+	relay := &fakeRelay{
+		dropAfterAssign: true,
+		rejectFrom:      2,
+		rejectCode:      http.StatusBadGateway,
+	}
+	wsURL := newFakeRelay(t, relay)
+
+	sleep, schedule := recordingSleep()
+	tun := New(wsURL, "http://localhost:0", "", discardLogger(), Callbacks{})
+	tun.sleep = sleep // uses the default jittered backoff from New
+	tun.SetMaxReconnectAttempts(8)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_ = tun.Run(ctx)
+
+	got := schedule()
+	// Expected base before jitter per attempt: 1,2,4,8,16,32,60(capped),60.
+	wantBase := []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		32 * time.Second,
+		60 * time.Second,
+		60 * time.Second,
+	}
+	if len(got) != len(wantBase) {
+		t.Fatalf("backoff schedule length: got %d (%v), want %d", len(got), got, len(wantBase))
+	}
+	for index, base := range wantBase {
+		low := time.Duration(float64(base) * 0.75)
+		high := time.Duration(float64(base) * 1.25)
+		if got[index] < low || got[index] > high {
+			t.Errorf("backoff[%d]=%s outside jitter band [%s,%s] for base %s",
+				index, got[index], low, high, base)
+		}
+		if got[index] > 60*time.Second {
+			t.Errorf("backoff[%d]=%s exceeds 60s cap", index, got[index])
 		}
 	}
 }
@@ -293,6 +349,11 @@ func TestReconnectSucceedsAfterDrop(t *testing.T) {
 		},
 	})
 	tun.sleep = sleep
+	// Deterministic backoff so the recorded wait is exact; this test asserts
+	// the count of waits, not the jitter (covered elsewhere).
+	tun.backoff = func(attempt int) time.Duration {
+		return time.Duration(attempt) * time.Second
+	}
 	tun.SetMaxReconnectAttempts(5)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
