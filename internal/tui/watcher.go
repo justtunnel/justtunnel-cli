@@ -15,6 +15,29 @@ const (
 	debounceDelay = 100 * time.Millisecond
 )
 
+// isRelevantEvent reports whether an fsnotify event should trigger a debounced
+// reload. We care about writes, creates (editors that write a new file then
+// rename), removes (config deleted), and renames (atomic save).
+func isRelevantEvent(event fsnotify.Event) bool {
+	return event.Has(fsnotify.Write) ||
+		event.Has(fsnotify.Create) ||
+		event.Has(fsnotify.Remove) ||
+		event.Has(fsnotify.Rename)
+}
+
+// accumulateRewatch carries the "watch was dropped" state across a debounce
+// window. A Remove/Rename drops the underlying fsnotify watch and must trigger
+// a re-watch; a trailing Write/Create within the same window must NOT clear that
+// need. It is therefore sticky: once true it stays true for the window, which is
+// reset by the caller when a new window opens. Kept pure so the order-independent
+// behavior can be tested without timing.
+func accumulateRewatch(pending bool, event fsnotify.Event) bool {
+	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
+		return true
+	}
+	return pending
+}
+
 // ConfigWatcher watches a config file for changes using fsnotify and sends
 // ConfigChangedMsg or ConfigReloadErrorMsg to the TUI via a MessageSender.
 type ConfigWatcher struct {
@@ -69,6 +92,17 @@ func (w *ConfigWatcher) Stop() {
 func (w *ConfigWatcher) watchLoop() {
 	var debounceTimer *time.Timer
 
+	// pendingRewatch accumulates across the debounce window. A remove/rename
+	// drops the underlying watch, and editor atomic saves commonly emit a
+	// Rename/Remove followed by a trailing Create/Write within the window.
+	// The debounce timer only ever fires the last event's closure, so we must
+	// remember that a rewatch is needed regardless of which event arrives last;
+	// otherwise the trailing event would reset it to false and the re-watch is
+	// skipped, silently dropping the watch on the next save. The flag lives only
+	// in this goroutine; it is cleared when a new window opens after the previous
+	// debounce already fired (see the Stop()==false check below).
+	pendingRewatch := false
+
 	for {
 		select {
 		case <-w.stopCh:
@@ -84,17 +118,23 @@ func (w *ConfigWatcher) watchLoop() {
 
 			// We care about writes, creates (some editors write to a new file then rename),
 			// and removes (config deleted).
-			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
-				// Reset the debounce timer on each event
-				if debounceTimer != nil {
-					debounceTimer.Stop()
+			if isRelevantEvent(event) {
+				// Reset the debounce timer on each event. Timer.Stop reports false
+				// when the previous timer already fired, which means the previous
+				// debounce window completed (its reload ran) — so this event opens
+				// a fresh window and the accumulated rewatch flag must be cleared.
+				if debounceTimer == nil || !debounceTimer.Stop() {
+					pendingRewatch = false
 				}
 
 				// fsnotify drops the watch when the file is removed or renamed
 				// (e.g. an editor's atomic save: write tmp, rename over original).
 				// In that case we must re-add the watch after reloading, otherwise
-				// the watcher fires once and then goes permanently silent.
-				rewatch := event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)
+				// the watcher fires once and then goes permanently silent. The flag
+				// is sticky across the whole debounce window so a trailing Write/Create
+				// after the rename does not flip it back to false.
+				pendingRewatch = accumulateRewatch(pendingRewatch, event)
+				rewatch := pendingRewatch
 				debounceTimer = time.AfterFunc(debounceDelay, func() {
 					w.handleReload(rewatch)
 				})
@@ -133,11 +173,20 @@ func (w *ConfigWatcher) handleReload(rewatch bool) {
 
 	// The reload succeeded, so the path exists again. Re-add the watch that
 	// fsnotify dropped on the remove/rename, ignoring "already watching" no-ops.
+	// rewatchErr is reported after the config change below so the valid diff is
+	// still applied — the reload genuinely succeeded; only live-reload degraded.
+	var rewatchErr error
 	if rewatch {
-		if err := w.watcher.Add(w.configPath); err != nil {
-			w.sender.Send(ConfigReloadErrorMsg{
-				Error: fmt.Sprintf("re-watch config file %q: %v", w.configPath, err),
-			})
+		// Re-check stop: Stop() closes the watcher, and calling Add on a closed
+		// watcher races with that close. The second check shrinks the window
+		// between the AfterFunc firing and a concurrent Stop().
+		select {
+		case <-w.stopCh:
+			return
+		default:
+		}
+		if addErr := w.watcher.Add(w.configPath); addErr != nil {
+			rewatchErr = addErr
 		}
 	}
 
@@ -149,6 +198,16 @@ func (w *ConfigWatcher) handleReload(rewatch bool) {
 		w.sender.Send(ConfigChangedMsg{
 			ToAdd:    diff.ToAdd,
 			ToRemove: diff.ToRemove,
+		})
+	}
+
+	// Re-watching failed after a successful reload: the change above was applied,
+	// but fsnotify is no longer watching the file, so live-reload is now dead until
+	// the watcher restarts. Report this distinctly so it does not read as a reload
+	// failure (the config loaded fine) — it is a degraded-watch warning.
+	if rewatchErr != nil {
+		w.sender.Send(ConfigReloadErrorMsg{
+			Error: fmt.Sprintf("config applied, but live-reload stopped (could not re-watch %q): %v", w.configPath, rewatchErr),
 		})
 	}
 }

@@ -3,11 +3,13 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/fsnotify/fsnotify"
 )
 
 // watcherMsgCollector collects tea.Msg values sent by the ConfigWatcher.
@@ -67,6 +69,22 @@ func writeWatcherConfig(t *testing.T, configPath string, content string) {
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to write config: %v", err)
 	}
+}
+
+// waitForWatched polls the watcher's WatchList until configPath appears or the
+// timeout elapses. Used to settle the re-watch before driving the next event so
+// tests do not race the watch re-registration.
+func waitForWatched(watcher *ConfigWatcher, configPath string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, watched := range watcher.watcher.WatchList() {
+			if watched == configPath {
+				return true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
 }
 
 func TestConfigWatcher_FileChangeProducesMessage(t *testing.T) {
@@ -333,6 +351,156 @@ func TestConfigWatcher_ReWatchesAfterRenameReplace(t *testing.T) {
 	}
 }
 
+// TestAccumulateRewatch_StickyAcrossWindow locks in the order-independent
+// sticky-flag behavior deterministically (no timing, no fsnotify backend
+// dependency). The bug it guards against: an editor atomic save emits a
+// Rename/Remove followed by a trailing Create/Write within the debounce window;
+// only the last event's value reaches handleReload, so if the flag were
+// recomputed per-event the trailing Write would reset rewatch to false and the
+// dropped watch would never be re-added — the watcher goes silent on the next save.
+func TestAccumulateRewatch_StickyAcrossWindow(t *testing.T) {
+	t.Parallel()
+
+	const configPath = "tunnels.yaml"
+	renameEvent := fsnotify.Event{Name: configPath, Op: fsnotify.Rename}
+	removeEvent := fsnotify.Event{Name: configPath, Op: fsnotify.Remove}
+	writeEvent := fsnotify.Event{Name: configPath, Op: fsnotify.Write}
+	createEvent := fsnotify.Event{Name: configPath, Op: fsnotify.Create}
+
+	tests := []struct {
+		name     string
+		sequence []fsnotify.Event
+		want     bool
+	}{
+		{
+			name:     "rename then trailing write stays sticky",
+			sequence: []fsnotify.Event{renameEvent, writeEvent},
+			want:     true,
+		},
+		{
+			name:     "remove then create then write stays sticky",
+			sequence: []fsnotify.Event{removeEvent, createEvent, writeEvent},
+			want:     true,
+		},
+		{
+			name:     "write then rename is true",
+			sequence: []fsnotify.Event{writeEvent, renameEvent},
+			want:     true,
+		},
+		{
+			name:     "only writes never request rewatch",
+			sequence: []fsnotify.Event{writeEvent, writeEvent},
+			want:     false,
+		},
+		{
+			name:     "single rename requests rewatch",
+			sequence: []fsnotify.Event{renameEvent},
+			want:     true,
+		},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			// Simulate one debounce window: the flag starts fresh and accumulates
+			// across every event in the burst, mirroring watchLoop.
+			pendingRewatch := false
+			for _, event := range testCase.sequence {
+				pendingRewatch = accumulateRewatch(pendingRewatch, event)
+			}
+			if pendingRewatch != testCase.want {
+				t.Errorf("after %v: accumulated rewatch = %v, want %v", testCase.sequence, pendingRewatch, testCase.want)
+			}
+		})
+	}
+}
+
+// TestConfigWatcher_RewatchFailureStillAppliesDiff documents the deliberate
+// double-send when re-watching fails after a successful reload: the config
+// loaded fine, so the diff is applied (ConfigChangedMsg), and a *distinct*
+// degraded-watch notice is sent so the user knows live-reload stopped. The
+// notice must NOT read as a reload failure (the reload succeeded).
+func TestConfigWatcher_RewatchFailureStillAppliesDiff(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "tunnels.yaml")
+
+	initialYAML := "tunnels:\n  - port: 3000\n    name: frontend\n"
+	writeWatcherConfig(t, configPath, initialYAML)
+
+	collector := newWatcherMsgCollector()
+	mgr := NewTunnelManager(mockTunnelFactory(nil), collector)
+	watcher, err := NewConfigWatcher(configPath, mgr, collector)
+	if err != nil {
+		t.Fatalf("NewConfigWatcher failed: %v", err)
+	}
+
+	// Add a tunnel to the config so the reload produces a non-empty diff.
+	writeWatcherConfig(t, configPath, "tunnels:\n  - port: 3000\n    name: frontend\n  - port: 8080\n    name: api\n")
+
+	// Close only the underlying fsnotify watcher (not stopCh) so the re-watch
+	// Add() fails while the reload itself still succeeds. stopCh stays open so
+	// handleReload proceeds past its stop checks.
+	if closeErr := watcher.watcher.Close(); closeErr != nil {
+		t.Fatalf("failed to close underlying watcher: %v", closeErr)
+	}
+
+	watcher.handleReload(true)
+
+	var sawChange, sawDegraded bool
+	for _, msg := range collector.Messages() {
+		switch typed := msg.(type) {
+		case ConfigChangedMsg:
+			sawChange = true
+		case ConfigReloadErrorMsg:
+			sawDegraded = true
+			if strings.Contains(typed.Error, "config reload failed") {
+				t.Errorf("re-watch failure must not masquerade as a reload failure; got %q", typed.Error)
+			}
+			if !strings.Contains(typed.Error, "live-reload stopped") {
+				t.Errorf("expected a distinct degraded-watch notice, got %q", typed.Error)
+			}
+		}
+	}
+
+	if !sawChange {
+		t.Error("expected ConfigChangedMsg: the reload succeeded so the valid diff must still be applied")
+	}
+	if !sawDegraded {
+		t.Error("expected a degraded-watch ConfigReloadErrorMsg when re-watch fails")
+	}
+}
+
+// TestIsRelevantEvent verifies which fsnotify ops trigger a reload.
+func TestIsRelevantEvent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		op   fsnotify.Op
+		want bool
+	}{
+		{name: "write", op: fsnotify.Write, want: true},
+		{name: "create", op: fsnotify.Create, want: true},
+		{name: "remove", op: fsnotify.Remove, want: true},
+		{name: "rename", op: fsnotify.Rename, want: true},
+		{name: "chmod ignored", op: fsnotify.Chmod, want: false},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			event := fsnotify.Event{Name: "tunnels.yaml", Op: testCase.op}
+			if got := isRelevantEvent(event); got != testCase.want {
+				t.Errorf("isRelevantEvent(%v) = %v, want %v", testCase.op, got, testCase.want)
+			}
+		})
+	}
+}
+
 // TestConfigWatcher_KeepsWatchingAfterRenameReplace is an end-to-end check that
 // repeated editor atomic saves (write tmp + rename) keep producing change
 // messages instead of the watcher going silent after the first rename.
@@ -368,6 +536,16 @@ func TestConfigWatcher_KeepsWatchingAfterRenameReplace(t *testing.T) {
 		t.Fatal("expected ConfigChangedMsg after first rename-replace, got none")
 	}
 
+	// Wait for the watch to be re-established before firing the second write.
+	// handleReload re-adds the watch after the rename drops it; the first
+	// ConfigChangedMsg can arrive a hair before WatchList reflects the re-add.
+	// Without settling, the second atomic write can land before the watch is
+	// back, dropping the event and flaking the test (it would then look like the
+	// re-watch fix failed when it is really a timing artifact).
+	if !waitForWatched(watcher, configPath, time.Second) {
+		t.Fatalf("watch on %q was not re-established after first rename-replace", configPath)
+	}
+
 	collector.Reset()
 
 	// Second atomic save adds port 9090. Before the fix the watcher was silent
@@ -380,8 +558,8 @@ func TestConfigWatcher_KeepsWatchingAfterRenameReplace(t *testing.T) {
 		if !ok {
 			return false
 		}
-		for _, preset := range changed.ToAdd {
-			if preset.Port == 9090 {
+		for _, tunnel := range changed.ToAdd {
+			if tunnel.Port == 9090 {
 				return true
 			}
 		}
