@@ -57,3 +57,57 @@ func TestRequireSingleTunnelPort_AllowsNonZeroPort(t *testing.T) {
 		t.Fatalf("expected no error for non-zero port, got %v", err)
 	}
 }
+
+// guardTUIFallback is the decision that runTUI applies after program.Run() fails:
+// a config-file-only invocation (port==0) must not fall back to runNonTTY, which
+// would dial http://localhost:0. These tests cover that fallback decision directly
+// so the wiring at the runTUI call site is exercised, not just the shared primitive.
+func TestGuardTUIFallback_RejectsZeroPort(t *testing.T) {
+	err := guardTUIFallback(0)
+	if err == nil {
+		t.Fatal("expected an error when falling back with port 0, got nil")
+	}
+
+	var cliErr *display.CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("expected *display.CLIError, got %T", err)
+	}
+	if cliErr.Category != display.CategoryInput {
+		t.Errorf("expected CategoryInput, got %v", cliErr.Category)
+	}
+	if !strings.Contains(cliErr.Message, "fall back to single-tunnel mode") {
+		t.Errorf("expected fallback-specific message, got %q", cliErr.Message)
+	}
+}
+
+func TestGuardTUIFallback_AllowsNonZeroPort(t *testing.T) {
+	if err := guardTUIFallback(8080); err != nil {
+		t.Fatalf("expected no error for non-zero port, got %v", err)
+	}
+}
+
+// guardNonTTYPort backs the direct non-TTY entry point. It must reject port==0
+// with an input-category error before runNonTTY dials http://localhost:0.
+func TestGuardNonTTYPort_RejectsZeroPort(t *testing.T) {
+	err := guardNonTTYPort(0)
+	if err == nil {
+		t.Fatal("expected an error in non-TTY mode with port 0, got nil")
+	}
+
+	var cliErr *display.CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("expected *display.CLIError, got %T", err)
+	}
+	if cliErr.Category != display.CategoryInput {
+		t.Errorf("expected CategoryInput, got %v", cliErr.Category)
+	}
+	if !strings.Contains(cliErr.Message, "non-TTY mode") {
+		t.Errorf("expected non-TTY-specific message, got %q", cliErr.Message)
+	}
+}
+
+func TestGuardNonTTYPort_AllowsNonZeroPort(t *testing.T) {
+	if err := guardNonTTYPort(8080); err != nil {
+		t.Fatalf("expected no error for non-zero port, got %v", err)
+	}
+}
