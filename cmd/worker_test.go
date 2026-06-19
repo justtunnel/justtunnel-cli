@@ -369,6 +369,91 @@ func TestWorkerRmDeleteOnServerHappyPath(t *testing.T) {
 	}
 }
 
+// TestWorkerRmDeleteOnServerTearsDownManagedService covers the CLI-7 gap on
+// the --delete-on-server path: after the server-side DELETE and local config
+// removal, a managed-backend worker's service unit must also be torn down —
+// otherwise `rm --delete-on-server` orphans the launchd/systemd unit just
+// like the local-only path used to.
+func TestWorkerRmDeleteOnServerTearsDownManagedService(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && request.URL.Path == "/api/teams/team-alpha/workers" {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[{"id":"wkr_x","name":"alice","team_id":"team-alpha"}]}`))
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		writer.Write([]byte(`{"status":"deleted"}`))
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "launchd",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+
+	if _, err := runCmd(t, "worker", "rm", "alice", "--delete-on-server"); err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	if got := atomic.LoadInt32(&fake.unbootstrapCalls); got != 1 {
+		t.Errorf("Unbootstrap calls: got %d, want 1 (service unit must be removed on --delete-on-server too)", got)
+	}
+	if got := fake.readGotUnbootName(); got != "alice" {
+		t.Errorf("Unbootstrap name: got %q, want alice", got)
+	}
+	if _, readErr := worker.Read("alice"); !errors.Is(readErr, os.ErrNotExist) {
+		t.Errorf("local config should be gone, got err=%v", readErr)
+	}
+}
+
+// TestWorkerRmDeleteOnServerNotFoundTearsDownManagedService covers the
+// "server doesn't know about it" sub-path of --delete-on-server: even when
+// the worker is absent server-side, the managed service unit recorded in the
+// local config must still be torn down.
+func TestWorkerRmDeleteOnServerNotFoundTearsDownManagedService(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Write([]byte(`{"workers":[]}`))
+			return
+		}
+		t.Errorf("unexpected %s to %s; worker is absent server-side so no DELETE should fire", request.Method, request.URL.Path)
+		http.NotFound(writer, request)
+	}))
+	defer stub.Close()
+
+	resetWorkerState(t, teamCfg(stub.URL))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "systemd",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+
+	out, err := runCmd(t, "worker", "rm", "alice", "--delete-on-server")
+	if err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	if got := atomic.LoadInt32(&fake.unbootstrapCalls); got != 1 {
+		t.Errorf("Unbootstrap calls: got %d, want 1 (unit must be removed even when server-side absent)", got)
+	}
+	if _, readErr := worker.Read("alice"); !errors.Is(readErr, os.ErrNotExist) {
+		t.Errorf("local config should be gone, got err=%v", readErr)
+	}
+	if !strings.Contains(out, "not found server-side") {
+		t.Errorf("expected not-found message, got: %s", out)
+	}
+}
+
 func TestWorkerRmDeleteOnServer404ProceedsLocally(t *testing.T) {
 	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method == http.MethodGet {
@@ -507,19 +592,57 @@ func TestWorkerRmLocalOnlyMissingConfigIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestWorkerRmLocalOnlyCorruptConfigWarnsAboutOrphanedUnit covers the
+// non-ENOENT read-failure branch: when the config is unreadable (malformed
+// JSON), rm still deletes the file but cannot know the backend, so any
+// installed service unit would be silently orphaned. The command must warn
+// and point the operator at `worker uninstall --force`.
+func TestWorkerRmLocalOnlyCorruptConfigWarnsAboutOrphanedUnit(t *testing.T) {
+	resetWorkerState(t, teamCfg("http://unused.invalid"))
+
+	// Write a malformed JSON file at the config path so worker.Read fails
+	// with a parse error (non-ENOENT). resetWorkerState sets JUSTTUNNEL_HOME
+	// to a temp dir; configs live under workers/<name>.json.
+	workersDir := os.Getenv("JUSTTUNNEL_HOME") + "/workers"
+	if err := os.MkdirAll(workersDir, 0o700); err != nil {
+		t.Fatalf("mkdir workers: %v", err)
+	}
+	if err := os.WriteFile(workersDir+"/alice.json", []byte("{not valid json"), 0o600); err != nil {
+		t.Fatalf("seed corrupt config: %v", err)
+	}
+
+	fake := &fakeServiceInstaller{}
+	withFakeInstaller(t, fake)
+
+	stdout, stderr, err := runCmdSplit(t, "worker", "rm", "alice")
+	if err != nil {
+		t.Fatalf("rm must succeed despite corrupt config, got err=%v", err)
+	}
+	// cfg is nil on a parse failure, so teardown short-circuits — no
+	// supervisor call should happen.
+	if got := atomic.LoadInt32(&fake.unbootstrapCalls); got != 0 {
+		t.Errorf("Unbootstrap must not run when config is unreadable, got %d calls", got)
+	}
+	if _, readErr := worker.Read("alice"); !errors.Is(readErr, os.ErrNotExist) {
+		t.Errorf("corrupt config should still be deleted, got err=%v", readErr)
+	}
+	if !strings.Contains(stdout, "Removed local config") {
+		t.Errorf("expected success message on stdout, got: %s", stdout)
+	}
+	if !strings.Contains(stderr, "worker uninstall") || !strings.Contains(stderr, "--force") {
+		t.Errorf("expected stderr warning pointing at `worker uninstall --force`, got: %s", stderr)
+	}
+}
+
 // TestWorkerRmLocalOnlyManagedBackendTearsDownService covers CLI-7: when
 // the local config records a managed supervisor (launchd/systemd), a
 // local-only `rm` must tear down the service unit too — otherwise a ghost
 // launchd/systemd job keeps firing on boot reading a now-deleted config.
 func TestWorkerRmLocalOnlyManagedBackendTearsDownService(t *testing.T) {
-	var httpCalls int32
-	stub := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&httpCalls, 1)
-		writer.WriteHeader(http.StatusOK)
-	}))
-	defer stub.Close()
-
-	resetWorkerState(t, teamCfg(stub.URL))
+	// Point at an unreachable host: a local-only rm must never make an HTTP
+	// call, so any accidental request fails loudly instead of silently
+	// returning a stub 200.
+	resetWorkerState(t, teamCfg("http://unused.invalid"))
 
 	if err := worker.Write(&worker.Config{
 		WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "launchd",
@@ -540,14 +663,46 @@ func TestWorkerRmLocalOnlyManagedBackendTearsDownService(t *testing.T) {
 	if got := fake.readGotUnbootName(); got != "alice" {
 		t.Errorf("Unbootstrap name: got %q, want alice", got)
 	}
-	if atomic.LoadInt32(&httpCalls) != 0 {
-		t.Errorf("local-only rm must not call the server, got %d calls", httpCalls)
-	}
 	if _, readErr := worker.Read("alice"); !errors.Is(readErr, os.ErrNotExist) {
 		t.Errorf("local config should be gone, got err=%v", readErr)
 	}
 	if !strings.Contains(out, "Removed local config") {
 		t.Errorf("expected success message, got: %s", out)
+	}
+}
+
+// TestWorkerRmLocalOnlyManagedBackendUnsupportedOSWarns covers the
+// no-supervisor branch in teardownLocalService: when the config records a
+// managed backend (launchd/systemd) but the host has no supervisor adapter
+// (e.g. a config copied from darwin and rm'd on Windows), rm must still
+// succeed, attempt no Unbootstrap, and warn the operator to run uninstall on
+// the original machine.
+func TestWorkerRmLocalOnlyManagedBackendUnsupportedOSWarns(t *testing.T) {
+	resetWorkerState(t, teamCfg("http://unused.invalid"))
+
+	if err := worker.Write(&worker.Config{
+		WorkerID: "wkr_x", Name: "alice", Context: "team:team-alpha", ServiceBackend: "launchd",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	withUnsupportedOS(t)
+
+	stdout, stderr, err := runCmdSplit(t, "worker", "rm", "alice")
+	if err != nil {
+		t.Fatalf("rm must succeed on unsupported OS, got err=%v", err)
+	}
+	if _, readErr := worker.Read("alice"); !errors.Is(readErr, os.ErrNotExist) {
+		t.Errorf("local config should be gone, got err=%v", readErr)
+	}
+	if !strings.Contains(stdout, "Removed local config") {
+		t.Errorf("expected success message on stdout, got: %s", stdout)
+	}
+	if !strings.Contains(stderr, "original machine") {
+		t.Errorf("expected stderr warning pointing at the original machine, got: %s", stderr)
+	}
+	if !strings.Contains(stderr, "worker uninstall") {
+		t.Errorf("expected stderr warning to mention `worker uninstall`, got: %s", stderr)
 	}
 }
 

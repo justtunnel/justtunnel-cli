@@ -19,7 +19,7 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Lint
+      - name: Vet
         run: go vet ./...
 
       - name: Test
