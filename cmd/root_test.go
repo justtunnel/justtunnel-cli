@@ -111,3 +111,34 @@ func TestGuardNonTTYPort_AllowsNonZeroPort(t *testing.T) {
 		t.Fatalf("expected no error for non-zero port, got %v", err)
 	}
 }
+
+// guardMissingTarget backs the no-arg entry point. With neither a port nor a
+// --config-file it must return a non-nil typed error so Execute exits non-zero,
+// instead of cmd.Help() which always returns nil and exits 0 — breaking
+// `justtunnel || fallback` and `if justtunnel; then` shell/CI idioms.
+func TestGuardMissingTarget_RejectsNoPortNoConfig(t *testing.T) {
+	err := guardMissingTarget(0, "")
+	if err == nil {
+		t.Fatal("expected an error with no port and no config file, got nil")
+	}
+
+	var cliErr *display.CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("expected *display.CLIError, got %T", err)
+	}
+	if cliErr.Category != display.CategoryInput {
+		t.Errorf("expected CategoryInput, got %v", cliErr.Category)
+	}
+}
+
+func TestGuardMissingTarget_AllowsPort(t *testing.T) {
+	if err := guardMissingTarget(8080, ""); err != nil {
+		t.Fatalf("expected no error when a port is supplied, got %v", err)
+	}
+}
+
+func TestGuardMissingTarget_AllowsConfigFile(t *testing.T) {
+	if err := guardMissingTarget(0, "tunnels.yaml"); err != nil {
+		t.Fatalf("expected no error when a config file is supplied, got %v", err)
+	}
+}
