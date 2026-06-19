@@ -500,7 +500,9 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 
 	fmt.Fprintf(os.Stderr, "\n  Welcome to justtunnel! Sign in with GitHub to get started.\n\n")
 
-	deviceResp, err := createDeviceSession(http.DefaultClient, baseURL)
+	httpClient := &http.Client{Timeout: httpTimeout}
+
+	deviceResp, err := createDeviceSession(httpClient, baseURL)
 	if err != nil {
 		return categorizeAuthError(err)
 	}
@@ -538,7 +540,7 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 			}
 			return display.InputError("authentication cancelled")
 		case <-ticker.C:
-			status, pollErr := pollDeviceStatus(http.DefaultClient, baseURL, deviceResp.DeviceCode)
+			status, pollErr := pollDeviceStatus(httpClient, baseURL, deviceResp.DeviceCode)
 			if pollErr != nil {
 				continue
 			}
@@ -557,7 +559,7 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 					return fmt.Errorf("save config: %w", saveErr)
 				}
 
-				result, verifyErr := verifyKey(http.DefaultClient, baseURL, status.APIKey)
+				result, verifyErr := verifyKey(httpClient, baseURL, status.APIKey)
 				if verifyErr != nil {
 					fmt.Fprintf(os.Stderr, "\n  Authenticated successfully. Starting tunnel...\n\n")
 					return nil

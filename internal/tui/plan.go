@@ -5,9 +5,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // PlanInfo is defined in model.go — reused here for FetchPlanInfo.
+
+// httpTimeout bounds the /api/me plan-info request so an unresponsive server
+// cannot block TUI startup indefinitely. Matches the 10s timeout used by the
+// CLI subcommands.
+const httpTimeout = 10 * time.Second
 
 // planLimits maps plan names to their maximum number of concurrent tunnels.
 // This mirrors the server-side plan/limits.go configuration.
@@ -40,7 +46,8 @@ func FetchPlanInfo(serverURL string, token string) (PlanInfo, error) {
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 
-	response, err := http.DefaultClient.Do(request)
+	client := &http.Client{Timeout: httpTimeout}
+	response, err := client.Do(request)
 	if err != nil {
 		return PlanInfo{}, fmt.Errorf("fetch plan info: %w", err)
 	}
