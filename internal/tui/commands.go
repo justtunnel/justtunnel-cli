@@ -88,8 +88,11 @@ func parseAddCommand(args []string) (Command, error) {
 
 	portStr := args[0]
 	port, parseErr := strconv.Atoi(portStr)
-	if parseErr != nil || config.ValidatePort(port) != nil {
-		return nil, fmt.Errorf("Invalid port: %s (must be %d-%d).", portStr, config.MinPort, config.MaxPort)
+	if parseErr != nil {
+		return nil, fmt.Errorf("invalid port: %s (must be %d-%d)", portStr, config.MinPort, config.MaxPort)
+	}
+	if err := config.ValidatePort(port); err != nil {
+		return nil, err
 	}
 
 	cmd := AddCommand{Port: port}
