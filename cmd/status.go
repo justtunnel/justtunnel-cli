@@ -9,6 +9,7 @@ import (
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 type tunnelInfo struct {
@@ -58,7 +59,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
 
-	client := &http.Client{Timeout: httpTimeout}
+	client := &http.Client{Timeout: httpclient.Timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return display.NetworkError("could not reach justtunnel server")

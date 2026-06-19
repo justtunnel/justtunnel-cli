@@ -5,15 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"time"
+
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 // PlanInfo is defined in model.go — reused here for FetchPlanInfo.
-
-// httpTimeout bounds the /api/me plan-info request so an unresponsive server
-// cannot block TUI startup indefinitely. Matches the 10s timeout used by the
-// CLI subcommands.
-const httpTimeout = 10 * time.Second
 
 // planLimits maps plan names to their maximum number of concurrent tunnels.
 // This mirrors the server-side plan/limits.go configuration.
@@ -40,13 +36,13 @@ func FetchPlanInfo(serverURL string, token string) (PlanInfo, error) {
 		return PlanInfo{}, fmt.Errorf("parse server URL: %w", err)
 	}
 
-	request, err := http.NewRequest("GET", baseURL+"/api/me", nil)
+	request, err := http.NewRequest(http.MethodGet, baseURL+"/api/me", nil)
 	if err != nil {
 		return PlanInfo{}, fmt.Errorf("create request: %w", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 
-	client := &http.Client{Timeout: httpTimeout}
+	client := &http.Client{Timeout: httpclient.Timeout}
 	response, err := client.Do(request)
 	if err != nil {
 		return PlanInfo{}, fmt.Errorf("fetch plan info: %w", err)

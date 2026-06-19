@@ -17,6 +17,7 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/browser"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 type authVerifyResponse struct {
@@ -73,7 +74,7 @@ func runKeyAuth(_ *cobra.Command, key string) error {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
 
-	result, err := verifyKey(&http.Client{Timeout: httpTimeout}, baseURL, key)
+	result, err := verifyKey(&http.Client{Timeout: httpclient.Timeout}, baseURL, key)
 	if err != nil {
 		return categorizeAuthError(err)
 	}
@@ -104,7 +105,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 
 	// Check if already authenticated
 	if cfg.AuthToken != "" {
-		result, verifyErr := verifyKey(&http.Client{Timeout: httpTimeout}, baseURL, cfg.AuthToken)
+		result, verifyErr := verifyKey(&http.Client{Timeout: httpclient.Timeout}, baseURL, cfg.AuthToken)
 		if verifyErr == nil {
 			displayName := result.GitHubUsername
 			if displayName == "" {
@@ -121,7 +122,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 	}
 
 	// Create device session
-	deviceResp, err := createDeviceSession(&http.Client{Timeout: httpTimeout}, baseURL)
+	deviceResp, err := createDeviceSession(&http.Client{Timeout: httpclient.Timeout}, baseURL)
 	if err != nil {
 		return categorizeAuthError(err)
 	}
@@ -154,7 +155,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
-	httpClient := &http.Client{Timeout: httpTimeout}
+	httpClient := &http.Client{Timeout: httpclient.Timeout}
 
 	for {
 		select {

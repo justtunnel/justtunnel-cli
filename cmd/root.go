@@ -21,6 +21,7 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/browser"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 	"github.com/justtunnel/justtunnel-cli/internal/tui"
 	"github.com/justtunnel/justtunnel-cli/internal/tunnel"
 	"github.com/justtunnel/justtunnel-cli/internal/version"
@@ -500,7 +501,7 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 
 	fmt.Fprintf(os.Stderr, "\n  Welcome to justtunnel! Sign in with GitHub to get started.\n\n")
 
-	httpClient := &http.Client{Timeout: httpTimeout}
+	httpClient := &http.Client{Timeout: httpclient.Timeout}
 
 	deviceResp, err := createDeviceSession(httpClient, baseURL)
 	if err != nil {

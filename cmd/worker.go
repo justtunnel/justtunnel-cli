@@ -9,12 +9,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 // workerAPI mirrors the JSON shape returned by the server for a single
@@ -37,11 +37,6 @@ type workerAPI struct {
 type workerListResponse struct {
 	Workers []workerAPI `json:"workers"`
 }
-
-// httpTimeout matches the 10s timeout used by other subcommands so behavior
-// is consistent against an unresponsive server. Declared as a var (not const)
-// so tests can shrink it to keep timeout cases fast.
-var httpTimeout = 10 * time.Second
 
 var workerCmd = &cobra.Command{
 	Use:   "worker",
@@ -155,7 +150,7 @@ func mapForbiddenError(body []byte) error {
 //
 // D1: ctx threads through to client.Do via req.WithContext so a SIGINT
 // during a long-running HTTP call (slow server, hung TLS handshake)
-// cancels the in-flight request rather than blocking until httpTimeout.
+// cancels the in-flight request rather than blocking until httpclient.Timeout.
 // Pass cmd.Context() from cobra handlers; pass context.Background() from
 // non-cobra callers (rare).
 func httpDo(ctx context.Context, method, url, authToken string, body io.Reader) (int, []byte, error) {
@@ -172,7 +167,7 @@ func httpDo(ctx context.Context, method, url, authToken string, body io.Reader) 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	client := &http.Client{Timeout: httpTimeout}
+	client := &http.Client{Timeout: httpclient.Timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, fmt.Errorf("request: %w", err)

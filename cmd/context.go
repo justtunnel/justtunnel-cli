@@ -18,6 +18,7 @@ import (
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 // membership represents a single team membership returned by the server.
@@ -440,7 +441,7 @@ func looksLikeULID(identifier string) bool {
 // can treat that as a definitive "not a member" signal (vs a transient 5xx).
 func fetchMembershipsHTTP(client *http.Client, baseURL, authToken string) ([]membership, bool, bool, error) {
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: httpclient.Timeout}
 	}
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/api/memberships", nil)
 	if err != nil {
@@ -487,7 +488,7 @@ func fetchMembershipsHTTP(client *http.Client, baseURL, authToken string) ([]mem
 // (caller validates first via config.ValidateContext).
 func pushActiveContextHTTP(client *http.Client, baseURL, authToken, contextName string) error {
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: httpclient.Timeout}
 	}
 
 	var body struct {
