@@ -23,13 +23,12 @@ import (
 // to handleConn, which the test supplies to decide what the server does for
 // that particular connection (e.g. accept then drop, or reject with 401).
 type fakeRelay struct {
-	server *httptest.Server
-
 	mu              sync.Mutex
 	dialCount       int
 	rejectFrom      int  // dials at or after this index get rejectStatus (0 = never)
 	rejectCode      int  // HTTP status used when rejecting before the WS upgrade
-	dropAfterAssign bool // when accepting, drop the connection right after tunnel_assigned
+	dropAfterAssign bool // when accepting, drop every connection right after tunnel_assigned
+	dropUntil       int  // accepted dials at or before this index are dropped after assign; later dials are held open (0 = never)
 }
 
 func newFakeRelay(t *testing.T, relay *fakeRelay) string {
@@ -41,6 +40,7 @@ func newFakeRelay(t *testing.T, relay *fakeRelay) string {
 		rejectFrom := relay.rejectFrom
 		rejectCode := relay.rejectCode
 		dropAfterAssign := relay.dropAfterAssign
+		dropUntil := relay.dropUntil
 		relay.mu.Unlock()
 
 		if rejectFrom > 0 && current >= rejectFrom {
@@ -66,7 +66,7 @@ func newFakeRelay(t *testing.T, relay *fakeRelay) string {
 			return
 		}
 
-		if dropAfterAssign {
+		if dropAfterAssign || (dropUntil > 0 && current <= dropUntil) {
 			// Simulate the relay dropping the connection. The CLI's read
 			// loop will see an abnormal closure and enter reconnect.
 			conn.Close(websocket.StatusAbnormalClosure, "server dropping")
@@ -78,7 +78,6 @@ func newFakeRelay(t *testing.T, relay *fakeRelay) string {
 		conn.Close(websocket.StatusNormalClosure, "")
 	}))
 	t.Cleanup(httpServer.Close)
-	relay.server = httpServer
 	return "ws" + strings.TrimPrefix(httpServer.URL, "http")
 }
 
@@ -149,6 +148,15 @@ func TestReconnectGivesUpAfterMaxAttempts(t *testing.T) {
 	}
 	if !strings.Contains(cliErr.Error(), "gave up reconnecting") {
 		t.Errorf("message: got %q, want it to mention giving up", cliErr.Error())
+	}
+	// The give-up message embeds attempt-1; with max=3 it must report 3 attempts.
+	if !strings.Contains(cliErr.Error(), "after 3 attempts") {
+		t.Errorf("message: got %q, want it to report 3 attempts", cliErr.Error())
+	}
+	// 1 initial dial + exactly 3 reconnect dials, then it gives up. Locks the
+	// off-by-one boundary at the attempt > maxReconnectAttempts check.
+	if dials := relay.dials(); dials != 4 {
+		t.Errorf("dial count: got %d, want 4 (initial + 3 reconnect attempts)", dials)
 	}
 }
 
@@ -268,41 +276,12 @@ func TestReconnectStopsOnForbiddenMidReconnect(t *testing.T) {
 // where the relay accepts the reconnect, and asserts OnReconnected fires and
 // the loop resumes without surfacing an error (until ctx is cancelled).
 func TestReconnectSucceedsAfterDrop(t *testing.T) {
-	var dialCount int
-	var mu sync.Mutex
 	reconnected := make(chan ReconnectInfo, 1)
 
-	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		mu.Lock()
-		dialCount++
-		current := dialCount
-		mu.Unlock()
-
-		conn, err := websocket.Accept(writer, request, nil)
-		if err != nil {
-			return
-		}
-		assigned := TunnelAssigned{
-			Type:           "tunnel_assigned",
-			TunnelID:       "test-tunnel-id",
-			Subdomain:      "test-sub",
-			URL:            "https://test-sub.justtunnel.dev",
-			ReconnectToken: "reconnect-token",
-		}
-		data, _ := json.Marshal(assigned)
-		conn.Write(request.Context(), websocket.MessageText, data)
-
-		if current == 1 {
-			// Drop the first connection to trigger a reconnect.
-			conn.Close(websocket.StatusAbnormalClosure, "drop")
-			return
-		}
-		// Second (reconnect) connection: hold it open.
-		<-request.Context().Done()
-		conn.Close(websocket.StatusNormalClosure, "")
-	}))
-	t.Cleanup(httpServer.Close)
-	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http")
+	// First dial is accepted then dropped to trigger a reconnect; the second
+	// (reconnect) dial is held open so the reconnect succeeds.
+	relay := &fakeRelay{dropUntil: 1}
+	wsURL := newFakeRelay(t, relay)
 
 	sleep, schedule := recordingSleep()
 	tun := New(wsURL, "http://localhost:0", "", discardLogger(), Callbacks{
@@ -338,6 +317,13 @@ func TestReconnectSucceedsAfterDrop(t *testing.T) {
 		t.Errorf("backoff before successful reconnect: got %v, want [1s]", got)
 	}
 
+	// Exactly 2 dials: the initial (dropped) connection plus one reconnect.
+	// Guards against an implementation that retries more than once before
+	// succeeding (e.g. an attempt-counter reset bug).
+	if dials := relay.dials(); dials != 2 {
+		t.Errorf("dial count: got %d, want 2 (initial drop + one successful reconnect)", dials)
+	}
+
 	cancel()
 	select {
 	case err := <-errCh:
@@ -346,5 +332,62 @@ func TestReconnectSucceedsAfterDrop(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+// TestReconnectStopsOnContextCancelDuringBackoff covers graceful shutdown while
+// a reconnect is mid-backoff: when ctx is cancelled during the wait, Run returns
+// context.Canceled and no further reconnect dial is attempted. This exercises the
+// ctx.Err() propagation path out of waitWithCountdown/sleep that the other tests
+// (give-up, terminal 401/403, success) never reach.
+func TestReconnectStopsOnContextCancelDuringBackoff(t *testing.T) {
+	// Accept the first dial, drop it to trigger reconnect, then drop every
+	// subsequent dial so the loop would keep retrying if not cancelled.
+	relay := &fakeRelay{dropAfterAssign: true}
+	wsURL := newFakeRelay(t, relay)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Block the first backoff wait until ctx is cancelled, then surface
+	// ctx.Err() like realSleep would. Cancelling unblocks the wait.
+	waiting := make(chan struct{})
+	var once sync.Once
+	blockingSleep := func(sleepCtx context.Context, _ time.Duration) error {
+		once.Do(func() { close(waiting) })
+		<-sleepCtx.Done()
+		return sleepCtx.Err()
+	}
+
+	tun := New(wsURL, "http://localhost:0", "", discardLogger(), Callbacks{})
+	tun.sleep = blockingSleep
+	tun.SetMaxReconnectAttempts(10)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- tun.Run(ctx)
+	}()
+
+	select {
+	case <-waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for reconnect to enter backoff")
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run error after cancel during backoff: got %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after context cancel during backoff")
+	}
+
+	// 1 initial dial only. The reconnect never re-dialed because cancellation
+	// landed during the backoff wait, before the dial.
+	if dials := relay.dials(); dials != 1 {
+		t.Errorf("dial count: got %d, want 1 (initial only; no reconnect dial after cancel)", dials)
 	}
 }
