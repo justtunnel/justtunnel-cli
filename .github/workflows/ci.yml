@@ -6,6 +6,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -57,7 +61,7 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Vet
+      - name: Lint
         run: go vet ./...
 
       - name: Test
