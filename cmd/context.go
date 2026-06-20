@@ -18,6 +18,7 @@ import (
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 // membership represents a single team membership returned by the server.
@@ -173,7 +174,7 @@ func runContextList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
@@ -267,7 +268,7 @@ func runContextUse(cmd *cobra.Command, args []string) error {
 	// the server is unreachable. The downstream best-effort push then
 	// skips its own attempt to avoid emitting a second redundant warning.
 	offlineDetected := false
-	baseURL, parseErr := apiBaseURL(cfg.ServerURL)
+	baseURL, parseErr := config.APIBaseURL(cfg.ServerURL)
 	if cfg.AuthToken != "" && strings.HasPrefix(name, config.TeamContextPrefix) && parseErr == nil {
 		memberships, supported, definitelyNotMember, fetchErr := fetchMembershipsCached(nil, baseURL, cfg.AuthToken)
 		switch {
@@ -351,7 +352,7 @@ func runContextShow(cmd *cobra.Command, args []string) error {
 	//
 	// Compute the REST base URL once and pass it down so stalenessAnnotation
 	// doesn't repeat the work the caller already did.
-	baseURL, baseURLErr := apiBaseURL(cfg.ServerURL)
+	baseURL, baseURLErr := config.APIBaseURL(cfg.ServerURL)
 	if baseURLErr != nil {
 		fmt.Fprintln(cmd.OutOrStdout(), active)
 		return nil
@@ -372,7 +373,7 @@ func runContextShow(cmd *cobra.Command, args []string) error {
 // the slug-keyed memberships endpoint).
 //
 // Callers compute the REST baseURL once and pass it in to avoid two
-// successive apiBaseURL calls.
+// successive config.APIBaseURL calls.
 func stalenessAnnotation(cfg *config.Config, baseURL, active string) (string, bool) {
 	if cfg == nil || cfg.AuthToken == "" {
 		return "", false
@@ -440,7 +441,7 @@ func looksLikeULID(identifier string) bool {
 // can treat that as a definitive "not a member" signal (vs a transient 5xx).
 func fetchMembershipsHTTP(client *http.Client, baseURL, authToken string) ([]membership, bool, bool, error) {
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: httpclient.Timeout}
 	}
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/api/memberships", nil)
 	if err != nil {
@@ -487,7 +488,7 @@ func fetchMembershipsHTTP(client *http.Client, baseURL, authToken string) ([]mem
 // (caller validates first via config.ValidateContext).
 func pushActiveContextHTTP(client *http.Client, baseURL, authToken, contextName string) error {
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: httpclient.Timeout}
 	}
 
 	var body struct {

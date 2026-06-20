@@ -741,9 +741,9 @@ func TestStalenessAnnotationCachesMembershipFetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
-		t.Fatalf("apiBaseURL: %v", err)
+		t.Fatalf("config.APIBaseURL: %v", err)
 	}
 	if _, stale := stalenessAnnotation(cfg, baseURL, "team:acme"); stale {
 		t.Fatalf("first call: should not be stale for valid membership")
@@ -781,9 +781,9 @@ func TestStalenessAnnotation403MarksStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
-		t.Fatalf("apiBaseURL: %v", err)
+		t.Fatalf("config.APIBaseURL: %v", err)
 	}
 	annotation, stale := stalenessAnnotation(cfg, baseURL, "team:acme")
 	if !stale {
@@ -818,9 +818,9 @@ func TestStalenessAnnotationFailsOpenOn5xx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
-		t.Fatalf("apiBaseURL: %v", err)
+		t.Fatalf("config.APIBaseURL: %v", err)
 	}
 	if _, stale := stalenessAnnotation(cfg, baseURL, "team:acme"); stale {
 		t.Errorf("5xx must fail open, not annotate as stale")
