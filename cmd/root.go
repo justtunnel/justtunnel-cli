@@ -125,9 +125,12 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Need at least a port arg or a config file
-	if port == 0 && tunnelConfigFile == "" {
-		return cmd.Help()
+	// Need at least a port arg or a config file. Return a typed error so
+	// Execute propagates a non-nil error and os.Exit(1) fires — cmd.Help()
+	// always returns nil, which made `justtunnel || fallback` and
+	// `if justtunnel; then` shell/CI idioms see a success exit code.
+	if guardErr := guardMissingTarget(port, tunnelConfigFile); guardErr != nil {
+		return guardErr
 	}
 
 	cfg, err := config.Load(cfgFile)
@@ -382,6 +385,17 @@ func guardNonTTYPort(port int) error {
 // (port==0) has nothing to dial in single-tunnel mode and must use the TUI.
 func guardTUIFallback(port int) error {
 	return requireSingleTunnelPort(port, "port argument is required to fall back to single-tunnel mode; multi-tunnel config files need the interactive TUI")
+}
+
+// guardMissingTarget rejects an invocation with neither a port arg nor a
+// --config-file. Returning a typed InputError (instead of cmd.Help(), which
+// returns nil) makes Execute propagate a non-nil error so os.Exit(1) fires,
+// keeping `justtunnel || fallback` and `if justtunnel; then` idioms correct.
+func guardMissingTarget(port int, configFile string) error {
+	if port == 0 && configFile == "" {
+		return display.InputError("provide a port (e.g. `justtunnel 3000`) or a --config-file; run `justtunnel --help` for usage")
+	}
+	return nil
 }
 
 // runNonTTY is the original single-tunnel flow for non-terminal output (pipes, etc.).
