@@ -159,8 +159,8 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	}
 
 	// Non-TTY requires a port arg (single-tunnel mode)
-	if port == 0 {
-		return display.InputError("port argument is required in non-TTY mode")
+	if guardErr := guardNonTTYPort(port); guardErr != nil {
+		return guardErr
 	}
 	return runNonTTY(port, cfg, serverURL, logger, cmd)
 }
@@ -263,6 +263,12 @@ func runTUI(port int, cfg *config.Config, serverURL string, logger *slog.Logger,
 		manager.Shutdown()
 		logger.Warn("TUI could not start, falling back to non-interactive mode", "error", runErr)
 		fmt.Fprintf(os.Stderr, "Warning: TUI failed to start (%v), falling back to single-tunnel mode\n", runErr)
+		// runNonTTY is single-tunnel and needs an explicit port. When only a config
+		// file was supplied (port==0), there is nothing to dial in fallback mode —
+		// otherwise it would build http://localhost:0 and every request would fail.
+		if guardErr := guardTUIFallback(port); guardErr != nil {
+			return guardErr
+		}
 		return runNonTTY(port, cfg, serverURL, logger, cmd)
 	}
 
@@ -347,6 +353,35 @@ func newTunnelFactory(serverURL, authToken string, logger *slog.Logger, cmd *cob
 
 		return tun
 	}
+}
+
+// runNonTTY dials http://localhost:<port>, so a zero port (only --config-file
+// was supplied) would build http://localhost:0 and fail every request. Both the
+// direct non-TTY path and the TUI fallback path must reject port==0 before
+// calling runNonTTY. guardNonTTYPort and guardTUIFallback own the precondition
+// for their respective call sites so the messages can't be mismatched by
+// callers; both delegate to requireSingleTunnelPort.
+
+// requireSingleTunnelPort returns an InputError when port==0, which would make
+// runNonTTY dial http://localhost:0. Returns nil when the port is usable.
+func requireSingleTunnelPort(port int, message string) error {
+	if port == 0 {
+		return display.InputError(message)
+	}
+	return nil
+}
+
+// guardNonTTYPort enforces the single-tunnel port precondition for the direct
+// non-TTY entry point (stdout is not a terminal).
+func guardNonTTYPort(port int) error {
+	return requireSingleTunnelPort(port, "port argument is required in non-TTY mode")
+}
+
+// guardTUIFallback enforces the single-tunnel port precondition when the TUI
+// fails to start and runTUI falls back to runNonTTY. A config-file-only invocation
+// (port==0) has nothing to dial in single-tunnel mode and must use the TUI.
+func guardTUIFallback(port int) error {
+	return requireSingleTunnelPort(port, "port argument is required to fall back to single-tunnel mode; multi-tunnel config files need the interactive TUI")
 }
 
 // runNonTTY is the original single-tunnel flow for non-terminal output (pipes, etc.).
