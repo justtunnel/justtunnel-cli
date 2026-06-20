@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/justtunnel/justtunnel-cli/internal/backoff"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
 )
@@ -68,9 +70,18 @@ type Tunnel struct {
 	// observe the backoff schedule and advance time without real waits.
 	// Defaults to realSleep.
 	sleep func(ctx context.Context, duration time.Duration) error
+
+	// backoff computes the wait before the Nth reconnect attempt. Defaults to
+	// the shared backoff package (60s cap, ±25% jitter) over a per-tunnel rng
+	// so reconnects from many clients do not synchronize after a server
+	// restart. Tests inject a deterministic schedule to assert the sequence.
+	backoff func(attempt int) time.Duration
 }
 
 func New(serverURL, localTarget, authToken string, logger *slog.Logger, callbacks Callbacks) *Tunnel {
+	// Per-tunnel rng so jitter is independent across clients in the same
+	// process and across restarts; math/rand is fine for a reconnect spreader.
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return &Tunnel{
 		serverURL:            serverURL,
 		localTarget:          localTarget,
@@ -79,6 +90,9 @@ func New(serverURL, localTarget, authToken string, logger *slog.Logger, callback
 		callbacks:            callbacks,
 		maxReconnectAttempts: 50,
 		sleep:                realSleep,
+		backoff: func(attempt int) time.Duration {
+			return backoff.ComputeWithRand(attempt, rng)
+		},
 	}
 }
 
@@ -395,7 +409,9 @@ func (t *Tunnel) buildReconnectURL() string {
 }
 
 // reconnect attempts to re-establish the WebSocket connection with
-// exponential backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s.
+// exponential backoff: 1s, 2s, 4s, ... capped at 60s with ±25% jitter (see
+// the shared backoff package). The cap and jitter match the worker runner so
+// reconnects do not synchronize into a thundering herd after a server restart.
 func (t *Tunnel) reconnect(ctx context.Context) error {
 	// Wait for in-flight requests from the old connection to finish
 	// so they don't write stale responses to the new connection. Bound the
@@ -425,9 +441,6 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 	t.setReconnecting(true)
 	previousSubdomain := t.subdomain
 
-	backoff := time.Second
-	const maxBackoff = 30 * time.Second
-
 	for attempt := 1; ; attempt++ {
 		// Check max reconnect attempts (0 = unlimited).
 		if t.maxReconnectAttempts > 0 && attempt > t.maxReconnectAttempts {
@@ -438,6 +451,8 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 				attempt-1, elapsed,
 			))
 		}
+
+		backoff := t.backoff(attempt)
 
 		if t.callbacks.OnReconnecting != nil {
 			t.callbacks.OnReconnecting(attempt, backoff)
@@ -459,10 +474,6 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 				return terminalErr
 			}
 
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
 			continue
 		}
 
