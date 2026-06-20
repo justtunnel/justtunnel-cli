@@ -17,6 +17,7 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/browser"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 type authVerifyResponse struct {
@@ -73,7 +74,7 @@ func runKeyAuth(_ *cobra.Command, key string) error {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
 
-	result, err := verifyKey(http.DefaultClient, baseURL, key)
+	result, err := verifyKey(&http.Client{Timeout: httpclient.Timeout}, baseURL, key)
 	if err != nil {
 		return categorizeAuthError(err)
 	}
@@ -104,7 +105,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 
 	// Check if already authenticated
 	if cfg.AuthToken != "" {
-		result, verifyErr := verifyKey(http.DefaultClient, baseURL, cfg.AuthToken)
+		result, verifyErr := verifyKey(&http.Client{Timeout: httpclient.Timeout}, baseURL, cfg.AuthToken)
 		if verifyErr == nil {
 			displayName := result.GitHubUsername
 			if displayName == "" {
@@ -121,7 +122,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 	}
 
 	// Create device session
-	deviceResp, err := createDeviceSession(http.DefaultClient, baseURL)
+	deviceResp, err := createDeviceSession(&http.Client{Timeout: httpclient.Timeout}, baseURL)
 	if err != nil {
 		return categorizeAuthError(err)
 	}
@@ -154,6 +155,8 @@ func runDeviceAuth(cmd *cobra.Command) error {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	httpClient := &http.Client{Timeout: httpclient.Timeout}
+
 	for {
 		select {
 		case <-sigCtx.Done():
@@ -163,7 +166,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 			}
 			return display.InputError("authentication cancelled")
 		case <-ticker.C:
-			status, pollErr := pollDeviceStatus(http.DefaultClient, baseURL, deviceResp.DeviceCode)
+			status, pollErr := pollDeviceStatus(httpClient, baseURL, deviceResp.DeviceCode)
 			if pollErr != nil {
 				continue // retry on network errors
 			}
@@ -184,7 +187,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 				}
 
 				// Verify and display user info
-				result, verifyErr := verifyKey(http.DefaultClient, baseURL, status.APIKey)
+				result, verifyErr := verifyKey(httpClient, baseURL, status.APIKey)
 				if verifyErr != nil {
 					// Key saved but verify failed — still OK
 					fmt.Println("Authenticated successfully.")

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/justtunnel/justtunnel-cli/internal/config"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 	"github.com/justtunnel/justtunnel-cli/internal/worker"
 )
 
@@ -354,9 +355,9 @@ func TestWorkerStatusServerTimeout(t *testing.T) {
 	}))
 	defer stub.Close()
 
-	prev := httpTimeout
-	httpTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { httpTimeout = prev })
+	prev := httpclient.Timeout
+	httpclient.Timeout = 100 * time.Millisecond
+	t.Cleanup(func() { httpclient.Timeout = prev })
 
 	resetWorkerState(t, teamCfg(stub.URL))
 	useFakeSupervisor(t, newFakeSupervisor())

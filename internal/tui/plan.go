@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 // PlanInfo is defined in model.go — reused here for FetchPlanInfo.
@@ -34,13 +36,14 @@ func FetchPlanInfo(serverURL string, token string) (PlanInfo, error) {
 		return PlanInfo{}, fmt.Errorf("parse server URL: %w", err)
 	}
 
-	request, err := http.NewRequest("GET", baseURL+"/api/me", nil)
+	request, err := http.NewRequest(http.MethodGet, baseURL+"/api/me", nil)
 	if err != nil {
 		return PlanInfo{}, fmt.Errorf("create request: %w", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 
-	response, err := http.DefaultClient.Do(request)
+	client := &http.Client{Timeout: httpclient.Timeout}
+	response, err := client.Do(request)
 	if err != nil {
 		return PlanInfo{}, fmt.Errorf("fetch plan info: %w", err)
 	}

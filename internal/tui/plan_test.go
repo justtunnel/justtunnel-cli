@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 func TestFetchPlanInfo(t *testing.T) {
@@ -119,6 +122,37 @@ func TestFetchPlanInfo_NetworkError(t *testing.T) {
 	_, err := FetchPlanInfo("http://127.0.0.1:1", "test-token")
 	if err == nil {
 		t.Fatal("expected error for network failure, got nil")
+	}
+}
+
+// TestFetchPlanInfo_ServerStall is the CLI-2 regression for TUI startup: a
+// server that accepts the connection then never responds must not block the
+// TUI indefinitely. httpclient.Timeout bounds the call; we shrink it so the
+// test is fast. The handler blocks on the request context so it unblocks
+// cleanly when the client cancels.
+func TestFetchPlanInfo_ServerStall(t *testing.T) {
+	prev := httpclient.Timeout
+	httpclient.Timeout = 100 * time.Millisecond
+	t.Cleanup(func() { httpclient.Timeout = prev })
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
+		<-req.Context().Done()
+	}))
+	defer server.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := FetchPlanInfo(server.URL, "test-token")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected timeout error from stalling server, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("FetchPlanInfo did not return within 5s — timeout did not bound the stalling server")
 	}
 }
 

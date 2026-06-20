@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestVerifyKeyValid(t *testing.T) {
@@ -68,12 +69,41 @@ func TestVerifyKeyForbidden(t *testing.T) {
 }
 
 func TestVerifyKeyNetworkError(t *testing.T) {
-	_, err := verifyKey(http.DefaultClient, "http://127.0.0.1:1", "justtunnel_key")
+	// Bound the client so a (very unlikely) reachable 127.0.0.1:1 can't hang
+	// the test, matching the timeout-bearing clients production code now uses.
+	_, err := verifyKey(&http.Client{Timeout: 2 * time.Second}, "http://127.0.0.1:1", "justtunnel_key")
 	if err == nil {
 		t.Fatal("expected error for network failure")
 	}
 	if err.Error() != "could not reach justtunnel server" {
 		t.Errorf("error message: got %q, want %q", err.Error(), "could not reach justtunnel server")
+	}
+}
+
+// TestVerifyKeyServerStall is the core CLI-2 regression: a server that
+// accepts the connection then never responds must not hang the CLI. The
+// client's Timeout has to bound the call. The handler blocks on the request
+// context so it unblocks cleanly when the client cancels.
+func TestVerifyKeyServerStall(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+	done := make(chan error, 1)
+	go func() {
+		_, err := verifyKey(client, server.URL, "justtunnel_key")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected timeout error from stalling server, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("verifyKey did not return within 5s — timeout did not bound the stalling server")
 	}
 }
 
