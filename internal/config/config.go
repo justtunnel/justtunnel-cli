@@ -18,6 +18,26 @@ import (
 // from the others.
 const AuthHeaderPrefix = "Bearer "
 
+// MinPort and MaxPort bound the valid TCP port range. Defined here so the
+// CLI flag parser (cmd/), the TUI slash-command parser, and the tunnel
+// manager all validate against the same numbers instead of repeating
+// `1`/`65535` literals with divergent error strings.
+const (
+	MinPort = 1
+	MaxPort = 65535
+)
+
+// ValidatePort returns an error if port is outside the valid TCP range
+// [MinPort, MaxPort]. The error message is shared across every call site so
+// the user sees identical wording regardless of where the bad port came
+// from.
+func ValidatePort(port int) error {
+	if port < MinPort || port > MaxPort {
+		return fmt.Errorf("invalid port %d (must be %d-%d)", port, MinPort, MaxPort)
+	}
+	return nil
+}
+
 // APIBaseURL derives the REST API base URL from a WebSocket or HTTP server
 // URL, e.g. "wss://api.justtunnel.dev/ws" -> "https://api.justtunnel.dev".
 // Defined once here so cmd/ and internal/tui/ share a single implementation

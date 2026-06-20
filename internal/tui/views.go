@@ -157,10 +157,6 @@ func renderDetailView(model Model) string {
 		styleDetailLabel.Render("Total Requests:"),
 		entry.Requests))
 
-	builder.WriteString(fmt.Sprintf("  %s  %.1f\n",
-		styleDetailLabel.Render("Avg req/sec:"),
-		entry.AvgReqSec))
-
 	builder.WriteString("\n")
 
 	// Recent requests table

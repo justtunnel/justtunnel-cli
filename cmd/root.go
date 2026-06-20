@@ -111,11 +111,14 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	// Parse port arg if provided
 	var port int
 	if len(args) > 0 {
-		var parseErr error
-		port, parseErr = strconv.Atoi(args[0])
-		if parseErr != nil || port < 1 || port > 65535 {
-			return display.InputError(fmt.Sprintf("invalid port: %s (must be 1-65535)", args[0]))
+		parsed, parseErr := strconv.Atoi(args[0])
+		if parseErr != nil {
+			return display.InputError(fmt.Sprintf("invalid port: %s (must be %d-%d)", args[0], config.MinPort, config.MaxPort))
 		}
+		if err := config.ValidatePort(parsed); err != nil {
+			return display.InputError(err.Error())
+		}
+		port = parsed
 	}
 
 	// Validate password length if provided

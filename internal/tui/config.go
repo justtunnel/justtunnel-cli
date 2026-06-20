@@ -5,6 +5,8 @@ import (
 	"os"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/justtunnel/justtunnel-cli/internal/config"
 )
 
 // TunnelPresetConfig is the top-level structure of a tunnel preset YAML file.
@@ -45,8 +47,8 @@ func validateConfig(cfg *TunnelPresetConfig) error {
 	seenPorts := make(map[int]bool, len(cfg.Tunnels))
 
 	for idx, preset := range cfg.Tunnels {
-		if preset.Port < minPort || preset.Port > maxPort {
-			return fmt.Errorf("tunnel[%d]: invalid port %d (must be %d-%d)", idx, preset.Port, minPort, maxPort)
+		if err := config.ValidatePort(preset.Port); err != nil {
+			return fmt.Errorf("tunnel[%d]: %w", idx, err)
 		}
 
 		if seenPorts[preset.Port] {

@@ -57,7 +57,7 @@ type RotatingWriter struct {
 // changes. clock may be nil to use time.Now (production); tests inject a
 // deterministic clock to drive rotation without sleeping.
 func NewRotatingWriter(workerName string, clock func() time.Time) (*RotatingWriter, error) {
-	if err := validateName(workerName); err != nil {
+	if err := ValidateName(workerName); err != nil {
 		return nil, err
 	}
 	if clock == nil {
@@ -308,7 +308,7 @@ type HistoricalLog struct {
 // Returns an error only when the worker name is invalid or the logs
 // directory cannot be read.
 func ListLogsForReader(workerName string) (historical []HistoricalLog, activePath string, err error) {
-	if err := validateName(workerName); err != nil {
+	if err := ValidateName(workerName); err != nil {
 		return nil, "", err
 	}
 	root, err := home()
