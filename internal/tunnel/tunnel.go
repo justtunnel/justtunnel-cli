@@ -195,7 +195,8 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 
-	const maxBodySize = 10 << 20 // 10 MB
+	// maxBodySize is the package-level proxy body limit (proxy.go). The WS read
+	// limit is derived from it so the two stay in lockstep if the limit changes.
 	bodyFloat := float64(maxBodySize) * 1.34
 	readLimit := int64(bodyFloat) + 4096
 	conn.SetReadLimit(readLimit)
