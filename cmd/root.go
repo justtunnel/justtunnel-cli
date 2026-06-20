@@ -502,7 +502,7 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 		return display.AuthError("not authenticated. Set JUSTTUNNEL_AUTH_TOKEN or run `justtunnel auth` first")
 	}
 
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
