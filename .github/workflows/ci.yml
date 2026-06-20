@@ -6,6 +6,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,7 +18,8 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - name: Build
         run: go build ./...
@@ -50,12 +55,13 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - name: Build
         run: go build ./...
 
-      - name: Vet
+      - name: Lint
         run: go vet ./...
 
       - name: Test
