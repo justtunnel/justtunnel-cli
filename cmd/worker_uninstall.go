@@ -22,9 +22,21 @@ var workerUninstallDeleteOnServer bool
 
 // workerUninstallForce is the bound flag value for `worker uninstall
 // --force`. With --force each step's error is collected, all steps
-// run to completion, errors are printed to stderr but the command
-// exits 0 (best-effort cleanup; useful when local config is corrupt).
+// run to completion, and every collected error is printed to stderr.
+// The command then exits non-zero so scripts checking $? still detect
+// a partial failure (e.g. server-side 403 + local service left
+// registered). Best-effort cleanup runs regardless of the exit code.
 var workerUninstallForce bool
+
+// errForceStepErrors is the sentinel returned when --force ran every
+// step to completion but at least one step failed. Callers can match
+// it with errors.Is to distinguish "best-effort cleanup hit a snag"
+// from an early abort. The detailed per-step summary is printed to
+// stderr before this is returned; Execute() recognizes the sentinel and
+// skips the generic display.PrintError line so the summary is not
+// duplicated. Unexported because cmd is a leaf package — the only caller
+// is Execute() in this same package.
+var errForceStepErrors = errors.New("worker uninstall --force completed with step errors")
 
 var workerUninstallCmd = &cobra.Command{
 	Use:   "uninstall <name>",
@@ -32,8 +44,12 @@ var workerUninstallCmd = &cobra.Command{
 	Long: "Reverses `worker install`: stops the platform service, removes the local\n" +
 		"service definition, and deletes the local worker config. With\n" +
 		"--delete-on-server, also deletes the server-side worker record.\n\n" +
-		"Idempotent: re-running on an already-uninstalled worker is a no-op.\n" +
-		"Use --force to continue past individual step failures (best-effort cleanup).",
+		"Idempotent: re-running on an already-uninstalled worker is a no-op.\n\n" +
+		"Use --force to continue past individual step failures (best-effort cleanup).\n" +
+		"Exit codes: 0 when every step succeeds; non-zero if any step fails.\n" +
+		"Without --force the command stops at the first failure. With --force it\n" +
+		"runs every step, prints each failure to stderr, and still exits non-zero\n" +
+		"when any step failed — so scripts checking $? detect partial failures.",
 	Args: cobra.ExactArgs(1),
 	RunE: runWorkerUninstall,
 }
@@ -145,7 +161,8 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 		// Two cases land here:
 		//   1. --delete-on-server NOT set → local-only path.
 		//   2. --delete-on-server set AND --force → best-effort: run
-		//      every step, collect errors, exit 0.
+		//      every step, collect errors, exit non-zero when any step
+		//      fails.
 		// E1: under --force + --delete-on-server we still attempt the
 		// server delete FIRST so the operator's local pointer is
 		// preserved on a server-side failure (e.g. 403 from a stale
@@ -192,15 +209,19 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Step 4: post-uninstall probe. Best-effort warning only — the
+	// Step 3: post-uninstall probe. Best-effort warning only — the
 	// supervisor may take a beat to fully tear down. We intentionally
 	// do NOT fail on a still-running probe; an operator who needs a
 	// hard guarantee can re-run with --force after a moment.
 	probePostUninstall(cmd.Context(), name, cmd.ErrOrStderr())
 
-	// --force summary: print each collected error to stderr and
-	// continue exiting 0 so callers can drive cleanup from scripts.
-	if workerUninstallForce && len(stepErrors) > 0 {
+	// forceFailed gates the non-zero exit and the stdout wording below.
+	// Compute it once so the summary guard and the return path can't drift.
+	forceFailed := workerUninstallForce && len(stepErrors) > 0
+
+	// --force summary: print each collected error to stderr so the
+	// operator sees exactly which steps failed.
+	if forceFailed {
 		fmt.Fprintf(cmd.ErrOrStderr(),
 			"warning: --force completed uninstall with %d step error(s):\n", len(stepErrors))
 		for _, stepErr := range stepErrors {
@@ -208,11 +229,18 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if !changed {
+	// Stdout line. When --force hit step errors we must NOT claim
+	// "already uninstalled" even if nothing mutated (e.g. server delete
+	// failed AND local config was already absent) — that would contradict
+	// the stderr error summary and the non-zero exit. Report partial
+	// cleanup instead. On success, render the usual outcome line.
+	switch {
+	case forceFailed:
+		fmt.Fprintf(cmd.OutOrStdout(),
+			"worker %q: cleanup completed with errors (see warnings above)\n", name)
+	case !changed:
 		fmt.Fprintf(cmd.OutOrStdout(), "worker %q already uninstalled\n", name)
-		return nil
-	}
-	if workerUninstallDeleteOnServer {
+	case workerUninstallDeleteOnServer:
 		// Server soft-deletes (status=retired_quarantined); a reaper
 		// removes the row 30 days later. Tell the operator so they
 		// aren't surprised by `worker list --all` still showing the
@@ -221,9 +249,13 @@ func runWorkerUninstall(cmd *cobra.Command, args []string) error {
 			"Uninstalled worker %q (server-side row quarantined; permanent removal in 30 days)\n",
 			name,
 		)
-		return nil
+	default:
+		fmt.Fprintf(cmd.OutOrStdout(), "Uninstalled worker %q\n", name)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Uninstalled worker %q\n", name)
+
+	if forceFailed {
+		return errForceStepErrors
+	}
 	return nil
 }
 

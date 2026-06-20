@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
+
+	"github.com/justtunnel/justtunnel-cli/internal/config"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 // PlanInfo is defined in model.go — reused here for FetchPlanInfo.
@@ -29,18 +31,19 @@ type meResponsePlan struct {
 // and maps it to tunnel limits. The serverURL can be in any scheme
 // (wss://, ws://, https://, http://) and will be converted appropriately.
 func FetchPlanInfo(serverURL string, token string) (PlanInfo, error) {
-	baseURL, err := apiBaseURL(serverURL)
+	baseURL, err := config.APIBaseURL(serverURL)
 	if err != nil {
 		return PlanInfo{}, fmt.Errorf("parse server URL: %w", err)
 	}
 
-	request, err := http.NewRequest("GET", baseURL+"/api/me", nil)
+	request, err := http.NewRequest(http.MethodGet, baseURL+"/api/me", nil)
 	if err != nil {
 		return PlanInfo{}, fmt.Errorf("create request: %w", err)
 	}
-	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Authorization", config.AuthHeaderPrefix+token)
 
-	response, err := http.DefaultClient.Do(request)
+	client := &http.Client{Timeout: httpclient.Timeout}
+	response, err := client.Do(request)
 	if err != nil {
 		return PlanInfo{}, fmt.Errorf("fetch plan info: %w", err)
 	}
@@ -68,22 +71,4 @@ func maxTunnelsForPlan(planName string) int {
 		return limit
 	}
 	return defaultMaxTunnels
-}
-
-// apiBaseURL derives the REST API base URL from a WebSocket or HTTP server URL.
-// e.g. "wss://api.justtunnel.dev/ws" -> "https://api.justtunnel.dev"
-func apiBaseURL(serverURL string) (string, error) {
-	parsedURL, err := url.Parse(serverURL)
-	if err != nil {
-		return "", fmt.Errorf("parse URL: %w", err)
-	}
-	switch parsedURL.Scheme {
-	case "wss":
-		parsedURL.Scheme = "https"
-	case "ws":
-		parsedURL.Scheme = "http"
-	}
-	parsedURL.Path = ""
-	parsedURL.RawQuery = ""
-	return parsedURL.String(), nil
 }

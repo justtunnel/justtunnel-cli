@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/browser"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 	"github.com/justtunnel/justtunnel-cli/internal/tui"
 	"github.com/justtunnel/justtunnel-cli/internal/tunnel"
 	"github.com/justtunnel/justtunnel-cli/internal/version"
@@ -86,7 +88,14 @@ func init() {
 func Execute() error {
 	err := rootCmd.Execute()
 	if err != nil {
-		display.PrintError(err)
+		// errForceStepErrors already printed a per-step summary to stderr
+		// inside runWorkerUninstall. PrintError would fall through to its
+		// generic branch and emit a second, redundant "Error: ..." line
+		// after that summary. Suppress it — the summary is the feedback.
+		// The non-zero exit code is still propagated to the caller.
+		if !errors.Is(err, errForceStepErrors) {
+			display.PrintError(err)
+		}
 	}
 	return err
 }
@@ -116,9 +125,12 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Need at least a port arg or a config file
-	if port == 0 && tunnelConfigFile == "" {
-		return cmd.Help()
+	// Need at least a port arg or a config file. Return a typed error so
+	// Execute propagates a non-nil error and os.Exit(1) fires — cmd.Help()
+	// always returns nil, which made `justtunnel || fallback` and
+	// `if justtunnel; then` shell/CI idioms see a success exit code.
+	if guardErr := guardMissingTarget(port, tunnelConfigFile); guardErr != nil {
+		return guardErr
 	}
 
 	cfg, err := config.Load(cfgFile)
@@ -150,8 +162,8 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	}
 
 	// Non-TTY requires a port arg (single-tunnel mode)
-	if port == 0 {
-		return display.InputError("port argument is required in non-TTY mode")
+	if guardErr := guardNonTTYPort(port); guardErr != nil {
+		return guardErr
 	}
 	return runNonTTY(port, cfg, serverURL, logger, cmd)
 }
@@ -254,6 +266,12 @@ func runTUI(port int, cfg *config.Config, serverURL string, logger *slog.Logger,
 		manager.Shutdown()
 		logger.Warn("TUI could not start, falling back to non-interactive mode", "error", runErr)
 		fmt.Fprintf(os.Stderr, "Warning: TUI failed to start (%v), falling back to single-tunnel mode\n", runErr)
+		// runNonTTY is single-tunnel and needs an explicit port. When only a config
+		// file was supplied (port==0), there is nothing to dial in fallback mode —
+		// otherwise it would build http://localhost:0 and every request would fail.
+		if guardErr := guardTUIFallback(port); guardErr != nil {
+			return guardErr
+		}
 		return runNonTTY(port, cfg, serverURL, logger, cmd)
 	}
 
@@ -338,6 +356,46 @@ func newTunnelFactory(serverURL, authToken string, logger *slog.Logger, cmd *cob
 
 		return tun
 	}
+}
+
+// runNonTTY dials http://localhost:<port>, so a zero port (only --config-file
+// was supplied) would build http://localhost:0 and fail every request. Both the
+// direct non-TTY path and the TUI fallback path must reject port==0 before
+// calling runNonTTY. guardNonTTYPort and guardTUIFallback own the precondition
+// for their respective call sites so the messages can't be mismatched by
+// callers; both delegate to requireSingleTunnelPort.
+
+// requireSingleTunnelPort returns an InputError when port==0, which would make
+// runNonTTY dial http://localhost:0. Returns nil when the port is usable.
+func requireSingleTunnelPort(port int, message string) error {
+	if port == 0 {
+		return display.InputError(message)
+	}
+	return nil
+}
+
+// guardNonTTYPort enforces the single-tunnel port precondition for the direct
+// non-TTY entry point (stdout is not a terminal).
+func guardNonTTYPort(port int) error {
+	return requireSingleTunnelPort(port, "port argument is required in non-TTY mode")
+}
+
+// guardTUIFallback enforces the single-tunnel port precondition when the TUI
+// fails to start and runTUI falls back to runNonTTY. A config-file-only invocation
+// (port==0) has nothing to dial in single-tunnel mode and must use the TUI.
+func guardTUIFallback(port int) error {
+	return requireSingleTunnelPort(port, "port argument is required to fall back to single-tunnel mode; multi-tunnel config files need the interactive TUI")
+}
+
+// guardMissingTarget rejects an invocation with neither a port arg nor a
+// --config-file. Returning a typed InputError (instead of cmd.Help(), which
+// returns nil) makes Execute propagate a non-nil error so os.Exit(1) fires,
+// keeping `justtunnel || fallback` and `if justtunnel; then` idioms correct.
+func guardMissingTarget(port int, configFile string) error {
+	if port == 0 && configFile == "" {
+		return display.InputError("provide a port (e.g. `justtunnel 3000`) or a --config-file; run `justtunnel --help` for usage")
+	}
+	return nil
 }
 
 // runNonTTY is the original single-tunnel flow for non-terminal output (pipes, etc.).
@@ -493,14 +551,16 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 		return display.AuthError("not authenticated. Set JUSTTUNNEL_AUTH_TOKEN or run `justtunnel auth` first")
 	}
 
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
 
 	fmt.Fprintf(os.Stderr, "\n  Welcome to justtunnel! Sign in with GitHub to get started.\n\n")
 
-	deviceResp, err := createDeviceSession(http.DefaultClient, baseURL)
+	httpClient := &http.Client{Timeout: httpclient.Timeout}
+
+	deviceResp, err := createDeviceSession(httpClient, baseURL)
 	if err != nil {
 		return categorizeAuthError(err)
 	}
@@ -538,7 +598,7 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 			}
 			return display.InputError("authentication cancelled")
 		case <-ticker.C:
-			status, pollErr := pollDeviceStatus(http.DefaultClient, baseURL, deviceResp.DeviceCode)
+			status, pollErr := pollDeviceStatus(httpClient, baseURL, deviceResp.DeviceCode)
 			if pollErr != nil {
 				continue
 			}
@@ -557,7 +617,7 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 					return fmt.Errorf("save config: %w", saveErr)
 				}
 
-				result, verifyErr := verifyKey(http.DefaultClient, baseURL, status.APIKey)
+				result, verifyErr := verifyKey(httpClient, baseURL, status.APIKey)
 				if verifyErr != nil {
 					fmt.Fprintf(os.Stderr, "\n  Authenticated successfully. Starting tunnel...\n\n")
 					return nil

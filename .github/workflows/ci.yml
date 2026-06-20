@@ -6,6 +6,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,12 +18,13 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - name: Build
         run: go build ./...
 
-      - name: Lint
+      - name: Vet
         run: go vet ./...
 
       - name: Test
@@ -46,16 +51,20 @@ jobs:
           git config user.email "ci@justtunnel.dev"
           git config user.name "ci"
           git fetch origin main
-          git merge --no-edit origin/main
+          git merge --no-edit origin/main || {
+            echo "::error::Merge conflict with origin/main. Rebase or merge main into this branch locally, resolve the conflicts, and re-push."
+            exit 1
+          }
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - name: Build
         run: go build ./...
 
-      - name: Vet
+      - name: Lint
         run: go vet ./...
 
       - name: Test
