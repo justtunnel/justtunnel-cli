@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -86,7 +87,14 @@ func init() {
 func Execute() error {
 	err := rootCmd.Execute()
 	if err != nil {
-		display.PrintError(err)
+		// errForceStepErrors already printed a per-step summary to stderr
+		// inside runWorkerUninstall. PrintError would fall through to its
+		// generic branch and emit a second, redundant "Error: ..." line
+		// after that summary. Suppress it — the summary is the feedback.
+		// The non-zero exit code is still propagated to the caller.
+		if !errors.Is(err, errForceStepErrors) {
+			display.PrintError(err)
+		}
 	}
 	return err
 }
