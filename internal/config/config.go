@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -16,6 +17,27 @@ import (
 // the same value — a typo in one call site cannot accidentally diverge
 // from the others.
 const AuthHeaderPrefix = "Bearer "
+
+// APIBaseURL derives the REST API base URL from a WebSocket or HTTP server
+// URL, e.g. "wss://api.justtunnel.dev/ws" -> "https://api.justtunnel.dev".
+// Defined once here so cmd/ and internal/tui/ share a single implementation
+// instead of maintaining byte-identical copies that can drift on the next
+// edit.
+func APIBaseURL(serverURL string) (string, error) {
+	parsedURL, err := url.Parse(serverURL)
+	if err != nil {
+		return "", fmt.Errorf("parse URL: %w", err)
+	}
+	switch parsedURL.Scheme {
+	case "wss":
+		parsedURL.Scheme = "https"
+	case "ws":
+		parsedURL.Scheme = "http"
+	}
+	parsedURL.Path = ""
+	parsedURL.RawQuery = ""
+	return parsedURL.String(), nil
+}
 
 type Config struct {
 	AuthToken            string `mapstructure:"auth_token" yaml:"auth_token,omitempty"`

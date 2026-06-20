@@ -14,6 +14,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
 )
 
@@ -59,8 +60,14 @@ type Tunnel struct {
 	passwordProtected bool // set from tunnel_assigned frame
 
 	maxReconnectAttempts int
-	reconnecting         bool
+	reconnecting         bool // guarded by connMu; gates the OnConnected suppression during reconnects
 	disconnectedAt       time.Time
+
+	// sleep blocks for the given duration or until ctx is cancelled,
+	// returning ctx.Err() in the latter case. It is a seam for tests to
+	// observe the backoff schedule and advance time without real waits.
+	// Defaults to realSleep.
+	sleep func(ctx context.Context, duration time.Duration) error
 }
 
 func New(serverURL, localTarget, authToken string, logger *slog.Logger, callbacks Callbacks) *Tunnel {
@@ -71,6 +78,19 @@ func New(serverURL, localTarget, authToken string, logger *slog.Logger, callback
 		logger:               logger,
 		callbacks:            callbacks,
 		maxReconnectAttempts: 50,
+		sleep:                realSleep,
+	}
+}
+
+// realSleep blocks for the given duration or until ctx is cancelled.
+func realSleep(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -142,7 +162,7 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 	opts := &websocket.DialOptions{}
 	if t.authToken != "" {
 		opts.HTTPHeader = http.Header{
-			"Authorization": []string{"Bearer " + t.authToken},
+			"Authorization": []string{config.AuthHeaderPrefix + t.authToken},
 		}
 	}
 	if t.password != "" {
@@ -175,7 +195,8 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 
-	const maxBodySize = 10 << 20 // 10 MB
+	// maxBodySize is the package-level proxy body limit (proxy.go). The WS read
+	// limit is derived from it so the two stay in lockstep if the limit changes.
 	bodyFloat := float64(maxBodySize) * 1.34
 	readLimit := int64(bodyFloat) + 4096
 	conn.SetReadLimit(readLimit)
@@ -216,11 +237,28 @@ func (t *Tunnel) connectWithURL(ctx context.Context, dialURL string) error {
 	)
 
 	// Only fire OnConnected for the initial connection, not during reconnects.
-	if !t.reconnecting && t.callbacks.OnConnected != nil {
+	if !t.isReconnecting() && t.callbacks.OnConnected != nil {
 		t.callbacks.OnConnected(assigned.Subdomain, assigned.URL, t.localTarget, t.passwordProtected)
 	}
 
 	return nil
+}
+
+// setReconnecting updates the reconnecting flag under connMu. The flag is read
+// from connectWithURL (which can run on the reconnect goroutine) and written
+// from reconnect, so it must be synchronized to stay race-free under -race.
+func (t *Tunnel) setReconnecting(value bool) {
+	t.connMu.Lock()
+	t.reconnecting = value
+	t.connMu.Unlock()
+}
+
+// isReconnecting reports whether a reconnect is in progress, reading the flag
+// under connMu.
+func (t *Tunnel) isReconnecting() bool {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	return t.reconnecting
 }
 
 func (t *Tunnel) readLoop(ctx context.Context) error {
@@ -312,22 +350,27 @@ func (t *Tunnel) writeJSONTo(ctx context.Context, targetConn *websocket.Conn, v 
 	return t.conn.Write(ctx, websocket.MessageText, data)
 }
 
-// isAuthError checks if an error is an authentication/authorization failure
-// by checking if it wraps a display.CLIError with CategoryAuth.
-func isAuthError(err error) bool {
-	var cliErr *display.CLIError
-	return errors.As(err, &cliErr) && cliErr.Category == display.CategoryAuth
-}
-
-// isTerminalDialError reports whether reconnecting is futile. Auth (401)
-// won't fix itself across attempts, and Forbidden (403) policy decisions
-// won't either — keep retrying would just hammer the server.
-func isTerminalDialError(err error) bool {
+// terminalReconnectError reports whether reconnecting is futile and, if so,
+// returns the error to surface to the caller. Auth (401) won't fix itself
+// across attempts and Forbidden (403) policy decisions won't either, so we stop
+// retrying rather than hammer the server. Auth gets a reconnect-specific message
+// that points at `justtunnel auth`; everything else terminal is surfaced as-is.
+//
+// Returning the resolved error here keeps the category precedence in one place:
+// callers no longer rely on the ordering of separate auth/terminal checks.
+func terminalReconnectError(err error) (error, bool) {
 	var cliErr *display.CLIError
 	if !errors.As(err, &cliErr) {
-		return false
+		return nil, false
 	}
-	return cliErr.Category == display.CategoryAuth || cliErr.Category == display.CategoryForbidden
+	switch cliErr.Category {
+	case display.CategoryAuth:
+		return display.AuthError("authentication failed during reconnect - run 'justtunnel auth' to re-authenticate"), true
+	case display.CategoryForbidden:
+		return err, true
+	default:
+		return nil, false
+	}
 }
 
 // buildReconnectURL appends reconnect token parameters to the server URL
@@ -355,17 +398,22 @@ func (t *Tunnel) buildReconnectURL() string {
 // exponential backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s.
 func (t *Tunnel) reconnect(ctx context.Context) error {
 	// Wait for in-flight requests from the old connection to finish
-	// so they don't write stale responses to the new connection.
+	// so they don't write stale responses to the new connection. Bound the
+	// wait with a cancellable timer (stopped when draining wins or ctx is
+	// cancelled) so the timer goroutine never leaks past this select.
 	drainDone := make(chan struct{})
 	go func() {
 		t.wg.Wait()
 		close(drainDone)
 	}()
+	drainTimer := time.NewTimer(5 * time.Second)
 	select {
 	case <-drainDone:
-	case <-time.After(5 * time.Second):
+	case <-ctx.Done():
+	case <-drainTimer.C:
 		t.logger.Warn("timed out waiting for in-flight requests before reconnect")
 	}
+	drainTimer.Stop()
 
 	// Close old connection before attempting to dial a new one.
 	t.connMu.Lock()
@@ -374,7 +422,7 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 	}
 	t.connMu.Unlock()
 
-	t.reconnecting = true
+	t.setReconnecting(true)
 	previousSubdomain := t.subdomain
 
 	backoff := time.Second
@@ -383,6 +431,7 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 	for attempt := 1; ; attempt++ {
 		// Check max reconnect attempts (0 = unlimited).
 		if t.maxReconnectAttempts > 0 && attempt > t.maxReconnectAttempts {
+			t.setReconnecting(false)
 			elapsed := time.Since(t.disconnectedAt).Round(time.Second)
 			return display.NetworkError(fmt.Sprintf(
 				"gave up reconnecting after %d attempts (disconnected for %s). Check your internet connection and restart the tunnel.",
@@ -395,6 +444,7 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 		}
 
 		if err := t.waitWithCountdown(ctx, attempt, backoff); err != nil {
+			t.setReconnecting(false)
 			return err
 		}
 
@@ -404,11 +454,9 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 
 			// Don't retry on auth or forbidden errors — credentials and
 			// policy decisions won't change between attempts.
-			if isAuthError(err) {
-				return display.AuthError("authentication failed during reconnect - run 'justtunnel auth' to re-authenticate")
-			}
-			if isTerminalDialError(err) {
-				return err
+			if terminalErr, terminal := terminalReconnectError(err); terminal {
+				t.setReconnecting(false)
+				return terminalErr
 			}
 
 			backoff *= 2
@@ -418,7 +466,7 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 			continue
 		}
 
-		t.reconnecting = false
+		t.setReconnecting(false)
 
 		if t.callbacks.OnReconnected != nil {
 			info := ReconnectInfo{
@@ -436,35 +484,32 @@ func (t *Tunnel) reconnect(ctx context.Context) error {
 }
 
 // waitWithCountdown waits for the given backoff duration, calling OnReconnectWait
-// every second with the remaining time.
+// once per second with the remaining time.
+//
+// Contract: the callback fires BEFORE each sleep, so the first call reports the
+// full backoff remaining (not backoff-1s as the prior ticker-based loop did) and
+// the last call reports the final sub-second step. Callers driving a UI countdown
+// should treat the reported value as the time still to wait at the moment of the
+// call.
 func (t *Tunnel) waitWithCountdown(ctx context.Context, attempt int, backoff time.Duration) error {
 	if t.callbacks.OnReconnectWait == nil {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-			return nil
-		}
+		return t.sleep(ctx, backoff)
 	}
 
-	deadline := time.Now().Add(backoff)
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil
-		}
-
+	remaining := backoff
+	for remaining > 0 {
 		t.callbacks.OnReconnectWait(attempt, remaining)
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
+		step := time.Second
+		if remaining < step {
+			step = remaining
 		}
+		if err := t.sleep(ctx, step); err != nil {
+			return err
+		}
+		remaining -= step
 	}
+	return nil
 }
 
 // Shutdown gracefully closes the WebSocket connection and waits for in-flight

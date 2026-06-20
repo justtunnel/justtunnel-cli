@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/browser"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 	"github.com/justtunnel/justtunnel-cli/internal/tui"
 	"github.com/justtunnel/justtunnel-cli/internal/tunnel"
 	"github.com/justtunnel/justtunnel-cli/internal/version"
@@ -86,7 +88,14 @@ func init() {
 func Execute() error {
 	err := rootCmd.Execute()
 	if err != nil {
-		display.PrintError(err)
+		// errForceStepErrors already printed a per-step summary to stderr
+		// inside runWorkerUninstall. PrintError would fall through to its
+		// generic branch and emit a second, redundant "Error: ..." line
+		// after that summary. Suppress it — the summary is the feedback.
+		// The non-zero exit code is still propagated to the caller.
+		if !errors.Is(err, errForceStepErrors) {
+			display.PrintError(err)
+		}
 	}
 	return err
 }
@@ -542,14 +551,16 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 		return display.AuthError("not authenticated. Set JUSTTUNNEL_AUTH_TOKEN or run `justtunnel auth` first")
 	}
 
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
 
 	fmt.Fprintf(os.Stderr, "\n  Welcome to justtunnel! Sign in with GitHub to get started.\n\n")
 
-	deviceResp, err := createDeviceSession(http.DefaultClient, baseURL)
+	httpClient := &http.Client{Timeout: httpclient.Timeout}
+
+	deviceResp, err := createDeviceSession(httpClient, baseURL)
 	if err != nil {
 		return categorizeAuthError(err)
 	}
@@ -587,7 +598,7 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 			}
 			return display.InputError("authentication cancelled")
 		case <-ticker.C:
-			status, pollErr := pollDeviceStatus(http.DefaultClient, baseURL, deviceResp.DeviceCode)
+			status, pollErr := pollDeviceStatus(httpClient, baseURL, deviceResp.DeviceCode)
 			if pollErr != nil {
 				continue
 			}
@@ -606,7 +617,7 @@ func ensureAuthenticated(cfg *config.Config, cmd *cobra.Command) error {
 					return fmt.Errorf("save config: %w", saveErr)
 				}
 
-				result, verifyErr := verifyKey(http.DefaultClient, baseURL, status.APIKey)
+				result, verifyErr := verifyKey(httpClient, baseURL, status.APIKey)
 				if verifyErr != nil {
 					fmt.Fprintf(os.Stderr, "\n  Authenticated successfully. Starting tunnel...\n\n")
 					return nil
