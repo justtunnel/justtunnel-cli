@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -35,6 +36,27 @@ func ValidatePort(port int) error {
 		return fmt.Errorf("invalid port %d (must be %d-%d)", port, MinPort, MaxPort)
 	}
 	return nil
+}
+
+// APIBaseURL derives the REST API base URL from a WebSocket or HTTP server
+// URL, e.g. "wss://api.justtunnel.dev/ws" -> "https://api.justtunnel.dev".
+// Defined once here so cmd/ and internal/tui/ share a single implementation
+// instead of maintaining byte-identical copies that can drift on the next
+// edit.
+func APIBaseURL(serverURL string) (string, error) {
+	parsedURL, err := url.Parse(serverURL)
+	if err != nil {
+		return "", fmt.Errorf("parse URL: %w", err)
+	}
+	switch parsedURL.Scheme {
+	case "wss":
+		parsedURL.Scheme = "https"
+	case "ws":
+		parsedURL.Scheme = "http"
+	}
+	parsedURL.Path = ""
+	parsedURL.RawQuery = ""
+	return parsedURL.String(), nil
 }
 
 type Config struct {

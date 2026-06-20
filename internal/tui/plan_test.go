@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 func TestFetchPlanInfo(t *testing.T) {
@@ -122,6 +125,37 @@ func TestFetchPlanInfo_NetworkError(t *testing.T) {
 	}
 }
 
+// TestFetchPlanInfo_ServerStall is the CLI-2 regression for TUI startup: a
+// server that accepts the connection then never responds must not block the
+// TUI indefinitely. httpclient.Timeout bounds the call; we shrink it so the
+// test is fast. The handler blocks on the request context so it unblocks
+// cleanly when the client cancels.
+func TestFetchPlanInfo_ServerStall(t *testing.T) {
+	prev := httpclient.Timeout
+	httpclient.Timeout = 100 * time.Millisecond
+	t.Cleanup(func() { httpclient.Timeout = prev })
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
+		<-req.Context().Done()
+	}))
+	defer server.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := FetchPlanInfo(server.URL, "test-token")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected timeout error from stalling server, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("FetchPlanInfo did not return within 5s — timeout did not bound the stalling server")
+	}
+}
+
 func TestFetchPlanInfo_AuthorizationHeaderSent(t *testing.T) {
 	t.Parallel()
 
@@ -159,75 +193,13 @@ func TestFetchPlanInfo_WSSURLConversion(t *testing.T) {
 
 	// The function should handle raw http:// URLs directly since httptest returns them.
 	// The important thing is that wss:// -> https:// and ws:// -> http:// conversion works.
-	// We test this via the apiBaseURL helper.
+	// The conversion itself is covered by config.TestAPIBaseURL.
 	planInfo, err := FetchPlanInfo(server.URL, "test-token")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if planInfo.Name != "pro" {
 		t.Errorf("plan name = %q, want %q", planInfo.Name, "pro")
-	}
-}
-
-func TestAPIBaseURL(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		serverURL string
-		want      string
-		wantErr   bool
-	}{
-		{
-			name:      "wss URL converts to https",
-			serverURL: "wss://api.justtunnel.dev/ws",
-			want:      "https://api.justtunnel.dev",
-			wantErr:   false,
-		},
-		{
-			name:      "ws URL converts to http",
-			serverURL: "ws://localhost:8080/ws",
-			want:      "http://localhost:8080",
-			wantErr:   false,
-		},
-		{
-			name:      "https URL stays https",
-			serverURL: "https://api.justtunnel.dev",
-			want:      "https://api.justtunnel.dev",
-			wantErr:   false,
-		},
-		{
-			name:      "http URL stays http",
-			serverURL: "http://localhost:8080",
-			want:      "http://localhost:8080",
-			wantErr:   false,
-		},
-		{
-			name:      "strips path from URL",
-			serverURL: "wss://api.justtunnel.dev/ws/connect",
-			want:      "https://api.justtunnel.dev",
-			wantErr:   false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			got, err := apiBaseURL(tt.serverURL)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if got != tt.want {
-				t.Errorf("apiBaseURL(%q) = %q, want %q", tt.serverURL, got, tt.want)
-			}
-		})
 	}
 }
 

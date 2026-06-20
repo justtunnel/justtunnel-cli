@@ -103,6 +103,68 @@ func TestDeleteAuthTokenNoFile(t *testing.T) {
 	}
 }
 
+func TestAPIBaseURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		serverURL string
+		want      string
+		wantErr   bool
+	}{
+		{
+			name:      "wss URL converts to https",
+			serverURL: "wss://api.justtunnel.dev/ws",
+			want:      "https://api.justtunnel.dev",
+		},
+		{
+			name:      "ws URL converts to http",
+			serverURL: "ws://localhost:8080/ws",
+			want:      "http://localhost:8080",
+		},
+		{
+			name:      "https URL stays https",
+			serverURL: "https://api.justtunnel.dev",
+			want:      "https://api.justtunnel.dev",
+		},
+		{
+			name:      "http URL stays http",
+			serverURL: "http://localhost:8080",
+			want:      "http://localhost:8080",
+		},
+		{
+			name:      "strips path from URL",
+			serverURL: "wss://api.justtunnel.dev/ws/connect",
+			want:      "https://api.justtunnel.dev",
+		},
+		{
+			name:      "strips query string",
+			serverURL: "wss://custom.domain.com/ws?foo=bar",
+			want:      "https://custom.domain.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := config.APIBaseURL(tt.serverURL)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("APIBaseURL(%q) = %q, want %q", tt.serverURL, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSaveCreatesDirectory(t *testing.T) {
 	dir := t.TempDir()
 	nested := filepath.Join(dir, "a", "b", "c")

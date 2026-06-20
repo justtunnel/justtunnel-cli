@@ -17,6 +17,7 @@ import (
 	"github.com/justtunnel/justtunnel-cli/internal/browser"
 	"github.com/justtunnel/justtunnel-cli/internal/config"
 	"github.com/justtunnel/justtunnel-cli/internal/display"
+	"github.com/justtunnel/justtunnel-cli/internal/httpclient"
 )
 
 type authVerifyResponse struct {
@@ -68,12 +69,12 @@ func runKeyAuth(_ *cobra.Command, key string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
 
-	result, err := verifyKey(http.DefaultClient, baseURL, key)
+	result, err := verifyKey(&http.Client{Timeout: httpclient.Timeout}, baseURL, key)
 	if err != nil {
 		return categorizeAuthError(err)
 	}
@@ -97,14 +98,14 @@ func runDeviceAuth(cmd *cobra.Command) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	baseURL, err := apiBaseURL(cfg.ServerURL)
+	baseURL, err := config.APIBaseURL(cfg.ServerURL)
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
 
 	// Check if already authenticated
 	if cfg.AuthToken != "" {
-		result, verifyErr := verifyKey(http.DefaultClient, baseURL, cfg.AuthToken)
+		result, verifyErr := verifyKey(&http.Client{Timeout: httpclient.Timeout}, baseURL, cfg.AuthToken)
 		if verifyErr == nil {
 			displayName := result.GitHubUsername
 			if displayName == "" {
@@ -121,7 +122,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 	}
 
 	// Create device session
-	deviceResp, err := createDeviceSession(http.DefaultClient, baseURL)
+	deviceResp, err := createDeviceSession(&http.Client{Timeout: httpclient.Timeout}, baseURL)
 	if err != nil {
 		return categorizeAuthError(err)
 	}
@@ -154,6 +155,8 @@ func runDeviceAuth(cmd *cobra.Command) error {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	httpClient := &http.Client{Timeout: httpclient.Timeout}
+
 	for {
 		select {
 		case <-sigCtx.Done():
@@ -163,7 +166,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 			}
 			return display.InputError("authentication cancelled")
 		case <-ticker.C:
-			status, pollErr := pollDeviceStatus(http.DefaultClient, baseURL, deviceResp.DeviceCode)
+			status, pollErr := pollDeviceStatus(httpClient, baseURL, deviceResp.DeviceCode)
 			if pollErr != nil {
 				continue // retry on network errors
 			}
@@ -184,7 +187,7 @@ func runDeviceAuth(cmd *cobra.Command) error {
 				}
 
 				// Verify and display user info
-				result, verifyErr := verifyKey(http.DefaultClient, baseURL, status.APIKey)
+				result, verifyErr := verifyKey(httpClient, baseURL, status.APIKey)
 				if verifyErr != nil {
 					// Key saved but verify failed — still OK
 					fmt.Println("Authenticated successfully.")
@@ -261,7 +264,7 @@ func verifyKey(client *http.Client, baseURL, key string) (*authVerifyResponse, e
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Authorization", config.AuthHeaderPrefix+key)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -297,22 +300,4 @@ func categorizeAuthError(err error) error {
 	default:
 		return err
 	}
-}
-
-// apiBaseURL derives the REST API base URL from the WebSocket server URL.
-// e.g. "wss://api.justtunnel.dev/ws" -> "https://api.justtunnel.dev"
-func apiBaseURL(serverURL string) (string, error) {
-	parsedURL, err := url.Parse(serverURL)
-	if err != nil {
-		return "", err
-	}
-	switch parsedURL.Scheme {
-	case "wss":
-		parsedURL.Scheme = "https"
-	case "ws":
-		parsedURL.Scheme = "http"
-	}
-	parsedURL.Path = ""
-	parsedURL.RawQuery = ""
-	return parsedURL.String(), nil
 }
